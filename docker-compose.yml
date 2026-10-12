@@ -59,7 +59,10 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('redis', 6379), 3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     security_opt:
       - no-new-privileges:true
     cap_drop:
