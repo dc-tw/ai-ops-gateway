@@ -1,0 +1,35 @@
+services:
+  gateway:
+    build:
+      args:
+        INSTALL_BROWSER: "false"
+    environment:
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_API_KEY: test-only
+      LLM_MODEL: mock-model
+      LLM_INPUT_COST_PER_MILLION: "2"
+      LLM_OUTPUT_COST_PER_MILLION: "8"
+      CONVERSATION_MAX_TURNS: "2"
+
+  browser:
+    build:
+      args:
+        INSTALL_BROWSER: "false"
+
+  worker:
+    environment:
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_API_KEY: test-only
+      LLM_MODEL: mock-model
+      LLM_INPUT_COST_PER_MILLION: "2"
+      LLM_OUTPUT_COST_PER_MILLION: "8"
+      PLAYWRIGHT_ALLOWED_DOMAINS: example.com
+      CONVERSATION_MAX_TURNS: "2"
+    depends_on:
+      mock-llm:
+        condition: service_healthy
+
+  mock-llm:
+    build:
+      context: tests/docker/mock-llm
+    networks: [backend]

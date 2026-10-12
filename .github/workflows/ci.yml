@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: pytest -q
+      - run: docker compose config --quiet
+      - name: Validate Kubernetes YAML
+        run: python -c "from pathlib import Path; import yaml; docs=sum((list(yaml.safe_load_all(p.read_text())) for p in Path('deploy/kubernetes').glob('*.yaml')), []); assert all(isinstance(d, dict) for d in docs)"
+
+  docker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/test_docker_stack.sh

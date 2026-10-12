@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-ops-gateway"
+version = "0.1.0"
+description = "Enterprise local-LLM operations and data processing gateway"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "langchain-core>=0.3,<2",
+  "langchain-openai>=0.3,<2",
+  "langgraph>=1.0,<2",
+  "langgraph-checkpoint-redis>=0.5.2,<0.6",
+  "opentelemetry-api>=1.30,<2",
+  "opentelemetry-sdk>=1.30,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+  "opentelemetry-instrumentation-fastapi>=0.51b0,<1",
+  "pydantic-settings>=2.7,<3",
+  "PyJWT[crypto]>=2.10,<3",
+  "redis>=5.2,<8",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.50,<2"]
+mcp = ["mcp>=1.10,<2"]
+dev = [
+  "httpx>=0.28,<1",
+  "mcp>=1.10,<2",
+  "playwright>=1.50,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "PyYAML>=6,<7",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

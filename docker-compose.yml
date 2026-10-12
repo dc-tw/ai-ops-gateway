@@ -1,0 +1,182 @@
+name: ai-ops-gateway
+
+services:
+  gateway:
+    image: ai-ops-gateway:local
+    build:
+      context: .
+      args:
+        INSTALL_BROWSER: "false"
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-local-only}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      BROWSER_WORKER_URL: http://browser:8010
+      BROWSER_WORKER_TOKEN: ${BROWSER_WORKER_TOKEN:-change-me-internal}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      browser:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2
+    networks: [backend]
+
+  worker:
+    image: ai-ops-gateway:local
+    pull_policy: never
+    command: ["python", "-m", "app.worker"]
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-local-only}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+      BROWSER_WORKER_URL: http://browser:8010
+      BROWSER_WORKER_TOKEN: ${BROWSER_WORKER_TOKEN:-change-me-internal}
+    depends_on:
+      redis:
+        condition: service_healthy
+      browser:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2
+    networks: [backend]
+
+  browser:
+    image: ai-ops-browser:local
+    build:
+      context: .
+      args:
+        INSTALL_BROWSER: "true"
+    command: ["uvicorn", "app.browser_worker:app", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      BROWSER_WORKER_TOKEN: ${BROWSER_WORKER_TOKEN:-change-me-internal}
+      PLAYWRIGHT_ALLOWED_DOMAINS: ${PLAYWRIGHT_ALLOWED_DOMAINS:-}
+      BROWSER_MAX_SESSIONS: ${BROWSER_MAX_SESSIONS:-20}
+      BROWSER_SESSION_TTL_SECONDS: ${BROWSER_SESSION_TTL_SECONDS:-1800}
+    expose: ["8010"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    shm_size: "1gb"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    networks: [backend]
+
+  redis:
+    image: redis:8.2-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 1
+    networks: [backend]
+
+  # CPU / Apple Silicon friendly local model profile.
+  ollama:
+    image: ollama/ollama:0.12.3
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+    expose: ["11434"]
+    restart: unless-stopped
+    networks: [backend]
+
+  ollama-init:
+    image: curlimages/curl:8.16.0
+    profiles: ["ollama"]
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until curl -fsS http://ollama:11434/api/tags >/dev/null; do sleep 2; done
+        curl -fsS http://ollama:11434/api/pull \
+          -d "{\"name\":\"$${OLLAMA_MODEL}\",\"stream\":false}"
+    networks: [backend]
+
+  # NVIDIA GPU production profile. Set LLM_BASE_URL=http://vllm:8000/v1 and
+  # LLM_MODEL=Qwen/Qwen2.5-7B-Instruct in .env before enabling this profile.
+  vllm:
+    image: vllm/vllm-openai:v0.11.0
+    profiles: ["vllm"]
+    command:
+      - --model
+      - Qwen/Qwen2.5-7B-Instruct
+      - --served-model-name
+      - Qwen/Qwen2.5-7B-Instruct
+      - --max-model-len
+      - "8192"
+      - --enable-prefix-caching
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    expose: ["8000"]
+    restart: unless-stopped
+    networks: [backend]
+
+volumes:
+  redis-data:
+  ollama-data:
+  huggingface-cache:
+
+networks:
+  backend:
+    driver: bridge

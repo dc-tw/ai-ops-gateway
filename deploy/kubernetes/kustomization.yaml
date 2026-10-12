@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - workloads.yaml
+  - autoscaling.yaml
+  - availability.yaml
+  - network-policy.yaml
+configMapGenerator:
+  - name: ai-ops-gateway-config
+    literals:
+      - APP_ENV=production
+      - LLM_MODEL=qwen2.5:7b-instruct
+      - LANGGRAPH_CHECKPOINTING=true
+      - BROWSER_WORKER_URL=http://browser-worker:8010
+      - AGENT_MAX_TOOL_ROUNDS=8
+      - AGENT_DEFAULT_DEADLINE_SECONDS=300
+generatorOptions:
+  disableNameSuffixHash: true

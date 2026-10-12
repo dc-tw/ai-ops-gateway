@@ -1,0 +1,10 @@
+services:
+  gateway:
+    build:
+      args:
+        INSTALL_BROWSER: "false"
+
+  browser:
+    build:
+      args:
+        INSTALL_BROWSER: "false"
