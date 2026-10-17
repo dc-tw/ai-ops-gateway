@@ -13,6 +13,7 @@ from langgraph.types import Command
 from app.api.schemas import AgentRequest, ApprovalDecision
 from app.core.observability import metrics, observe_agent_event
 from app.core.security import authorize, redact_pii
+from app.core.threat_feedback import record_threat_findings
 from app.graph.workflow import build_agent_graph, initial_state
 
 router = APIRouter()
@@ -44,6 +45,14 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
     )
     if input_threat_scan.findings:
         observe_agent_event(input_threat_scan.to_event(), model=model_name)
+        await record_threat_findings(
+            request.app.state.redis,
+            settings,
+            principal.tenant_id,
+            input_threat_scan.to_event(),
+            context_id=request_id,
+            model=model_name,
+        )
     if input_threat_scan.blocked:
         if request.app.state.redis:
             await request.app.state.redis.append_audit(
@@ -225,6 +234,14 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                         metrics.inc("ai_gateway_ttft_observations_total", model=model_name)
                     await publish(event)
                     if event.get("type") == "threat_detection" and redis_runtime:
+                        await record_threat_findings(
+                            redis_runtime,
+                            settings,
+                            principal.tenant_id,
+                            event,
+                            context_id=request_id,
+                            model=model_name,
+                        )
                         await redis_runtime.append_audit(
                             principal.tenant_id,
                             {
@@ -488,6 +505,14 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
                     if event.get("type") == "threat_detection":
+                        await record_threat_findings(
+                            runtime,
+                            request.app.state.settings,
+                            principal.tenant_id,
+                            event,
+                            context_id=request_id,
+                            model=model_name,
+                        )
                         await runtime.append_audit(
                             principal.tenant_id,
                             {
@@ -701,6 +726,14 @@ async def decide_agent_approval(
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
                     if event.get("type") == "threat_detection":
+                        await record_threat_findings(
+                            runtime,
+                            request.app.state.settings,
+                            principal.tenant_id,
+                            event,
+                            context_id=request_id,
+                            model=model_name,
+                        )
                         await runtime.append_audit(
                             principal.tenant_id,
                             {

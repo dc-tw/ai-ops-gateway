@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from pyatr import AgentEvent, ATREngine
 
@@ -13,7 +14,7 @@ SEVERITY_RANK = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical
 class ThreatScan:
     event_type: str
     location: str
-    findings: tuple[dict[str, str], ...]
+    findings: tuple[dict[str, Any], ...]
     blocked: bool
     truncated: bool = False
 
@@ -48,6 +49,8 @@ class ThreatDetector:
         block_severity: str = "high",
         max_content_chars: int = 100_000,
         rules_dir: str = "",
+        blocking_rule_ids: list[str] | None = None,
+        blocking_excluded_rule_ids: list[str] | None = None,
         engine: ATREngine | None = None,
     ) -> None:
         self.enabled = enabled
@@ -55,6 +58,8 @@ class ThreatDetector:
         self.min_severity = min_severity
         self.block_severity = block_severity
         self.max_content_chars = max_content_chars
+        self.blocking_rule_ids = frozenset(blocking_rule_ids or [])
+        self.blocking_excluded_rule_ids = frozenset(blocking_excluded_rule_ids or [])
         self.engine = engine or ATREngine()
         if not enabled:
             self.rule_count = 0
@@ -77,6 +82,8 @@ class ThreatDetector:
             block_severity=settings.atr_block_severity,
             max_content_chars=settings.atr_max_content_chars,
             rules_dir=settings.atr_rules_dir,
+            blocking_rule_ids=settings.atr_blocking_rule_ids,
+            blocking_excluded_rule_ids=settings.atr_blocking_excluded_rule_ids,
         )
 
     def _bounded(self, value: str) -> tuple[str, bool]:
@@ -110,22 +117,30 @@ class ThreatDetector:
                 metadata={str(key): str(value) for key, value in (metadata or {}).items()},
             )
         )
-        findings = tuple(
-            {
-                "rule_id": match.rule_id,
-                "title": match.title,
-                "severity": match.severity,
-                "confidence": match.confidence,
-            }
-            for match in matches
-            if SEVERITY_RANK.get(match.severity, 0)
-            >= SEVERITY_RANK.get(self.min_severity, 2)
-        )
-        blocked = self.blocking and any(
-            SEVERITY_RANK.get(item["severity"], 0)
-            >= SEVERITY_RANK.get(self.block_severity, 3)
-            for item in findings
-        )
+        findings_list: list[dict[str, Any]] = []
+        for match in matches:
+            if SEVERITY_RANK.get(match.severity, 0) < SEVERITY_RANK.get(self.min_severity, 2):
+                continue
+            block_candidate = (
+                SEVERITY_RANK.get(match.severity, 0) >= SEVERITY_RANK.get(self.block_severity, 3)
+                and (not self.blocking_rule_ids or match.rule_id in self.blocking_rule_ids)
+                and match.rule_id not in self.blocking_excluded_rule_ids
+            )
+            findings_list.append(
+                {
+                    "finding_id": str(uuid4()),
+                    "rule_id": match.rule_id,
+                    "title": match.title,
+                    "severity": match.severity,
+                    "confidence": match.confidence,
+                    "block_candidate": block_candidate,
+                    "enforcement_action": (
+                        "blocked" if self.blocking and block_candidate else "detected"
+                    ),
+                }
+            )
+        findings = tuple(findings_list)
+        blocked = any(item["enforcement_action"] == "blocked" for item in findings)
         return ThreatScan(event_type, location, findings, blocked, truncated)
 
     async def ascan(

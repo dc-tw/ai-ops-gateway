@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.routes import router
+from app.api.security_routes import router as security_router
 from app.core.config import Settings, get_settings
 from app.core.observability import install_observability
 from app.core.redis_runtime import RedisRuntime
@@ -90,6 +91,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         lifespan=lifespan,
     )
     app.include_router(router)
+    app.include_router(security_router)
     app.include_router(goals_router)
     install_observability(app, app_settings)
     return app

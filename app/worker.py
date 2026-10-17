@@ -10,6 +10,7 @@ from app.core.config import get_settings
 from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatBlockedError, ThreatDetector
+from app.core.threat_feedback import record_threat_findings
 from app.graph.workflow import build_agent_graph, initial_state
 from app.llm.client import ModelRouter
 from app.tools.browser import BrowserScraper
@@ -84,6 +85,14 @@ async def execute_goal(
                         fields={"agent_output": step["query"]},
                     )
                     if scan.findings:
+                        await record_threat_findings(
+                            runtime,
+                            get_settings(),
+                            tenant_id,
+                            scan.to_event(),
+                            context_id=goal_id,
+                            model=goal["model"],
+                        )
                         await runtime.append_goal_event(
                             goal_id, scan.to_event(), tenant_id
                         )
@@ -154,6 +163,15 @@ async def execute_goal(
                     stream_mode="custom",
                 ):
                     observe_agent_event(event, model=goal["model"])
+                    if event.get("type") == "threat_detection":
+                        await record_threat_findings(
+                            runtime,
+                            get_settings(),
+                            tenant_id,
+                            event,
+                            context_id=goal_id,
+                            model=goal["model"],
+                        )
                     await runtime.append_goal_event(
                         goal_id,
                         {"type": "agent_event", "step_index": index, "event": event},

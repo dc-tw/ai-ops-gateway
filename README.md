@@ -148,6 +148,35 @@ LLM context 前被隔離，模型輸出則先完整緩衝並通過掃描後才�
 YAML 規則目錄；留空時使用 `pyatr` bundled rules。`GET /healthz` 顯示規則數與 blocking 狀態，
 Prometheus 提供 `ai_gateway_threat_detections_total` 與 `ai_gateway_threat_blocks_total`。
 
+### Detection-only 校準與正式阻擋
+
+Detection-only 命中會在 Redis 保存 30 天的 privacy-safe metadata，包括 rule、severity、
+event boundary、model、request/Goal ID 與審查狀態；不保存 prompt、網頁內容或 matched regex。
+安全管理者可列出 finding 並標記結果：
+
+```bash
+curl 'http://localhost:8000/v1/security/threat-findings?review_status=unreviewed' \
+  -H 'x-api-key: ADMIN_KEY'
+
+curl -X POST http://localhost:8000/v1/security/threat-findings/FINDING_ID/review \
+  -H 'content-type: application/json' -H 'x-api-key: ADMIN_KEY' \
+  -d '{"verdict":"false_positive","reason":"Approved internal red-team phrase"}'
+
+curl http://localhost:8000/v1/security/threat-findings/stats/rules \
+  -H 'x-api-key: ADMIN_KEY'
+```
+
+Rule statistics 會回傳 reviewed sample、false-positive rate 與 `recommended_for_blocking`。
+預設建議門檻是至少 20 個已判定 true/false-positive 樣本且誤判率不超過 5%。建議 rollout：
+
+1. 保持 `ATR_BLOCKING=false` 蒐集並人工標記資料。
+2. 將達標規則寫入 `ATR_BLOCKING_RULE_IDS`；已知誤判規則寫入
+   `ATR_BLOCKING_EXCLUDED_RULE_IDS`。
+3. 在 staging 設定 `ATR_BLOCKING=true`，確認 SSE、工具與 Goal 行為。
+4. production 逐批加入規則；若誤判升高，以 excluded list 即時停止該規則阻擋。
+
+系統不會因統計結果自行切換 production enforcement；切換必須經設定變更與部署審核。
+
 同一個 `conversation_id` 會載入 Redis 的近期訊息、rolling summary 與相關長期記憶；
 下一輪可指定另一個 allow-listed `model`。`LLM_ROUTES_JSON` 在伺服器端把 alias 映射到
 不同 Ollama／vLLM endpoint；客戶端不能提交推理 URL 或任意模型名稱。

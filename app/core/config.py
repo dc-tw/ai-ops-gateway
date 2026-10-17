@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     atr_block_severity: str = Field(default="high", pattern=r"^(low|medium|high|critical)$")
     atr_max_content_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     atr_rules_dir: str = ""
+    atr_blocking_rule_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    atr_blocking_excluded_rule_ids: Annotated[list[str], NoDecode] = Field(
+        default_factory=list
+    )
+    atr_findings_ttl_seconds: int = Field(default=2_592_000, ge=3_600)
+    atr_findings_max_records: int = Field(default=10_000, ge=100, le=100_000)
+    atr_calibration_min_reviews: int = Field(default=20, ge=1, le=10_000)
+    atr_calibration_max_false_positive_rate: float = Field(default=0.05, ge=0, le=1)
 
     @field_validator("playwright_allowed_domains", mode="before")
     @classmethod
@@ -83,6 +91,13 @@ class Settings(BaseSettings):
     @field_validator("content_blocked_patterns", mode="before")
     @classmethod
     def split_blocked_patterns(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("atr_blocking_rule_ids", "atr_blocking_excluded_rule_ids", mode="before")
+    @classmethod
+    def split_atr_rule_ids(cls, value: object) -> object:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value

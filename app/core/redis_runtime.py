@@ -145,6 +145,154 @@ class RedisRuntime:
             )
         )
 
+    async def save_threat_findings(
+        self,
+        tenant_id: str,
+        event: dict[str, Any],
+        *,
+        context_id: str,
+        model: str,
+        ttl_seconds: int,
+        max_records: int,
+    ) -> list[dict[str, Any]]:
+        """Persist privacy-safe ATR metadata; raw scanned content is never stored."""
+        now = datetime.now(UTC)
+        index_key = self._tenant_key(tenant_id, "security:threat-findings")
+        records: list[dict[str, Any]] = []
+        for finding in event.get("findings", []):
+            if not isinstance(finding, dict) or not finding.get("finding_id"):
+                continue
+            record = {
+                "finding_id": str(finding["finding_id"]),
+                "context_id": context_id,
+                "model": model,
+                "rule_id": str(finding.get("rule_id", "")),
+                "title": str(finding.get("title", "")),
+                "severity": str(finding.get("severity", "unknown")),
+                "confidence": str(finding.get("confidence", "unknown")),
+                "event_type": str(event.get("event_type", "unknown")),
+                "location": str(event.get("location", "unknown")),
+                "block_candidate": bool(finding.get("block_candidate", False)),
+                "enforcement_status": str(
+                    finding.get("enforcement_action", "detected")
+                ),
+                "review_status": "unreviewed",
+                "review_reason": "",
+                "reviewed_by": "",
+                "reviewed_at": "",
+                "created_at": now.isoformat(),
+            }
+            records.append(record)
+        if not records:
+            return []
+        async with self._client.pipeline(transaction=True) as pipe:
+            for record in records:
+                finding_id = record["finding_id"]
+                pipe.set(
+                    self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}"),
+                    json.dumps(record, ensure_ascii=False),
+                    ex=ttl_seconds,
+                )
+                pipe.zadd(index_key, {finding_id: now.timestamp()})
+            pipe.expire(index_key, ttl_seconds)
+            pipe.zremrangebyscore(index_key, "-inf", now.timestamp() - ttl_seconds)
+            await pipe.execute()
+        count = int(await self._client.zcard(index_key))
+        if count > max_records:
+            stale_ids = await self._client.zrange(index_key, 0, count - max_records - 1)
+            if stale_ids:
+                async with self._client.pipeline(transaction=True) as pipe:
+                    pipe.zrem(index_key, *stale_ids)
+                    pipe.delete(
+                        *[
+                            self._tenant_key(
+                                tenant_id, f"security:threat-finding:{finding_id}"
+                            )
+                            for finding_id in stale_ids
+                        ]
+                    )
+                    await pipe.execute()
+        return records
+
+    async def get_threat_finding(
+        self, tenant_id: str, finding_id: str
+    ) -> dict[str, Any] | None:
+        value = await self._client.get(
+            self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}")
+        )
+        return json.loads(value) if value else None
+
+    async def list_threat_findings(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 100,
+        review_status: str = "",
+        rule_id: str = "",
+    ) -> list[dict[str, Any]]:
+        index_key = self._tenant_key(tenant_id, "security:threat-findings")
+        records: list[dict[str, Any]] = []
+        expired: list[str] = []
+        offset = 0
+        batch_size = min(max(limit, 100), 1_000)
+        while len(records) < limit:
+            finding_ids = await self._client.zrevrange(
+                index_key, offset, offset + batch_size - 1
+            )
+            if not finding_ids:
+                break
+            offset += len(finding_ids)
+            keys = [
+                self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}")
+                for finding_id in finding_ids
+            ]
+            values = await self._client.mget(keys)
+            for finding_id, value in zip(finding_ids, values, strict=True):
+                if not value:
+                    expired.append(finding_id)
+                    continue
+                record = json.loads(value)
+                if review_status and record.get("review_status") != review_status:
+                    continue
+                if rule_id and record.get("rule_id") != rule_id:
+                    continue
+                records.append(record)
+                if len(records) >= limit:
+                    break
+            if len(finding_ids) < batch_size:
+                break
+        if expired:
+            await self._client.zrem(index_key, *expired)
+        return records
+
+    async def review_threat_finding(
+        self,
+        tenant_id: str,
+        finding_id: str,
+        *,
+        review_status: str,
+        reason: str,
+        reviewer: str,
+        ttl_seconds: int,
+    ) -> dict[str, Any] | None:
+        record = await self.get_threat_finding(tenant_id, finding_id)
+        if record is None:
+            return None
+        record.update(
+            {
+                "review_status": review_status,
+                "review_reason": reason,
+                "reviewed_by": reviewer,
+                "reviewed_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        await self._client.set(
+            self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}"),
+            json.dumps(record, ensure_ascii=False),
+            ex=ttl_seconds,
+        )
+        return record
+
     async def remember(
         self, request_id: str, result: dict[str, Any], ttl_seconds: int = 3600
     ) -> None:

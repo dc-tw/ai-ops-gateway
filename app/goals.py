@@ -10,6 +10,7 @@ from app.api.routes import _sse
 from app.api.schemas import GoalCreateRequest
 from app.core.observability import observe_agent_event
 from app.core.security import authorize, redact_pii
+from app.core.threat_feedback import record_threat_findings
 
 router = APIRouter(prefix="/v1/goals", tags=["goals"])
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -77,6 +78,14 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
     model_name = payload.model or request.app.state.model_router.default_model
     for scan in threat_scans:
         observe_agent_event(scan.to_event(), model=model_name)
+        await record_threat_findings(
+            runtime,
+            request.app.state.settings,
+            principal.tenant_id,
+            scan.to_event(),
+            context_id=goal_id,
+            model=model_name,
+        )
     blocked_scan = next((scan for scan in threat_scans if scan.blocked), None)
     if blocked_scan:
         await runtime.append_audit(
