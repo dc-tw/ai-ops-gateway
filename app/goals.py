@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from app.api.routes import _sse
 from app.api.schemas import GoalCreateRequest
+from app.core.observability import observe_agent_event
 from app.core.security import authorize, redact_pii
 
 router = APIRouter(prefix="/v1/goals", tags=["goals"])
@@ -35,6 +36,11 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     goal_id = str(uuid4())
     now = _now()
+    objective = (
+        redact_pii(payload.objective)
+        if request.app.state.settings.pii_redaction
+        else payload.objective
+    )
     steps = [
         {
             "id": str(uuid4()),
@@ -50,14 +56,51 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         }
         for step in payload.steps
     ]
+    threat_scans = [
+        await request.app.state.threat_detector.ascan(
+            objective,
+            event_type="llm_input",
+            location="goal_objective",
+            fields={"user_input": objective},
+        ),
+        *[
+            await request.app.state.threat_detector.ascan(
+                step["query"],
+                event_type="llm_input",
+                location=f"goal_step:{index}",
+                fields={"user_input": step["query"]},
+            )
+            for index, step in enumerate(steps)
+        ],
+    ]
+    threat_scans = [scan for scan in threat_scans if scan.findings]
+    model_name = payload.model or request.app.state.model_router.default_model
+    for scan in threat_scans:
+        observe_agent_event(scan.to_event(), model=model_name)
+    blocked_scan = next((scan for scan in threat_scans if scan.blocked), None)
+    if blocked_scan:
+        await runtime.append_audit(
+            principal.tenant_id,
+            {
+                "action": "goal.threat_detection",
+                "status": "blocked",
+                "subject": principal.subject,
+                "goal_id": goal_id,
+                "event": blocked_scan.to_event(),
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "atr_threat_blocked",
+                "goal_id": goal_id,
+                "findings": list(blocked_scan.findings),
+            },
+        )
     goal = {
         "goal_id": goal_id,
-        "objective": (
-            redact_pii(payload.objective)
-            if request.app.state.settings.pii_redaction
-            else payload.objective
-        ),
-        "model": payload.model or request.app.state.model_router.default_model,
+        "objective": objective,
+        "model": model_name,
         "max_retries": payload.max_retries,
         "max_tool_rounds": payload.max_tool_rounds,
         "step_deadline_seconds": payload.step_deadline_seconds,
@@ -73,6 +116,18 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
     await runtime.append_goal_event(
         goal_id, {"type": "goal_queued", "goal": goal}, principal.tenant_id
     )
+    for scan in threat_scans:
+        await runtime.append_goal_event(goal_id, scan.to_event(), principal.tenant_id)
+        await runtime.append_audit(
+            principal.tenant_id,
+            {
+                "action": "goal.threat_detection",
+                "status": "detected",
+                "subject": principal.subject,
+                "goal_id": goal_id,
+                "event": scan.to_event(),
+            },
+        )
     await runtime.enqueue_goal(goal_id, principal.tenant_id)
     await runtime.append_audit(
         principal.tenant_id,

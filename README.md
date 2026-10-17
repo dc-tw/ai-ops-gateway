@@ -9,7 +9,8 @@ LangGraph、Playwright、MCP、Redis，以及可互換的 Ollama / vLLM 推理�
 flowchart LR
     C[Client / Internal Service] -->|POST + SSE| G[FastAPI Gateway]
     G --> A[Auth / Conversation ID / Model Selection]
-    A --> LG[LangGraph Orchestrator]
+    A --> ATR[ATR Threat Detection]
+    ATR --> LG[LangGraph Orchestrator]
 
     subgraph Workflow[Durable Agent Workflow]
       P[Planning] --> TC[Tool Call]
@@ -32,6 +33,8 @@ flowchart LR
     MCP --> BW
     BW --> PW[Playwright Chromium]
     PW --> WEB[Allow-listed public web]
+    TC -. tool args / result .-> ATR
+    E -. model output .-> ATR
 
     G <-->|tenant memory / SSE replay / checkpoint / audit| RD[(Redis 8)]
     RD --> GW[Durable Goal Worker]
@@ -60,6 +63,9 @@ flowchart LR
   與 dead-letter stream。
 - **安全與治理**：支援多租戶 API key、OIDC/JWKS JWT、RBAC、rate/concurrency/token quota、
   PII redaction、模型 allow-list、內容政策、checkpoint-backed human approval、取消與 deadline。
+- **Agent Threat Rules (ATR)**：載入 `pyatr` 規則，自動掃描 user/Goal input、tool call、
+  Playwright/MCP response、Goal planner 與 model output。預設為 detection-only；可依 severity
+  開啟 blocking。事件與 audit 不包含原文或命中的 regex，避免安全遙測二次洩密。
 - **可觀測性**：`/metrics` 提供 HTTP、TTFT、token、tool、retry、Evidence Validation、active-run 指標；
   provider 有回報 usage 時，記錄精確 input/output token 與依模型 route 設定計算的 USD 成本。
   設定 OTLP endpoint 後啟用 OpenTelemetry tracing。對外不回傳 hidden chain-of-thought。
@@ -118,11 +124,29 @@ curl -N http://localhost:8000/v1/agent/stream \
   }'
 ```
 
-事件類型包含：`accepted`、`node_status`、`tool_status`、`approval_required`、
+事件類型包含：`accepted`、`node_status`、`tool_status`、`threat_detection`、`approval_required`、
 `model_usage`、`draft_token`、`evidence_validation`、`retry`、`token`、`completed`、
 `cancelled`、`error`。`draft_token` 是尚未通過
 Evidence Validation 的真實模型串流，只適合即時預覽與 TTFT；正式答案應使用驗證後的
 `token`／`completed.answer`。註解 heartbeat 不會觸發 EventSource message handler。
+
+## Agent Threat Rules 自動檢測
+
+Gateway 使用 [ATR / pyatr](https://github.com/dc-tw/agent-threat-rules) 的 Layer-1 規則引擎。
+偵測預設開啟但不阻擋，以便先觀察 false positive；正式環境可設定：
+
+```env
+ATR_ENABLED=true
+ATR_BLOCKING=true
+ATR_MIN_SEVERITY=medium
+ATR_BLOCK_SEVERITY=high
+```
+
+當 `ATR_BLOCKING=true` 時，達門檻的 request/Goal 會收到 HTTP 403；工具內容會在進入
+LLM context 前被隔離，模型輸出則先完整緩衝並通過掃描後才送出 `draft_token`。因此阻擋模式
+刻意犧牲 generation TTFT，換取「未掃描內容不先洩漏」的保證。`ATR_RULES_DIR` 可改用企業自訂
+YAML 規則目錄；留空時使用 `pyatr` bundled rules。`GET /healthz` 顯示規則數與 blocking 狀態，
+Prometheus 提供 `ai_gateway_threat_detections_total` 與 `ai_gateway_threat_blocks_total`。
 
 同一個 `conversation_id` 會載入 Redis 的近期訊息、rolling summary 與相關長期記憶；
 下一輪可指定另一個 allow-listed `model`。`LLM_ROUTES_JSON` 在伺服器端把 alias 映射到
@@ -309,6 +333,8 @@ sh scripts/test_ollama_stack.sh
 
 - Deterministic Evidence gate 可證明來源、hash、citation 與數值對應，但不能取代人工審查
   或專業領域 NLI／完整語意事實查核。
+- ATR 目前是 pattern-based Layer-1 detection；命中代表規則證據，不等同已證實攻擊。
+  blocking 應先以 detection-only 流量校準，語意型／跨事件攻擊仍需 classifier、人工審查或 SIEM 關聯。
 - Prometheus metrics 為 process-local；多 replica 部署應由 Prometheus 分別 scrape，再集中彙總。
 - Kubernetes baseline 使用 ClientIP affinity；跨 cluster、pod replacement 或 service mesh 環境仍建議
   使用外部 session-owner registry，而不能假設 affinity 永遠保留 session。

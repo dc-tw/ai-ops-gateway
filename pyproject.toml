@@ -21,6 +21,7 @@ dependencies = [
   "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
   "opentelemetry-instrumentation-fastapi>=0.51b0,<1",
   "pydantic-settings>=2.7,<3",
+  "pyatr>=0.3,<0.4",
   "PyJWT[crypto]>=2.10,<3",
   "redis>=5.2,<8",
   "uvicorn[standard]>=0.34,<1",

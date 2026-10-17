@@ -93,6 +93,23 @@ def observe_agent_event(event: dict[str, Any], *, model: str) -> None:
                 float(usage.get("cost_usd", 0)),
                 model=model,
             )
+    elif event_type == "threat_detection":
+        findings = event.get("findings", [])
+        if isinstance(findings, list):
+            for finding in findings:
+                if isinstance(finding, dict):
+                    metrics.inc(
+                        "ai_gateway_threat_detections_total",
+                        model=model,
+                        severity=str(finding.get("severity", "unknown")),
+                        event_type=str(event.get("event_type", "unknown")),
+                    )
+        if event.get("status") == "blocked":
+            metrics.inc(
+                "ai_gateway_threat_blocks_total",
+                model=model,
+                event_type=str(event.get("event_type", "unknown")),
+            )
 
 
 def install_observability(app: FastAPI, settings: Any) -> None:

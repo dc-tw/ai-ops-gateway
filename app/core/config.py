@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     tenant_daily_token_budget: int = Field(default=1_000_000, ge=1_000)
     pii_redaction: bool = True
     content_blocked_patterns: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    atr_enabled: bool = True
+    atr_blocking: bool = False
+    atr_min_severity: str = Field(
+        default="medium", pattern=r"^(informational|low|medium|high|critical)$"
+    )
+    atr_block_severity: str = Field(default="high", pattern=r"^(low|medium|high|critical)$")
+    atr_max_content_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    atr_rules_dir: str = ""
 
     @field_validator("playwright_allowed_domains", mode="before")
     @classmethod

@@ -7,7 +7,9 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.config import get_settings
+from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
+from app.core.threat_detection import ThreatBlockedError, ThreatDetector
 from app.graph.workflow import build_agent_graph, initial_state
 from app.llm.client import ModelRouter
 from app.tools.browser import BrowserScraper
@@ -58,6 +60,7 @@ async def execute_goal(
     checkpointer: object | None = None,
     tenant_id: str = "default",
     tool_executor: ToolExecutor | None = None,
+    threat_detector: ThreatDetector | None = None,
 ) -> None:
     goal = await runtime.get_goal(goal_id, tenant_id)
     if not goal or goal.get("status") != "queued":
@@ -72,6 +75,20 @@ async def execute_goal(
     try:
         if not goal["steps"]:
             goal["steps"] = await _plan_steps(goal, router)
+            if threat_detector:
+                for index, step in enumerate(goal["steps"]):
+                    scan = await threat_detector.ascan(
+                        step["query"],
+                        event_type="llm_output",
+                        location=f"goal_planner_step:{index}",
+                        fields={"agent_output": step["query"]},
+                    )
+                    if scan.findings:
+                        await runtime.append_goal_event(
+                            goal_id, scan.to_event(), tenant_id
+                        )
+                    if scan.blocked:
+                        raise ThreatBlockedError(scan)
             await runtime.save_goal(goal_id, goal, tenant_id)
             await runtime.append_goal_event(
                 goal_id,
@@ -116,6 +133,7 @@ async def execute_goal(
                 scraper,
                 checkpointer=checkpointer,
                 tool_executor=tool_executor,
+                threat_detector=threat_detector,
             )
             completed: dict[str, Any] | None = None
             graph_input = None if resume_checkpoint else initial_state(
@@ -135,6 +153,7 @@ async def execute_goal(
                     config={"configurable": {"thread_id": f"{goal_id}:{step['id']}"}},
                     stream_mode="custom",
                 ):
+                    observe_agent_event(event, model=goal["model"])
                     await runtime.append_goal_event(
                         goal_id,
                         {"type": "agent_event", "step_index": index, "event": event},
@@ -238,6 +257,7 @@ async def main() -> None:
     runtime = RedisRuntime(settings.redis_url, settings.redis_stream_maxlen)
     router = ModelRouter(settings)
     scraper = BrowserScraper(settings)
+    threat_detector = ThreatDetector.from_settings(settings)
     tool_executor = None
     if settings.browser_worker_url:
         tool_executor = RemoteBrowserToolExecutor(
@@ -278,6 +298,7 @@ async def main() -> None:
                     checkpointer=checkpointer,
                     tenant_id=tenant_id,
                     tool_executor=tool_executor,
+                    threat_detector=threat_detector,
                 )
                 finished = await runtime.get_goal(goal_id, tenant_id)
                 error = (

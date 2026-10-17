@@ -34,6 +34,36 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
     principal = await authorize(request, "operator")
     settings = request.app.state.settings
     safe_query = redact_pii(payload.query) if settings.pii_redaction else payload.query
+    request_id = str(uuid4())
+    model_name = payload.model or request.app.state.model_router.default_model
+    input_threat_scan = await request.app.state.threat_detector.ascan(
+        safe_query,
+        event_type="llm_input",
+        location="agent_request",
+        fields={"user_input": safe_query},
+    )
+    if input_threat_scan.findings:
+        observe_agent_event(input_threat_scan.to_event(), model=model_name)
+    if input_threat_scan.blocked:
+        if request.app.state.redis:
+            await request.app.state.redis.append_audit(
+                principal.tenant_id,
+                {
+                    "action": "agent.threat_detection",
+                    "status": "blocked",
+                    "subject": principal.subject,
+                    "request_id": request_id,
+                    "event": input_threat_scan.to_event(),
+                },
+            )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "atr_threat_blocked",
+                "request_id": request_id,
+                "findings": list(input_threat_scan.findings),
+            },
+        )
     if any(
         re.search(pattern, safe_query, re.IGNORECASE)
         for pattern in settings.content_blocked_patterns
@@ -42,9 +72,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
     if max(1, len(safe_query) // 4) > settings.request_token_budget:
         raise HTTPException(status_code=413, detail="Request exceeds token budget")
 
-    request_id = str(uuid4())
     conversation_id = payload.conversation_id or str(uuid4())
-    model_name = payload.model or request.app.state.model_router.default_model
     try:
         selected_model = request.app.state.model_router.get(model_name)
     except ValueError as exc:
@@ -55,6 +83,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         tool_executor=request.app.state.tool_executor,
         autonomous_tool_planning=settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
+        threat_detector=request.app.state.threat_detector,
     )
     redis_runtime = request.app.state.redis
     max_retries = (
@@ -166,6 +195,19 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                     "history_messages": len(history),
                 }
             )
+            if input_threat_scan.findings:
+                await publish(input_threat_scan.to_event())
+                if redis_runtime:
+                    await redis_runtime.append_audit(
+                        principal.tenant_id,
+                        {
+                            "action": "agent.threat_detection",
+                            "status": "detected",
+                            "subject": principal.subject,
+                            "request_id": request_id,
+                            "event": input_threat_scan.to_event(),
+                        },
+                    )
             async with asyncio.timeout(deadline_seconds):
                 async for event in graph.astream(
                     state,
@@ -182,6 +224,17 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                         )
                         metrics.inc("ai_gateway_ttft_observations_total", model=model_name)
                     await publish(event)
+                    if event.get("type") == "threat_detection" and redis_runtime:
+                        await redis_runtime.append_audit(
+                            principal.tenant_id,
+                            {
+                                "action": "agent.threat_detection",
+                                "status": event.get("status", "detected"),
+                                "subject": principal.subject,
+                                "request_id": request_id,
+                                "event": event,
+                            },
+                        )
                     if event.get("type") == "model_usage" and isinstance(
                         event.get("usage"), dict
                     ):
@@ -400,6 +453,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
         tool_executor=request.app.state.tool_executor,
         autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
+        threat_detector=request.app.state.threat_detector,
     )
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
@@ -433,6 +487,17 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                 ):
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
+                    if event.get("type") == "threat_detection":
+                        await runtime.append_audit(
+                            principal.tenant_id,
+                            {
+                                "action": "agent.threat_detection",
+                                "status": event.get("status", "detected"),
+                                "subject": principal.subject,
+                                "request_id": request_id,
+                                "event": event,
+                            },
+                        )
                     if event.get("type") == "model_usage" and isinstance(
                         event.get("usage"), dict
                     ):
@@ -601,6 +666,7 @@ async def decide_agent_approval(
         tool_executor=request.app.state.tool_executor,
         autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
+        threat_detector=request.app.state.threat_detector,
     )
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
@@ -634,6 +700,17 @@ async def decide_agent_approval(
                 ):
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
+                    if event.get("type") == "threat_detection":
+                        await runtime.append_audit(
+                            principal.tenant_id,
+                            {
+                                "action": "agent.threat_detection",
+                                "status": event.get("status", "detected"),
+                                "subject": principal.subject,
+                                "request_id": request_id,
+                                "event": event,
+                            },
+                        )
                     if event.get("type") == "model_usage" and isinstance(
                         event.get("usage"), dict
                     ):
@@ -829,7 +906,16 @@ async def health(request: Request) -> dict[str, object]:
             redis_ok = await request.app.state.redis.ping()
         except Exception:
             redis_ok = False
-    return {"status": "ok", "redis": redis_ok}
+    detector = request.app.state.threat_detector
+    return {
+        "status": "ok",
+        "redis": redis_ok,
+        "atr": {
+            "enabled": detector.enabled,
+            "blocking": detector.blocking,
+            "rules": detector.rule_count,
+        },
+    }
 
 
 @router.get("/readyz")
@@ -845,7 +931,11 @@ async def readiness(request: Request) -> JSONResponse:
         or request.app.state.checkpointer is not None
     )
     return JSONResponse(
-        {"status": "ready" if ready else "not_ready", "redis": bool(redis_ok)},
+        {
+            "status": "ready" if ready else "not_ready",
+            "redis": bool(redis_ok),
+            "atr_rules": request.app.state.threat_detector.rule_count,
+        },
         status_code=200 if ready else 503,
     )
 

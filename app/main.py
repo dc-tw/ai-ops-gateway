@@ -8,6 +8,7 @@ from app.api.routes import router
 from app.core.config import Settings, get_settings
 from app.core.observability import install_observability
 from app.core.redis_runtime import RedisRuntime
+from app.core.threat_detection import ThreatDetector
 from app.goals import router as goals_router
 from app.llm.client import ModelRouter
 from app.tools.browser import BrowserScraper, BrowserSessionManager
@@ -26,6 +27,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     async def lifespan(app: FastAPI):
         app.state.settings = app_settings
         app.state.model_router = ModelRouter(app_settings)
+        app.state.threat_detector = ThreatDetector.from_settings(app_settings)
         app.state.scraper = BrowserScraper(app_settings)
         app.state.browser_sessions = BrowserSessionManager(app_settings)
         if app_settings.browser_worker_url:
