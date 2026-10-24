@@ -85,10 +85,15 @@ def test_atr_blocking_can_be_calibrated_with_rule_allow_and_exclude_lists() -> N
 
 
 class ToolResponseModel:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
     async def complete(self, system: str, prompt: str) -> str:
+        self.prompts.append(prompt)
         return '{"tool":null,"arguments":{}}'
 
     async def stream(self, system: str, prompt: str) -> AsyncIterator[str]:
+        self.prompts.append(prompt)
         yield "I could not safely use the source."
 
 
@@ -125,6 +130,8 @@ async def test_blocking_mode_does_not_stream_unscanned_model_output() -> None:
     ]
 
     assert not [event for event in events if event.get("type") == "draft_token"]
+    serialized_events = str(events).lower()
+    assert "ignore all previous instructions" not in serialized_events
     threat = next(event for event in events if event.get("type") == "threat_detection")
     assert threat["location"] == "model_output"
     assert threat["status"] == "blocked"
@@ -132,8 +139,9 @@ async def test_blocking_mode_does_not_stream_unscanned_model_output() -> None:
 
 @pytest.mark.asyncio
 async def test_langgraph_scans_and_blocks_untrusted_tool_response() -> None:
+    model = ToolResponseModel()
     graph = build_agent_graph(
-        ToolResponseModel(),
+        model,
         object(),
         tool_executor=InjectedPageTool(),
         threat_detector=detector(blocking=True),
@@ -160,6 +168,10 @@ async def test_langgraph_scans_and_blocks_untrusted_tool_response() -> None:
         if event.get("type") == "tool_status" and event.get("status") == "failed"
     )
     assert "ATR blocked" in failed["error"]
+    assert all(
+        "ignore all previous instructions" not in prompt.lower()
+        for prompt in model.prompts
+    )
 
 
 class CalibrationRedis:
@@ -238,3 +250,35 @@ def test_admin_can_label_findings_and_get_blocking_recommendation() -> None:
     assert stats.status_code == 200
     assert stats.json()["rules"][0]["false_positive_rate"] == 0
     assert stats.json()["rules"][0]["recommended_for_blocking"] is True
+    assert stats.json()["mode"] == "detection_only"
+    assert app.state.threat_detector.blocking is False
+
+
+def test_false_positive_rate_prevents_blocking_recommendation() -> None:
+    redis = CalibrationRedis()
+    template = next(iter(redis.records.values())).copy()
+    redis.records = {}
+    for index in range(20):
+        finding_id = str(uuid4())
+        redis.records[finding_id] = {
+            **template,
+            "finding_id": finding_id,
+            "review_status": "false_positive" if index == 0 else "true_positive",
+        }
+
+    app = create_app(
+        settings=Settings(
+            atr_enabled=False,
+            atr_calibration_min_reviews=20,
+            atr_calibration_max_false_positive_rate=0.04,
+        ),
+        redis_runtime=redis,
+    )
+    with TestClient(app) as client:
+        stats = client.get("/v1/security/threat-findings/stats/rules")
+
+    rule = stats.json()["rules"][0]
+    assert rule["reviewed_for_precision"] == 20
+    assert rule["false_positive_rate"] == 0.05
+    assert rule["recommended_for_blocking"] is False
+    assert app.state.threat_detector.blocking is False

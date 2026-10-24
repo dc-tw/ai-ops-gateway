@@ -19,7 +19,11 @@ def test_sse_frame_is_valid_and_json_encoded() -> None:
 
 
 class FakeGraph:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
         yield {"type": "token", "content": "hello"}
         yield {"type": "completed", "answer": "hello", "evidence_validated": True}
 
@@ -172,10 +176,12 @@ def test_stream_endpoint_returns_ordered_sse_events() -> None:
 
 
 def test_atr_can_block_malicious_request_before_agent_execution() -> None:
+    graph = FakeGraph()
+    redis = FakeRedis()
     app = create_app(
-        graph=FakeGraph(),
+        graph=graph,
         settings=Settings(atr_blocking=True),
-        redis_runtime=FakeRedis(),
+        redis_runtime=redis,
     )
     with TestClient(app) as client:
         response = client.post(
@@ -186,6 +192,9 @@ def test_atr_can_block_malicious_request_before_agent_execution() -> None:
     assert response.status_code == 403
     assert response.json()["detail"]["error"] == "atr_threat_blocked"
     assert response.json()["detail"]["findings"]
+    assert graph.calls == 0
+    assert redis.run_states == {}
+    assert redis.messages == {}
 
 
 def test_detection_only_records_metadata_without_blocking_or_raw_content() -> None:

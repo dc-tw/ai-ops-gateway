@@ -17,7 +17,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ${COMPOSE} up --detach --build
-${COMPOSE} wait ollama-init
+OLLAMA_INIT_ID="$(${COMPOSE} ps -aq ollama-init)"
+test -n "${OLLAMA_INIT_ID}"
+for _ in $(seq 1 150); do
+  INIT_STATUS="$(docker inspect --format '{{.State.Status}}' "${OLLAMA_INIT_ID}")"
+  if [ "${INIT_STATUS}" = "exited" ]; then
+    test "$(docker inspect --format '{{.State.ExitCode}}' "${OLLAMA_INIT_ID}")" = "0"
+    break
+  fi
+  sleep 2
+done
+test "${INIT_STATUS}" = "exited"
 
 attempt=0
 until curl --fail --silent http://localhost:8000/healthz >/dev/null; do

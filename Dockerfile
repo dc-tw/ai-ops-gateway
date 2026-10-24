@@ -19,7 +19,7 @@ RUN touch README.md \
     && if [ "${INSTALL_BROWSER}" = "true" ]; then \
       pip install '.[browser,mcp]'; \
     else \
-      pip install .; \
+      pip install '.[mcp]'; \
     fi
 
 RUN if [ "${INSTALL_BROWSER}" = "true" ]; then \

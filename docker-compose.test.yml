@@ -10,6 +10,8 @@ services:
       LLM_INPUT_COST_PER_MILLION: "2"
       LLM_OUTPUT_COST_PER_MILLION: "8"
       CONVERSATION_MAX_TURNS: "2"
+      ATR_ENABLED: ${ATR_ENABLED:-true}
+      ATR_BLOCKING: ${ATR_BLOCKING:-false}
 
   browser:
     build:
@@ -25,6 +27,8 @@ services:
       LLM_OUTPUT_COST_PER_MILLION: "8"
       PLAYWRIGHT_ALLOWED_DOMAINS: example.com
       CONVERSATION_MAX_TURNS: "2"
+      ATR_ENABLED: ${ATR_ENABLED:-true}
+      ATR_BLOCKING: ${ATR_BLOCKING:-false}
     depends_on:
       mock-llm:
         condition: service_healthy

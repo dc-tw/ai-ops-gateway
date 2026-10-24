@@ -16,7 +16,11 @@ import httpx
 class Sample:
     status_code: int
     ttft_ms: float
+    draft_ttft_ms: float | None
+    final_ttft_ms: float | None
     total_ms: float
+    draft_token_events: int
+    final_token_events: int
     token_events: int
     completed: bool
 
@@ -24,6 +28,10 @@ class Sample:
 async def measure(client: httpx.AsyncClient, endpoint: str, payload: dict[str, object]) -> Sample:
     started = time.perf_counter()
     first_token_at: float | None = None
+    first_draft_at: float | None = None
+    first_final_at: float | None = None
+    draft_token_events = 0
+    final_token_events = 0
     token_events = 0
     completed = False
     current_event = ""
@@ -36,9 +44,16 @@ async def measure(client: httpx.AsyncClient, endpoint: str, payload: dict[str, o
             elif line.startswith("data: "):
                 data = json.loads(line.removeprefix("data: "))
                 event_type = str(data.get("type", current_event))
-                if event_type in {"draft_token", "token"}:
+                if event_type == "draft_token":
+                    draft_token_events += 1
+                    first_draft_at = first_draft_at or time.perf_counter()
                     token_events += 1
-                    first_token_at = first_token_at or time.perf_counter()
+                    first_token_at = first_token_at or first_draft_at
+                elif event_type == "token":
+                    final_token_events += 1
+                    first_final_at = first_final_at or time.perf_counter()
+                    token_events += 1
+                    first_token_at = first_token_at or first_final_at
                 elif event_type == "completed":
                     completed = True
 
@@ -48,10 +63,24 @@ async def measure(client: httpx.AsyncClient, endpoint: str, payload: dict[str, o
         return Sample(
             status_code=response.status_code,
             ttft_ms=(first_token_at - started) * 1_000,
+            draft_ttft_ms=(first_draft_at - started) * 1_000 if first_draft_at else None,
+            final_ttft_ms=(first_final_at - started) * 1_000 if first_final_at else None,
             total_ms=(finished - started) * 1_000,
+            draft_token_events=draft_token_events,
+            final_token_events=final_token_events,
             token_events=token_events,
             completed=completed,
         )
+
+
+def summarize(values: list[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    return {
+        "min": round(ordered[0], 1),
+        "p50": round(statistics.median(ordered), 1),
+        "p95": round(ordered[max(0, int(len(ordered) * 0.95) - 1)], 1),
+        "max": round(ordered[-1], 1),
+    }
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -75,20 +104,18 @@ async def run(args: argparse.Namespace) -> int:
         samples = await asyncio.gather(*(bounded_sample() for _ in range(args.samples)))
 
     ttfts = [sample.ttft_ms for sample in samples]
+    draft_ttfts = [sample.draft_ttft_ms for sample in samples if sample.draft_ttft_ms is not None]
+    final_ttfts = [sample.final_ttft_ms for sample in samples if sample.final_ttft_ms is not None]
     totals = [sample.total_ms for sample in samples]
     summary = {
-        "samples": [asdict(sample) for sample in samples],
-        "ttft_ms": {
-            "min": round(min(ttfts), 1),
-            "p50": round(statistics.median(ttfts), 1),
-            "p95": round(sorted(ttfts)[max(0, int(len(ttfts) * 0.95) - 1)], 1),
-            "max": round(max(ttfts), 1),
-        },
-        "total_ms": {
-            "p50": round(statistics.median(totals), 1),
-            "max": round(max(totals), 1),
-        },
+        "label": args.label,
+        "ttft_ms": summarize(ttfts),
+        "draft_ttft_ms": summarize(draft_ttfts) if draft_ttfts else None,
+        "final_ttft_ms": summarize(final_ttfts) if final_ttfts else None,
+        "total_ms": summarize(totals),
     }
+    if not args.summary_only:
+        summary["samples"] = [asdict(sample) for sample in samples]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if not all(sample.completed for sample in samples):
@@ -101,6 +128,11 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", default="http://localhost:8000/v1/agent/stream")
+    parser.add_argument(
+        "--label",
+        default="unspecified",
+        help="寫入報告的模式標籤，例如 atr-off、detection-only 或 blocking",
+    )
     parser.add_argument("--query", default="請用一句話說明這個服務的狀態")
     parser.add_argument("--target-url")
     parser.add_argument("--api-key")
@@ -109,6 +141,11 @@ def main() -> int:
     parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-ttft-ms", type=float)
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="只輸出彙總統計，不輸出每筆 sample",
+    )
     return asyncio.run(run(parser.parse_args()))
 
 

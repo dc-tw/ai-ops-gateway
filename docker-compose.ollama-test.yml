@@ -3,8 +3,16 @@ services:
     build:
       args:
         INSTALL_BROWSER: "false"
+    environment:
+      ATR_ENABLED: ${ATR_ENABLED:-true}
+      ATR_BLOCKING: ${ATR_BLOCKING:-false}
 
   browser:
     build:
       args:
         INSTALL_BROWSER: "false"
+
+  worker:
+    environment:
+      ATR_ENABLED: ${ATR_ENABLED:-true}
+      ATR_BLOCKING: ${ATR_BLOCKING:-false}

@@ -177,6 +177,10 @@ Rule statistics 會回傳 reviewed sample、false-positive rate 與 `recommended
 
 系統不會因統計結果自行切換 production enforcement；切換必須經設定變更與部署審核。
 
+可重現的邊界測試、人工審查流程、延遲量測方式與限制整理在
+[`docs/atr-evaluation/`](docs/atr-evaluation/README.md)。其中明確區分控制流程測試、合成語料與
+部署量測，避免把規則命中誤寫成已證實攻擊，或把單元測試誤寫成 production benchmark。
+
 同一個 `conversation_id` 會載入 Redis 的近期訊息、rolling summary 與相關長期記憶；
 下一輪可指定另一個 allow-listed `model`。`LLM_ROUTES_JSON` 在伺服器端把 alias 映射到
 不同 Ollama／vLLM endpoint；客戶端不能提交推理 URL 或任意模型名稱。

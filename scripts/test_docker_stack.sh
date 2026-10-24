@@ -8,6 +8,9 @@ GOAL_FILE="$(mktemp)"
 HEADER_FILE="$(mktemp)"
 RESUME_FILE="$(mktemp)"
 THREAT_FILE="$(mktemp)"
+BLOCKED_HEADER_FILE="$(mktemp)"
+BLOCKED_STREAM_FILE="$(mktemp)"
+BLOCKED_REPLAY_FILE="$(mktemp)"
 
 cleanup() {
   if [ "${KEEP_STACK:-0}" != "1" ]; then
@@ -18,6 +21,9 @@ cleanup() {
   rm -f "${HEADER_FILE}"
   rm -f "${RESUME_FILE}"
   rm -f "${THREAT_FILE}"
+  rm -f "${BLOCKED_HEADER_FILE}"
+  rm -f "${BLOCKED_STREAM_FILE}"
+  rm -f "${BLOCKED_REPLAY_FILE}"
 }
 trap cleanup EXIT INT TERM
 
@@ -77,6 +83,11 @@ test "$(sed -n '1p' "${RESULT_FILE}")" = "0"
 ${COMPOSE} exec -T gateway python -c \
   'import httpx; r=httpx.post("http://browser:8010/internal/tools/browser_close", json={"session_id":"network-test"}, headers={"x-browser-worker-token":"change-me-internal"}); r.raise_for_status(); assert r.json()["closed"] is False'
 
+# Exercise the actual MCP stdio client/server transport inside the Gateway
+# container; the spawned MCP server then calls the isolated Browser Worker.
+${COMPOSE} exec -T gateway python -c \
+  'import asyncio; from app.tools.registry import MCPBrowserToolExecutor; exec("async def check():\n e=MCPBrowserToolExecutor()\n try:\n  result=await e.invoke(\"browser_close\",{\"session_id\":\"mcp-network-test\"})\n  assert result == {\"session_id\":\"mcp-network-test\",\"closed\":False},result\n finally:\n  await e.close()\n") ; asyncio.run(check())'
+
 curl --fail --silent http://localhost:8000/metrics >"${RESULT_FILE}"
 grep -q 'ai_gateway_http_requests_total' "${RESULT_FILE}"
 grep -q 'ai_gateway_model_input_tokens_total' "${RESULT_FILE}"
@@ -99,6 +110,39 @@ curl --fail --silent -X POST \
 grep -q '"review_status":"true_positive"' "${THREAT_FILE}"
 curl --fail --silent http://localhost:8000/v1/security/threat-findings/stats/rules >"${THREAT_FILE}"
 grep -q '"false_positive_rate":0.0' "${THREAT_FILE}"
+
+# In blocking mode, a malicious model output must never appear in either the live
+# SSE stream or Redis-backed event replay. The mock model emits a deterministic
+# threat only when this neutral marker is present in the request.
+ATR_BLOCKING=true ${COMPOSE} up --detach --force-recreate --wait gateway
+curl --fail --silent --no-buffer --max-time 60 -D "${BLOCKED_HEADER_FILE}" \
+  -H 'content-type: application/json' \
+  -d '{"query":"model-output-threat-test","max_retries":0}' \
+  http://localhost:8000/v1/agent/stream >"${BLOCKED_STREAM_FILE}"
+BLOCKED_RUN_ID="$(awk 'tolower($1)=="x-request-id:" {gsub("\\r", "", $2); print $2}' "${BLOCKED_HEADER_FILE}")"
+test -n "${BLOCKED_RUN_ID}"
+grep -q 'event: threat_detection' "${BLOCKED_STREAM_FILE}"
+grep -q '"status":"blocked"' "${BLOCKED_STREAM_FILE}"
+if grep -qi 'ignore all previous instructions\|reveal secrets' "${BLOCKED_STREAM_FILE}"; then
+  echo "Blocked model output leaked into the live SSE stream" >&2
+  exit 1
+fi
+curl --fail --silent --no-buffer --max-time 15 \
+  "http://localhost:8000/v1/agent/runs/${BLOCKED_RUN_ID}/events" >"${BLOCKED_REPLAY_FILE}"
+grep -q 'event: threat_detection' "${BLOCKED_REPLAY_FILE}"
+if grep -qi 'ignore all previous instructions\|reveal secrets' "${BLOCKED_REPLAY_FILE}"; then
+  echo "Blocked model output leaked into Redis event replay" >&2
+  exit 1
+fi
+${COMPOSE} exec -T redis redis-cli --raw XRANGE \
+  "tenant:default:agent:events:${BLOCKED_RUN_ID}" - + >"${BLOCKED_REPLAY_FILE}"
+if grep -qi 'ignore all previous instructions\|reveal secrets' "${BLOCKED_REPLAY_FILE}"; then
+  echo "Blocked model output leaked into the Redis stream" >&2
+  exit 1
+fi
+
+# Restore the default mode before the crash/resume scenario below.
+ATR_BLOCKING=false ${COMPOSE} up --detach --force-recreate --wait gateway
 
 # Crash a foreground run during model inference, restart the API, and resume the exact
 # LangGraph thread from Redis rather than restarting the request from scratch.
@@ -126,5 +170,7 @@ echo "Docker gateway -> mock OpenAI-compatible inference test passed"
 echo "Docker Redis conversation memory and per-turn model test passed"
 echo "Docker Redis-backed Goal worker test passed"
 echo "Docker LangGraph checkpoint, Consumer Group ACK, Browser Worker, and metrics test passed"
+echo "Docker MCP stdio -> Browser Worker transport test passed"
 echo "Docker SIGKILL -> LangGraph checkpoint resume test passed"
 echo "Docker ATR detection-only persistence and calibration API test passed"
+echo "Docker ATR blocking live-stream and Redis replay non-leakage test passed"
