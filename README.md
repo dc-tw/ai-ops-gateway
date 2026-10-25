@@ -70,6 +70,18 @@ flowchart LR
   provider 有回報 usage 時，記錄精確 input/output token 與依模型 route 設定計算的 USD 成本。
   設定 OTLP endpoint 後啟用 OpenTelemetry tracing。對外不回傳 hidden chain-of-thought。
 
+### 架構演進與公開討論
+
+[`docs/architecture/buzz-inspired-roadmap.md`](docs/architecture/buzz-inspired-roadmap.md) 記錄從
+[Buzz](https://github.com/block/buzz) 提煉出的架構參考，以及本專案對 durable event store、統一
+event envelope、Agent identity、tamper-evident audit 與 per-conversation single-flight 的分階段
+評估。這是一份 proposal／decision record，不代表列出的能力已經實作。
+
+後續設計討論採「GitHub Discussion 記錄探索，repository 文件保存決策」的方式；目前 repository
+尚未啟用 GitHub Discussions，因此先由
+[`docs/architecture/discussion-log.md`](docs/architecture/discussion-log.md) 保存起始紀錄與未決問題。
+啟用 Discussions 並建立主題後，應將連結回填到這兩份文件。
+
 ## 目錄
 
 ```text
