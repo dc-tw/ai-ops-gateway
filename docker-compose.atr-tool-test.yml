@@ -1,0 +1,24 @@
+# Dedicated transport/adversarial-response test, never a production deployment.
+services:
+  gateway:
+    image: ${ATR_TOOL_PROJECT:-ai-ops-atr-tool-test}-gateway:local
+    command: ["uvicorn", "atr_tool_gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: !override
+      - "127.0.0.1:${ATR_TOOL_PORT:-18082}:8000"
+    environment:
+      PYTHONPATH: /app:/fixtures
+      ATR_ENABLED: "true"
+      ATR_BLOCKING: "true"
+      PII_REDACTION: "false"
+      AGENT_TOOL_TRANSPORT: mcp
+      AUTONOMOUS_TOOL_PLANNING: "true"
+    volumes:
+      - ./tests/docker/atr-tool-response/gateway.py:/fixtures/atr_tool_gateway.py:ro
+
+  browser:
+    image: ${ATR_TOOL_PROJECT:-ai-ops-atr-tool-test}-browser:local
+    command: ["uvicorn", "atr_tool_browser:app", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      PYTHONPATH: /app:/fixtures
+    volumes:
+      - ./tests/docker/atr-tool-response/browser.py:/fixtures/atr_tool_browser.py:ro

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -103,7 +104,27 @@ class MCPBrowserToolExecutor:
 
         stack = AsyncExitStack()
         try:
-            params = StdioServerParameters(command=self._command, args=self._args)
+            # MCP deliberately forwards only a minimal OS environment. Pass the
+            # browser server configuration explicitly, never unrelated model,
+            # cloud or gateway credentials from the parent process.
+            browser_environment = {
+                key: os.environ[key]
+                for key in (
+                    "BROWSER_WORKER_URL",
+                    "BROWSER_WORKER_TOKEN",
+                    "PLAYWRIGHT_ALLOWED_DOMAINS",
+                    "PLAYWRIGHT_HEADLESS",
+                    "PLAYWRIGHT_TIMEOUT_MS",
+                    "PLAYWRIGHT_MAX_CONTENT_CHARS",
+                    "PLAYWRIGHT_BROWSERS_PATH",
+                    "BROWSER_SESSION_TTL_SECONDS",
+                    "BROWSER_MAX_SESSIONS",
+                )
+                if key in os.environ
+            }
+            params = StdioServerParameters(
+                command=self._command, args=self._args, env=browser_environment
+            )
             reader, writer = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(ClientSession(reader, writer))
             await session.initialize()

@@ -14,6 +14,8 @@ from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatDetector
 from app.goals import router as goals_router
 from app.llm.client import ModelRouter
+from app.planning import router as planning_router
+from app.skills import router as skills_router
 from app.tools.browser import BrowserScraper, BrowserSessionManager
 from app.tools.registry import (
     LocalBrowserToolExecutor,
@@ -97,6 +99,8 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(goals_router)
     app.include_router(automations_router)
     app.include_router(agents_router)
+    app.include_router(skills_router)
+    app.include_router(planning_router)
     install_observability(app, app_settings)
     return app
 

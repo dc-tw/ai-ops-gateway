@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
+from app.core.skill_store import guard_goal_skills
 from app.core.threat_detection import ThreatBlockedError, ThreatDetector
 from app.core.threat_feedback import record_threat_findings
 from app.graph.workflow import build_agent_graph, initial_state
@@ -132,6 +133,9 @@ async def execute_goal(
             configured = await AgentStore(runtime).get(tenant_id, goal["agent_id"])
             if not configured or not configured["enabled"]:
                 raise PermissionError("Agent is disabled")
+        config = goal.get("agent_config") or {}
+        if config.get("skills") or config.get("skill_snapshots"):
+            await guard_goal_skills(runtime, goal)
         if goal.get("parent_goal_id"):
             parent = await runtime.get_goal(goal["parent_goal_id"], tenant_id)
             if not parent or parent["status"] in {"completed", "failed", "cancelled"}:
@@ -159,9 +163,17 @@ async def execute_goal(
         )
 
     async def validate_inputs():
+        await require_enabled_agent()
         values = [("goal_objective", goal["objective"])] + [
             (f"goal_step:{index}", step["query"]) for index, step in enumerate(goal["steps"])
         ]
+        values.extend(
+            (
+                f"skill:{snapshot['skill_id']}:r{snapshot['revision']}",
+                snapshot["instructions"],
+            )
+            for snapshot in (goal.get("agent_config") or {}).get("skill_snapshots", [])
+        )
         for location, value in values:
             if any(
                 re.search(pattern, value, re.IGNORECASE)
@@ -202,6 +214,7 @@ async def execute_goal(
                 return
 
     async def finish(status, event):
+        await require_enabled_agent()
         goal["status"] = status
         goal["runtime_seconds"] = prior_runtime + time.monotonic() - started
         if not await store.finish(goal, owner, event):
@@ -399,6 +412,7 @@ async def execute_goal(
             on_usage=on_usage,
             max_output_tokens=settings.llm_max_output_tokens,
             persona=goal.get("agent_config", {}).get("persona", ""),
+            skill_snapshots=goal.get("agent_config", {}).get("skill_snapshots", []),
         )
         executor = PolicyToolExecutor(
             tool_executor or _ScraperExecutor(scraper),

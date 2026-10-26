@@ -81,20 +81,21 @@ local pending = pendingraw and cjson.decode(pendingraw) or nil
 local item
 if mode == 'flush' then
   if not pending then return cjson.encode({status='no_pending', goal_id=cjson.null}) end
-  if busy then return cjson.encode({status='busy', goal_id=active}) end
   item = pending
 else
   item = {goal_json=ARGV[2], event=cjson.decode(ARGV[3]), count=tonumber(ARGV[4])}
   if pending then item.count = item.count + pending.count end
 end
-local function record(status, goalid, count)
+local function record(status, goalid, count, reason, skillrefs)
   local event = {type='automation_' .. status,
     automation_id=job.automation_id, event_id=item.event.event_id,
-    goal_id=goalid, status=status, coalesced_count=count, time=ARGV[5]}
+    goal_id=goalid, status=status, coalesced_count=count, time=ARGV[5], reason=reason,
+    skills=skillrefs}
   redis.call('XADD', KEYS[7], '*', 'payload', cjson.encode(event))
   local audit = {action='automation.' .. status, automation_id=job.automation_id,
     event_id=item.event.event_id, goal_id=goalid, status=status,
-    coalesced_count=count, time=ARGV[5], agent_id=job.agent_id}
+    coalesced_count=count, time=ARGV[5], agent_id=job.agent_id, reason=reason,
+    skills=skillrefs}
   redis.call('XADD', ARGV[7] .. 'audit', '*', 'payload', cjson.encode(audit))
 end
 local function accept_schedule()
@@ -106,10 +107,84 @@ local function accept_schedule()
     redis.call('ZADD', KEYS[9], item.event.schedule_next_at, ARGV[9])
   end
 end
+local function decode_record(key)
+  local raw = redis.call('GET', key)
+  if not raw then return nil end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' then return nil end
+  return value
+end
+local function check_skills(goal)
+  if type(goal) ~= 'table' then return false, 'invalid_snapshot', nil end
+  local config = goal.agent_config
+  if config == nil then return true, nil, nil end
+  if type(config) ~= 'table' then return false, 'invalid_snapshot', nil end
+  local snapshots, bindings = config.skill_snapshots or {}, config.skills or {}
+  if type(snapshots) ~= 'table' or type(bindings) ~= 'table' then
+    return false, 'invalid_snapshot', nil
+  end
+  if #snapshots ~= #bindings then return false, 'invalid_binding', nil end
+  if #snapshots == 0 then
+    if next(snapshots) or next(bindings) then return false, 'invalid_binding', nil end
+    return true, nil, nil
+  end
+  if ARGV[7] ~= 'tenant:' .. job.tenant_id .. ':' then
+    return false, 'invalid_tenant', nil
+  end
+  local seen, refs = {}, {}
+  for index, snapshot in ipairs(snapshots) do
+    local binding = bindings[index]
+    if type(snapshot) ~= 'table' or type(binding) ~= 'table'
+      or type(snapshot.skill_id) ~= 'string' or snapshot.skill_id == ''
+      or type(snapshot.revision) ~= 'number' or snapshot.revision < 1
+      or snapshot.revision ~= math.floor(snapshot.revision)
+      or type(snapshot.revocation_epoch) ~= 'number' or snapshot.revocation_epoch < 0
+      or snapshot.revocation_epoch ~= math.floor(snapshot.revocation_epoch)
+      or type(snapshot.content_sha256) ~= 'string'
+      or snapshot.tenant_id ~= job.tenant_id
+      or binding.skill_id ~= snapshot.skill_id or binding.revision ~= snapshot.revision
+      or seen[snapshot.skill_id] then
+      return false, 'invalid_binding', refs
+    end
+    seen[snapshot.skill_id] = true
+    table.insert(refs, {skill_id=snapshot.skill_id, revision=snapshot.revision,
+      content_sha256=snapshot.content_sha256, revocation_epoch=snapshot.revocation_epoch})
+    local skill = decode_record(ARGV[7] .. 'skills:record:' .. snapshot.skill_id)
+    if not skill or skill.tenant_id ~= job.tenant_id or skill.skill_id ~= snapshot.skill_id
+      or skill.enabled ~= true or skill.revocation_epoch ~= snapshot.revocation_epoch then
+      return false, 'skill_revoked', refs
+    end
+    local revision = decode_record(ARGV[7] .. 'skills:revision:' .. snapshot.skill_id
+      .. ':' .. tostring(snapshot.revision))
+    if not revision or revision.tenant_id ~= job.tenant_id
+      or revision.skill_id ~= snapshot.skill_id or revision.revision ~= snapshot.revision
+      or revision.content_sha256 ~= snapshot.content_sha256 then
+      return false, 'revision_unavailable', refs
+    end
+  end
+  return true, nil, refs
+end
+local goal = cjson.decode(item.goal_json)
+local valid_skills, skill_reason, skillrefs = check_skills(goal)
+if not valid_skills then
+  -- Invalid pinned work cannot become runnable after a later re-enable. Drop
+  -- revoked pending work even while another Goal is active. A rejected new
+  -- occurrence must not discard an older pending Goal whose Skills remain valid.
+  if mode == 'submit' and pending and check_skills(cjson.decode(pending.goal_json)) then
+    item.count = tonumber(ARGV[4])
+  else
+    redis.call('DEL', KEYS[3])
+  end
+  if mode == 'submit' then redis.call('SET', KEYS[4], '', 'EX', ARGV[8]) end
+  record('skills_revoked', cjson.null, item.count, skill_reason, skillrefs)
+  accept_schedule()
+  return cjson.encode({status='skills_revoked', goal_id=cjson.null, reason=skill_reason})
+end
+if mode == 'flush' and busy then return cjson.encode({status='busy', goal_id=active}) end
 if busy then
   redis.call('SET', KEYS[3], cjson.encode(item))
   redis.call('SET', KEYS[4], active, 'EX', ARGV[8])
-  record('coalesced', active, item.count)
+  record('coalesced', active, item.count, nil, skillrefs)
   accept_schedule()
   return cjson.encode({status='coalesced', goal_id=active, coalesced_count=item.count})
 end
@@ -119,11 +194,10 @@ if tonumber(redis.call('GET', KEYS[5]) or '0') >= cap then
   -- Mark it seen so a provider retry cannot inflate the coalesced count.
   redis.call('SET', KEYS[3], cjson.encode(item))
   if mode == 'submit' then redis.call('SET', KEYS[4], '', 'EX', ARGV[8]) end
-  record('rate_limited', cjson.null, item.count)
+  record('rate_limited', cjson.null, item.count, nil, skillrefs)
   accept_schedule()
   return cjson.encode({status='rate_limited', goal_id=cjson.null, coalesced_count=item.count})
 end
-local goal = cjson.decode(item.goal_json)
 -- Keep the original JSON opaque: Redis Lua cjson turns empty arrays into objects.
 local goalraw = string.sub(item.goal_json, 1, -2) .. ',"automation_id":'
   .. cjson.encode(job.automation_id) .. ',"tenant_id":' .. cjson.encode(job.tenant_id)
@@ -149,7 +223,7 @@ local queued = {type='goal_queued', goal_id=goal.goal_id,
   automation_id=job.automation_id, coalesced_count=item.count, time=ARGV[5]}
 redis.call('XADD', ARGV[7] .. 'agent:goal:events:' .. goal.goal_id,
   '*', 'payload', cjson.encode(queued))
-record('queued', goal.goal_id, item.count)
+record('queued', goal.goal_id, item.count, nil, skillrefs)
 accept_schedule()
 return cjson.encode({status='queued', goal_id=goal.goal_id, coalesced_count=item.count})
 """
@@ -384,6 +458,16 @@ class AutomationStore:
         event: dict[str, Any] | None = None,
         coalesced_count: int = 1,
     ) -> dict[str, Any]:
+        if mode == "submit":
+            from app.core.skill_store import validate_skill_snapshots
+
+            config = (goal or {}).get("agent_config") or {}
+            validate_skill_snapshots(
+                config.get("skill_snapshots", []),
+                config.get("skills", []),
+                (goal or {}).get("policy") or {},
+                config.get("role", "worker"),
+            )
         job = await self.get(tenant_id, automation_id)
         timezone = ZoneInfo((job or {}).get("trigger", {}).get("timezone", "Asia/Taipei"))
         local_day = datetime.fromtimestamp(now, timezone).strftime("%Y-%m-%d")

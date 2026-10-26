@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
+from app.core.skill_store import guard_goal_skills, render_skill_instructions
 from app.llm.client import ModelChunk, ModelResult, OpenAICompatibleModel, validated_token_usage
 from app.tools.registry import (
     LocalBrowserToolExecutor,
@@ -44,12 +45,14 @@ class BudgetedModel:
         on_usage: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         max_output_tokens: int = 1_024,
         persona: str = "",
+        skill_snapshots: list[dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
         self.token_budget = token_budget
         self.max_output_tokens = max_output_tokens
         self.on_usage = on_usage
         self.persona = persona
+        self.skill_instructions = render_skill_instructions(skill_snapshots or [])
         self.usage: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -116,9 +119,15 @@ class BudgetedModel:
     async def complete(self, system: str, prompt: str) -> str:
         return (await self.complete_result(system, prompt)).text
 
-    async def complete_result(self, system: str, prompt: str) -> ModelResult:
+    def _system_instructions(self, system: str) -> str:
         if self.persona:
             system += "\n\nOperator-configured Agent role and persona:\n" + self.persona
+        if self.skill_instructions:
+            system += "\n\n" + self.skill_instructions
+        return system
+
+    async def complete_result(self, system: str, prompt: str) -> ModelResult:
+        system = self._system_instructions(system)
         before, input_bound, cap = await self._begin(system, prompt)
         if isinstance(self.model, OpenAICompatibleModel):
             result = await self.model.complete_result(system, prompt, max_output_tokens=cap)
@@ -135,8 +144,7 @@ class BudgetedModel:
                 yield chunk.text
 
     async def stream_result(self, system: str, prompt: str) -> AsyncIterator[ModelChunk]:
-        if self.persona:
-            system += "\n\nOperator-configured Agent role and persona:\n" + self.persona
+        system = self._system_instructions(system)
         before, input_bound, cap = await self._begin(system, prompt)
         if isinstance(self.model, OpenAICompatibleModel):
             iterator = self.model.stream_result(system, prompt, max_output_tokens=cap)
@@ -261,6 +269,9 @@ class PolicyToolExecutor:
             agent = await AgentStore(self.runtime).get(self.tenant_id, goal["agent_id"])
             if not agent or not agent["enabled"]:
                 raise PermissionError("Agent was disabled")
+        config = goal.get("agent_config") or {}
+        if config.get("skills") or config.get("skill_snapshots"):
+            await guard_goal_skills(self.runtime, goal)
         if goal.get("parent_goal_id"):
             parent = await self.runtime.get_goal(goal["parent_goal_id"], self.tenant_id)
             if not parent or parent.get("status") in {"cancelled", "failed", "completed"}:

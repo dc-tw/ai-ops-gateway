@@ -21,7 +21,13 @@
 - 記錄到的後續 model prompts 不包含被阻擋的攻擊內容。
 
 這證明測試案例中的內容沒有被加入後續 model context。它不代表所有 transport、序列化格式
-與截斷情況都已覆蓋；MCP 與 remote Browser Worker 還應在 Docker E2E 中各補一個案例。
+與截斷情況都已覆蓋。
+
+2026-10-26 新增 `scripts/test_atr_tool_stack.sh`：公開 SSE 經真正 MCP stdio／`app.mcp_server`
+連到 authenticated remote Browser Worker，使用測試 overlay 在既有 `browser_close` handler
+回傳後插入合成攻擊。真實 pyatr 阻擋後，後續 mock model context、live SSE、replay 與 Redis
+event／run／finding／audit 均沒有 canary；另驗證錯誤 Browser token 回 401。此案例不需要
+Chromium，不代表所有 browser 方法或 attack variants 已覆蓋。測試 wrapper 不在正式服務載入。
 
 ## Model output
 
@@ -39,7 +45,15 @@ Docker E2E 另外讓 mock model 產生固定攻擊內容，並以 blocking mode 
 - 底層 Redis event stream。
 
 這涵蓋正常完成後的 reconnect/replay 路徑；audit stream 只保存 privacy-safe finding metadata。
-多 replica 同時失敗、process crash 發生在掃描期間等路徑仍未覆蓋。
+
+2026-10-26 的 `tests/test_release_atr_crash.py` 再以兩個真正 HTTP process、真 Redis checkpoint、
+真 pyatr 及 deterministic model，在掃描中、阻擋判定後但 event write 前、write 後但 live
+publish 前 SIGKILL 第一個 process，由第二個恢復與 replay。三個時序均無原始攻擊或未掃描
+draft token 洩漏，恢復後 `evidence_validated` 為 false。
+
+已確認 checkpoint 與 SSE append 不在同一交易：write 前中斷可能遺失診斷事件，不能宣稱
+finding exactly-once／完整投遞。這是有限故障矩陣，不代表所有 multi-replica、partial-write
+或外部副作用情境已覆蓋。測試亦重現超長內容的中段攻擊可被 head／tail 截斷漏掉。
 
 ## 目前結論
 
@@ -48,3 +62,5 @@ Docker E2E 另外讓 mock model 產生固定攻擊內容，並以 blocking mode 
 - ATR 對未知攻擊的 recall。
 - 實際 production 流量的 false-positive rate。
 - 多 replica、失敗恢復或跨事件 correlation 的完整安全性。
+
+最新結果、已確認限制與尚未納入功能見[封版驗證彙總](../releases/2026-10-26-skills-plan-mode.md)。

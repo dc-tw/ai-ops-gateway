@@ -17,6 +17,7 @@ from app.api.schemas import GoalCreateRequest
 from app.automations import AutomationPolicy, validate_goal_input
 from app.core.goal_execution import GoalExecutionStore
 from app.core.security import authorize, redact_pii
+from app.core.skill_store import SkillBinding, resolve_skill_bindings, skill_refs
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
@@ -31,9 +32,12 @@ class AgentCreate(BaseModel):
     policy: AutomationPolicy = Field(default_factory=AutomationPolicy)
     enabled: bool = True
     delegate_agent_ids: list[str] = Field(default_factory=list, max_length=8)
+    skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def finite_delegation(self) -> AgentCreate:
+        if len({binding.skill_id for binding in self.skills}) != len(self.skills):
+            raise ValueError("An Agent cannot bind the same Skill more than once")
         self.delegate_agent_ids = list(dict.fromkeys(self.delegate_agent_ids))
         if any(not item or len(item) > 128 for item in self.delegate_agent_ids):
             raise ValueError("Delegate Agent IDs must contain 1-128 characters")
@@ -166,12 +170,24 @@ class AgentStore:
                             record[field] = current[field]
                     rows = await pipe.mget(delegate_keys) if delegate_keys else []
                     self._check_delegates(record, rows)
+                    skill_snapshots = []
+                    if record.get("skills"):
+                        skill_snapshots = await resolve_skill_bindings(
+                            self.runtime,
+                            tenant,
+                            record["skills"],
+                            record["policy"],
+                            record["role"],
+                            client=pipe,
+                            watch=True,
+                        )
                     audit = {
                         "action": "agent.create" if expected_version is None else "agent.update",
                         "agent_id": agent_id,
                         "version": record["version"],
                         "subject": record.get("updated_by", record["created_by"]),
                         "role": record["role"],
+                        "skills": skill_refs(skill_snapshots),
                         "time": record["updated_at"],
                     }
                     pipe.multi()
@@ -287,6 +303,15 @@ async def apply_agent(
         policy["approval_timeout_seconds"] = min(
             policy["approval_timeout_seconds"], int(requested_approval)
         )
+    bindings = deepcopy(agent.get("skills", []))
+    try:
+        skill_snapshots = (
+            await resolve_skill_bindings(runtime, tenant, bindings, policy, agent["role"])
+            if bindings
+            else []
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     snapshot = {
         field: deepcopy(agent[field])
         for field in (
@@ -301,8 +326,12 @@ async def apply_agent(
             "policy",
         )
     }
+    snapshot.update(skills=bindings, skill_snapshots=skill_snapshots)
+    trusted_goal = deepcopy(goal)
+    trusted_goal.pop("skills", None)
+    trusted_goal.pop("skill_snapshots", None)
     return {
-        **deepcopy(goal),
+        **trusted_goal,
         "tenant_id": tenant,
         "agent_id": agent["agent_id"],
         "agent_config": snapshot,
@@ -446,4 +475,7 @@ async def create_agent_goal(
         request.app.state.threat_detector,
         {**goal, "automation_id": goal.get("automation_id")},
     )
-    return await GoalExecutionStore(runtime).submit_manual(goal)
+    try:
+        return await GoalExecutionStore(runtime).submit_manual(goal)
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

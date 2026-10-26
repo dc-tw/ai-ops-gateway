@@ -15,6 +15,8 @@ from typing import Any
 
 from redis.exceptions import WatchError
 
+from app.core.skill_store import skill_refs
+
 TERMINAL = {"completed", "failed", "cancelled"}
 
 
@@ -54,12 +56,18 @@ class GoalExecutionStore:
         tenant: str,
         goal_id: str,
         change: Callable[[dict[str, Any] | None], GoalMutation],
+        *,
+        admission_goal: dict[str, Any] | None = None,
     ) -> Any:
+        from app.core.skill_store import guard_goal_skills
+
         # Explicit test adapter; real RedisRuntime always takes the WATCH path.
         if self.client is None:
             adapter = getattr(self.runtime, "goal_execution_mutate", None)
             if adapter is None:
                 raise RuntimeError("Goal execution requires an atomic Redis store")
+            if admission_goal is not None:
+                await guard_goal_skills(self.runtime, admission_goal)
             return await adapter(tenant, goal_id, change)
         key = self.key(tenant, goal_id)
         while True:
@@ -72,6 +80,10 @@ class GoalExecutionStore:
                     mutation = change(current)
                     if mutation.goal is None:
                         return mutation.result
+                    if admission_goal is not None:
+                        await guard_goal_skills(
+                            self.runtime, admission_goal, client=pipe, watch=True
+                        )
                     pipe.multi()
                     pipe.set(key, json.dumps(mutation.goal, ensure_ascii=False))
                     pipe.sadd(f"tenant:{tenant}:agent:goals", goal_id)
@@ -154,13 +166,21 @@ class GoalExecutionStore:
                         "status": "queued",
                         "goal_id": goal["goal_id"],
                         "subject": goal.get("created_by", "unknown"),
+                        "skills": skill_refs(
+                            (goal.get("agent_config") or {}).get("skill_snapshots", [])
+                        ),
                     }
                 ],
                 True,
                 goal,
             )
 
-        return await self._mutate(goal.get("tenant_id", "default"), goal["goal_id"], change)
+        return await self._mutate(
+            goal.get("tenant_id", "default"),
+            goal["goal_id"],
+            change,
+            admission_goal=goal,
+        )
 
     async def claim(
         self,
@@ -205,6 +225,9 @@ class GoalExecutionStore:
                         "goal_id": goal_id,
                         "agent_id": goal.get("agent_id"),
                         "owner": owner,
+                        "skills": skill_refs(
+                            (goal.get("agent_config") or {}).get("skill_snapshots", [])
+                        ),
                     }
                 ],
                 result=goal,

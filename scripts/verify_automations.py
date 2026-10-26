@@ -19,6 +19,7 @@ import httpx
 from app.core.automation_store import AutomationStore
 from app.core.config import get_settings
 from app.core.redis_runtime import RedisRuntime
+from app.core.skill_store import CONTENT_FIELDS
 from app.core.threat_feedback import record_threat_findings
 
 BASE = "http://127.0.0.1:8000"
@@ -47,13 +48,19 @@ def payload(name, trigger, task_type="agent"):
 
 
 def prepare():
+    security_skill = post("/v1/skills/install", {"name": "atr-finding-review"})
+    operations_skill = post("/v1/skills/install", {"name": "incident-triage"})
+    chief_skill = post("/v1/skills/install", {"name": "chief-coordination"})
     security = post(
         "/v1/agents",
         {
             "name": "Security Analyst",
             "role": "worker",
             "description": "Analyse security findings and trust boundaries",
-            "persona": "你是資安分析師，區分已知證據與推論。",
+            "persona": (
+                "你是資安分析師，區分已知證據與推論。 skills-e2e-required:atr-finding-review"
+            ),
+            "skills": [{"skill_id": security_skill["skill_id"], "revision": 1}],
             "model": "mock-model",
             "policy": {"allowed_tools": [], "token_budget": 6000},
         },
@@ -64,7 +71,8 @@ def prepare():
             "name": "Operations Analyst",
             "role": "worker",
             "description": "Analyse deployment failures and operational impact",
-            "persona": "你是運維分析師，提出有依據的修復建議。",
+            "persona": "你是運維分析師，提出有依據的修復建議。 skills-e2e-required:incident-triage",
+            "skills": [{"skill_id": operations_skill["skill_id"], "revision": 1}],
             "model": "mock-model",
             "policy": {"allowed_tools": [], "token_budget": 6000},
         },
@@ -75,7 +83,10 @@ def prepare():
             "name": "Chief Agent",
             "role": "chief",
             "description": "Delegate the main task to specialists and synthesise results",
-            "persona": "你是 Chief，依專長派工並彙整有來源的結果。",
+            "persona": (
+                "你是 Chief，依專長派工並彙整有來源的結果。 skills-e2e-required:chief-coordination"
+            ),
+            "skills": [{"skill_id": chief_skill["skill_id"], "revision": 1}],
             "model": "mock-model",
             "delegate_agent_ids": [security["agent_id"], operations["agent_id"]],
             "policy": {"allowed_tools": [], "token_budget": 20000},
@@ -107,6 +118,15 @@ def prepare():
     failure = post(
         "/v1/automations",
         payload("Goal 失敗分析", {"kind": "internal", "event_types": ["goal.failed"]}),
+    )
+    # Publishing a new head must not change the Agent's explicit revision-1 binding.
+    post(
+        f"/v1/skills/{security_skill['skill_id']}/revisions",
+        {field: security_skill[field] for field in CONTENT_FIELDS}
+        | {
+            "instructions": "新版技能內容：不得自動套用到仍綁定第一版的任務。",
+            "expected_version": 1,
+        },
     )
     print(
         json.dumps(
@@ -271,6 +291,16 @@ def verify(ids):
     )
     assert allocated <= chief_goal["team_token_budget"] == 20000
     assert len({c["agent_config"]["persona"] for c in children}) == 2
+    assert chief_goal["agent_config"]["skill_snapshots"][0]["name"] == "chief-coordination"
+    assert {c["agent_config"]["skill_snapshots"][0]["name"] for c in children} == {
+        "atr-finding-review",
+        "incident-triage",
+    }
+    security_snapshot = results["schedule"]["agent_config"]["skill_snapshots"][0]
+    assert security_snapshot["revision"] == 1
+    latest = httpx.get(BASE + f"/v1/skills/{security_snapshot['skill_id']}").json()
+    assert latest["revision"] == 2
+    assert latest["content_sha256"] != security_snapshot["content_sha256"]
     for name, automation_id in ids.items():
         rows = httpx.get(BASE + f"/v1/automations/{automation_id}/goals").json()["goals"]
         assert len(rows) == 1, (name, rows)
@@ -284,6 +314,9 @@ def verify(ids):
                     saw_completed = True
                     break
             assert saw_completed, name
+    verify_skill_revocation(
+        next(c for c in children if c["agent_config"]["name"] == "Operations Analyst")
+    )
     print(
         json.dumps(
             {
@@ -294,11 +327,46 @@ def verify(ids):
                     "internal ATR event and Goal failure event",
                     "two schedulers, two workers, durable results and SSE lifecycle replay",
                     "Chief delegation, independent personas and shared team token budget",
+                    "Skills reach model prompts with pinned, independent Agent revisions",
+                    "disable and immediate re-enable cannot revive an in-flight Skill snapshot",
                 ],
             },
             ensure_ascii=False,
         )
     )
+
+
+def verify_skill_revocation(operations_goal):
+    job = payload("Skill 撤銷驗證", {"kind": "schedule", "interval_seconds": 3600})
+    job["agent_id"] = operations_goal["agent_id"]
+    job["goal"]["steps"] = [{"query": "checkpoint-resume skill revocation boundary"}]
+    automation = post("/v1/automations", job)
+    queued = post(f"/v1/automations/{automation['automation_id']}/run", {})
+    goal_id = queued["goal_id"]
+    for _ in range(100):
+        current = httpx.get(BASE + f"/v1/goals/{goal_id}").json()
+        if current["status"] == "running" and current.get("usage", {}).get("policy_charged_tokens"):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("Skill revocation test never reached model execution")
+    skill_id = current["agent_config"]["skill_snapshots"][0]["skill_id"]
+    head = httpx.get(BASE + f"/v1/skills/{skill_id}").json()
+    disabled = post(
+        f"/v1/skills/{skill_id}/enabled", {"enabled": False, "expected_version": head["version"]}
+    )
+    post(
+        f"/v1/skills/{skill_id}/enabled", {"enabled": True, "expected_version": disabled["version"]}
+    )
+    for _ in range(200):
+        current = httpx.get(BASE + f"/v1/goals/{goal_id}").json()
+        if current["status"] in {"failed", "completed", "cancelled"}:
+            assert current["status"] == "failed", current
+            assert current["error_type"] == "PermissionError"
+            assert current["usage"]["model_calls"] == 1
+            return
+        time.sleep(0.1)
+    raise AssertionError("Revoked Skill snapshot did not stop after its in-flight call")
 
 
 def prepare_crash():

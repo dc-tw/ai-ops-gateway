@@ -55,3 +55,4 @@ git rev-parse HEAD
 - [限制](limitations.md)
 - [2026-10-23 本地驗證紀錄](run-2026-10-23.md)
 - [2026-10-24 ATR 驗證紀錄](run-2026-10-24.md)
+- [2026-10-26 封版：MCP、SIGKILL 與語料重跑](../releases/2026-10-26-skills-plan-mode.md)

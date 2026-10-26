@@ -157,6 +157,7 @@ class RedisRuntime:
         ttl_seconds: int,
         max_records: int,
         source_automation_id: str | None = None,
+        emit_internal_events: bool = True,
     ) -> list[dict[str, Any]]:
         """Persist privacy-safe ATR metadata; raw scanned content is never stored."""
         now = datetime.now(UTC)
@@ -201,7 +202,7 @@ class RedisRuntime:
                     record,
                     source_automation_id=source_automation_id,
                 )
-                if internal is not None:
+                if emit_internal_events and internal is not None:
                     pipe.xadd(
                         INTERNAL_STREAM,
                         {

@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 from redis.exceptions import WatchError
 
 from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+from app.core.skill_store import skill_refs
 
 TERMINAL = {"completed", "failed", "cancelled"}
 
@@ -25,6 +26,8 @@ def _goal_key(tenant: str, goal_id: str) -> str:
 
 
 def _scope_child(child: dict[str, Any], allowed_agents: set[str]) -> None:
+    from app.core.skill_store import validate_skill_snapshots
+
     config = child.get("agent_config") or {}
     if child.get("agent_id") not in allowed_agents:
         raise ValueError("Chief cannot delegate to an unapproved Agent")
@@ -33,6 +36,12 @@ def _scope_child(child: dict[str, Any], allowed_agents: set[str]) -> None:
     if config.get("delegate_agent_ids"):
         raise ValueError("Worker Agents cannot recursively delegate")
     pinned, effective = config.get("policy") or {}, child.get("policy") or {}
+    validate_skill_snapshots(
+        config.get("skill_snapshots", []),
+        config.get("skills", []),
+        effective,
+        config.get("role", "worker"),
+    )
     if not set(effective.get("allowed_tools", [])).issubset(pinned.get("allowed_tools", [])):
         raise ValueError("Child tools exceed the pinned Agent policy")
     domains, limits = effective.get("allowed_domains", []), pinned.get("allowed_domains", [])
@@ -98,6 +107,7 @@ class DelegationStore:
             "agent_id": goal.get("agent_id"),
             "status": goal["status"],
             "time": _now(),
+            "skills": skill_refs((goal.get("agent_config") or {}).get("skill_snapshots", [])),
             **fields,
         }
         pipe.xadd(f"tenant:{tenant}:audit", {"payload": json.dumps(event, ensure_ascii=False)})
@@ -115,6 +125,8 @@ class DelegationStore:
         the Chief service. This persistence boundary additionally verifies pinned
         identity, tenant, one-layer scope and the immutable team budget.
         """
+        from app.core.skill_store import guard_goal_skills
+
         if not 1 <= len(children) <= 20:
             raise ValueError("Chief delegation requires between one and twenty children")
         tenant, parent_id = parent["tenant_id"], parent["goal_id"]
@@ -144,6 +156,10 @@ class DelegationStore:
                     config = current.get("agent_config") or {}
                     if config.get("role") != "chief" or current.get("parent_goal_id"):
                         raise ValueError("Only a root Chief Goal can delegate")
+                    supplied_config = parent.get("agent_config") or {}
+                    for field in ("skills", "skill_snapshots"):
+                        if supplied_config.get(field, []) != config.get(field, []):
+                            raise ValueError("Chief Skill bindings cannot change during delegation")
                     allowed = set(config.get("delegate_agent_ids", []))
                     team_cap = int(
                         current.get(
@@ -222,6 +238,9 @@ class DelegationStore:
                         "usage": usage,
                         "updated_at": _now(),
                     }
+                    await guard_goal_skills(self.runtime, updated, client=pipe, watch=True)
+                    for child in prepared:
+                        await guard_goal_skills(self.runtime, child, client=pipe, watch=True)
                     pipe.multi()
                     pipe.set(key, json.dumps(updated, ensure_ascii=False))
                     pipe.zrem(f"tenant:{tenant}:quota:active-runs", f"goal:{parent_id}:{owner}")

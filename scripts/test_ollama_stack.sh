@@ -1,5 +1,5 @@
 #!/bin/sh
-# Opt-in real-model smoke test. It downloads qwen2.5:7b-instruct on first run.
+# Opt-in real-model smoke test. Defaults to qwen2.5:0.5b-instruct on first run.
 set -eu
 
 PROJECT_NAME="ai-ops-gateway-ollama-test"

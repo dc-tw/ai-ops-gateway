@@ -1,7 +1,9 @@
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -181,13 +183,78 @@ class ModelRouter:
                     ),
                 }
 
-    def get(self, model: str | None = None) -> OpenAICompatibleModel:
+    def _selection(self, model: str | None) -> str:
         selection = (model or self._settings.llm_model).strip()
         if not selection or len(selection) > 200:
             raise ValueError("Invalid model name")
         allowed = {self._settings.llm_model, *self._routes}
         if not self._settings.llm_allow_arbitrary_models and selection not in allowed:
             raise ValueError(f"Model is not allow-listed: {selection}")
+        return selection
+
+    def planning_route(self, model: str | None = None) -> dict[str, Any]:
+        """Describe configured inference identity without creating a client or making an RPC.
+
+        The endpoint and model identifier do not establish a weights, deployment,
+        tokenizer or runtime version. Credentials, pricing and request budgets are
+        excluded from identity. Endpoints with URL credentials, query or fragment
+        cannot provide an unambiguous identity without risking secret disclosure.
+        """
+        selection = self._selection(model)
+        route = self._routes.get(selection)
+        resolved_model = route["model"] if route else selection
+        base_url = route["base_url"] if route else self._settings.llm_base_url
+        try:
+            endpoint = urlsplit(base_url)
+            if (
+                endpoint.scheme.lower() not in {"http", "https"}
+                or not endpoint.hostname
+                or endpoint.username is not None
+                or endpoint.password is not None
+                or endpoint.query
+                or endpoint.fragment
+            ):
+                raise ValueError("Unsupported planning endpoint")
+            endpoint_identity = {
+                "scheme": endpoint.scheme.lower(),
+                "hostname": (endpoint.hostname or "").lower(),
+                "port": (
+                    endpoint.port
+                    if endpoint.port is not None
+                    else {"http": 80, "https": 443}.get(endpoint.scheme.lower())
+                ),
+                "path": endpoint.path if endpoint.path.endswith("/") else endpoint.path + "/",
+            }
+        except ValueError:
+            raise ValueError(
+                "Configured inference endpoint cannot provide a safe planning identity"
+            ) from None
+        identity = {
+            "endpoint": endpoint_identity,
+            "model": resolved_model,
+            "inference": {
+                "temperature": self._settings.llm_temperature,
+                "max_output_tokens": self._settings.llm_max_output_tokens,
+            },
+        }
+        canonical = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return {
+            "alias": selection,
+            "resolved_model": resolved_model,
+            "route_fingerprint": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "version_disclosure": {
+                "actual_model_version": "unknown",
+                "identity_scope": "configured_endpoint_model_and_inference_settings",
+                "limitation": (
+                    "Configured identity only; weights, deployment, tokenizer and runtime versions "
+                    "are unverified. Only HTTP(S) endpoints without userinfo, query or fragment "
+                    "are supported."
+                ),
+            },
+        }
+
+    def get(self, model: str | None = None) -> OpenAICompatibleModel:
+        selection = self._selection(model)
         if selection not in self._models:
             route = self._routes.get(selection)
             self._models[selection] = OpenAICompatibleModel(

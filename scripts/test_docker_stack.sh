@@ -28,6 +28,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ${COMPOSE} up --detach --build --wait
+${COMPOSE} exec -T gateway python < scripts/verify_planning.py
 curl --fail --no-buffer --max-time 60 \
   -H 'content-type: application/json' \
   -d '{"query":"Docker internal network smoke test","max_retries":0}' \

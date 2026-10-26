@@ -353,6 +353,8 @@ async def dispatch(
         raise HTTPException(
             status_code=409, detail="Automation changed; retry with current version"
         )
+    if result.get("status") == "skills_revoked":
+        raise HTTPException(status_code=409, detail="Automation Skill snapshot was revoked")
     return result
 
 

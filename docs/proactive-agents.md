@@ -26,6 +26,8 @@ Agent 設定的新增、修改、啟停需要 admin；operator 可以提交已�
 
 每個 Agent 保存 `name`、`description`、`persona`、`role`、`model`、`policy` 與 `enabled`。
 `model` 使用 `/v1/models` 中的 server-controlled alias；省略時採伺服器預設模型。
+亦可用 `skills:[{"skill_id":"...","revision":1}]` 綁定最多八個已安裝 Skill。
+Skill 版本、權限相容性與撤銷語意見[Skill 管理指南](skill-management.md)。
 
 先建立資安分析 Agent：
 

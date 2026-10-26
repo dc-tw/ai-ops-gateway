@@ -41,3 +41,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: sh scripts/test_docker_stack.sh
       - run: sh scripts/test_proactive_stack.sh
+      - run: sh scripts/test_atr_tool_stack.sh

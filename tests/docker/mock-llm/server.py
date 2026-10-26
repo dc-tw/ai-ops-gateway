@@ -1,6 +1,13 @@
 import json
+import re
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
+
+ATR_CASE = re.compile(r"atr-remote-tool-e2e:([0-9a-f]{32})")
+ATR_RECEIPTS = deque(maxlen=1_000)
+ATR_RECEIPT_LOCK = Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -10,6 +17,12 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self) -> None:
+        match = re.fullmatch(r"/test/atr-model-receipts/([0-9a-f]{32})", self.path)
+        if match:
+            with ATR_RECEIPT_LOCK:
+                receipts = [item for item in ATR_RECEIPTS if item["case_id"] == match[1]]
+            self._reply_json({"receipts": receipts})
+            return
         if self.path != "/healthz":
             self.send_error(404)
             return
@@ -27,6 +40,32 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         serialized_request = json.dumps(request)
+        case = ATR_CASE.search(serialized_request)
+        if case:
+            # Test evidence contains only booleans and the neutral case ID.
+            # Never retain a prompt, response, credential, or matched substring.
+            with ATR_RECEIPT_LOCK:
+                ATR_RECEIPTS.append(
+                    {
+                        "case_id": case[1],
+                        "stream": bool(request.get("stream")),
+                        "stage": "planning"
+                        if "<OBSERVATIONS>" in serialized_request
+                        else "generation",
+                        "contains_canary": "ATR_REMOTE_RAW_CANARY_" in serialized_request,
+                    }
+                )
+        messages = request.get("messages", [])
+        system = messages[0].get("content", "") if messages else ""
+        required = re.findall(r"skills-e2e-required:([a-z0-9-]+)", system)
+        for name in required:
+            marker = f'<gateway_skill name="{name}" revision=1>'
+            if (
+                marker not in system
+                or len(system.split(marker, 1)[1].split("</gateway_skill>", 1)[0].encode()) < 300
+            ):
+                self.send_error(400, "Required pinned Skill instructions were not supplied")
+                return
         if "checkpoint-resume" in serialized_request:
             time.sleep(10)
         if request.get("stream"):
@@ -40,6 +79,18 @@ class Handler(BaseHTTPRequestHandler):
     def _content(request: dict) -> str:
         content = "Mock model generated a sufficiently detailed verified response."
         messages = request.get("messages", [])
+        serialized = json.dumps(messages)
+        case = ATR_CASE.search(serialized)
+        if case:
+            prompt = messages[-1].get("content", "") if messages else ""
+            return json.dumps(
+                {
+                    "tool": "browser_close",
+                    "arguments": {"session_id": "atr-remote-" + case[1]},
+                }
+                if "<OBSERVATIONS>none</OBSERVATIONS>" in prompt
+                else {"tool": None, "arguments": {}}
+            )
         if messages and "You are a Chief Agent." in messages[0].get("content", ""):
             task = json.loads(messages[-1]["content"])
             content = json.dumps(
@@ -55,6 +106,14 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_ascii=False,
             )
         return content
+
+    def _reply_json(self, value: dict) -> None:
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json_response(self, request: dict) -> None:
         body = json.dumps(
@@ -95,6 +154,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         messages = request.get("messages", [])
         if messages and "You are a Chief Agent." in messages[0].get("content", ""):
+            tokens = (self._content(request),)
+        elif ATR_CASE.search(json.dumps(messages)) and "<OBSERVATIONS>" in messages[-1].get(
+            "content", ""
+        ):
             tokens = (self._content(request),)
         for token in tokens:
             chunk = {

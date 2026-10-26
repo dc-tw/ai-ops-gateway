@@ -12,6 +12,7 @@ async def record_threat_findings(
     context_id: str,
     model: str,
     source_automation_id: str | None = None,
+    emit_internal_events: bool = True,
 ) -> list[dict[str, Any]]:
     """Store ATR metadata when a Redis-compatible runtime supports calibration data."""
     if runtime is None or not event.get("findings"):
@@ -22,6 +23,8 @@ async def record_threat_findings(
     # Real Redis commits the source finding and its queue event together.
     # Lightweight test/runtime adapters without Redis retain their existing API.
     origin = {"source_automation_id": source_automation_id} if hasattr(runtime, "_client") else {}
+    if not emit_internal_events:
+        origin["emit_internal_events"] = False
     return await save(
         tenant_id,
         event,
