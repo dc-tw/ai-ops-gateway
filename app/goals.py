@@ -1,13 +1,16 @@
 import asyncio
+import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.api.routes import _sse
 from app.api.schemas import GoalCreateRequest
+from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
 from app.core.security import authorize, redact_pii
 from app.core.threat_feedback import record_threat_findings
@@ -46,9 +49,7 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         {
             "id": str(uuid4()),
             "query": (
-                redact_pii(step.query)
-                if request.app.state.settings.pii_redaction
-                else step.query
+                redact_pii(step.query) if request.app.state.settings.pii_redaction else step.query
             ),
             "target_url": str(step.target_url) if step.target_url else None,
             "status": "pending",
@@ -57,6 +58,14 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         }
         for step in payload.steps
     ]
+    for content in [objective, *(step["query"] for step in steps)]:
+        if any(
+            re.search(pattern, content, re.IGNORECASE)
+            for pattern in request.app.state.settings.content_blocked_patterns
+        ):
+            raise HTTPException(status_code=403, detail="Request blocked by content policy")
+        if max(1, len(content.encode("utf-8"))) > request.app.state.settings.request_token_budget:
+            raise HTTPException(status_code=413, detail="Request exceeds token budget")
     threat_scans = [
         await request.app.state.threat_detector.ascan(
             objective,
@@ -121,10 +130,14 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         "tenant_id": principal.tenant_id,
         "created_by": principal.subject,
     }
-    await runtime.save_goal(goal_id, goal, principal.tenant_id)
-    await runtime.append_goal_event(
-        goal_id, {"type": "goal_queued", "goal": goal}, principal.tenant_id
-    )
+    atomic_store = hasattr(runtime, "_client") or hasattr(runtime, "goal_execution_mutate")
+    if atomic_store:
+        await GoalExecutionStore(runtime).submit_manual(goal)
+    else:
+        await runtime.save_goal(goal_id, goal, principal.tenant_id)
+        await runtime.append_goal_event(
+            goal_id, {"type": "goal_queued", "goal": goal}, principal.tenant_id
+        )
     for scan in threat_scans:
         await runtime.append_goal_event(goal_id, scan.to_event(), principal.tenant_id)
         await runtime.append_audit(
@@ -137,16 +150,17 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
                 "event": scan.to_event(),
             },
         )
-    await runtime.enqueue_goal(goal_id, principal.tenant_id)
-    await runtime.append_audit(
-        principal.tenant_id,
-        {
-            "action": "goal.create",
-            "status": "queued",
-            "subject": principal.subject,
-            "goal_id": goal_id,
-        },
-    )
+    if not atomic_store:
+        await runtime.enqueue_goal(goal_id, principal.tenant_id)
+        await runtime.append_audit(
+            principal.tenant_id,
+            {
+                "action": "goal.create",
+                "status": "queued",
+                "subject": principal.subject,
+                "goal_id": goal_id,
+            },
+        )
     return goal
 
 
@@ -154,6 +168,8 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
 async def cancel_goal(goal_id: str, request: Request) -> dict[str, Any]:
     principal = await authorize(request, "operator")
     runtime = _require_redis(request)
+    if hasattr(runtime, "_client") or hasattr(runtime, "goal_execution_mutate"):
+        return await _control_goal(runtime, principal, goal_id, "cancel")
     goal = await runtime.get_goal(goal_id, principal.tenant_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="Goal not found")
@@ -204,6 +220,8 @@ async def get_goal(goal_id: str, request: Request) -> dict[str, Any]:
 async def pause_goal(goal_id: str, request: Request) -> dict[str, Any]:
     principal = await authorize(request, "operator")
     runtime = _require_redis(request)
+    if hasattr(runtime, "_client") or hasattr(runtime, "goal_execution_mutate"):
+        return await _control_goal(runtime, principal, goal_id, "pause")
     goal = await runtime.get_goal(goal_id, principal.tenant_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="Goal not found")
@@ -233,6 +251,8 @@ async def pause_goal(goal_id: str, request: Request) -> dict[str, Any]:
 async def resume_goal(goal_id: str, request: Request) -> dict[str, Any]:
     principal = await authorize(request, "operator")
     runtime = _require_redis(request)
+    if hasattr(runtime, "_client") or hasattr(runtime, "goal_execution_mutate"):
+        return await _control_goal(runtime, principal, goal_id, "resume")
     goal = await runtime.get_goal(goal_id, principal.tenant_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="Goal not found")
@@ -256,6 +276,55 @@ async def resume_goal(goal_id: str, request: Request) -> dict[str, Any]:
             "goal_id": goal_id,
         },
     )
+    return goal
+
+
+async def _control_goal(runtime: Any, principal: Any, goal_id: str, action: str) -> dict[str, Any]:
+    store = GoalExecutionStore(runtime)
+    try:
+        goal = await store.control(principal.tenant_id, goal_id, action, principal.subject)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if goal["status"] == "cancelled":
+        await store.reconcile_budget(goal)
+        from app.core.delegation import DelegationStore
+
+        await DelegationStore(runtime).cancel_children(
+            principal.tenant_id, goal_id, principal.subject
+        )
+    return goal
+
+
+class GoalApprovalDecision(BaseModel):
+    approval_id: str = Field(min_length=1, max_length=128)
+    approved: bool
+    reason: str = Field(default="", max_length=500)
+
+
+@router.post("/{goal_id}/approval")
+async def decide_goal_approval(
+    goal_id: str, payload: GoalApprovalDecision, request: Request
+) -> dict[str, Any]:
+    principal = await authorize(request, "operator")
+    runtime = _require_redis(request)
+    store = GoalExecutionStore(runtime)
+    try:
+        goal = await store.decide_approval(
+            principal.tenant_id,
+            goal_id,
+            payload.approval_id,
+            payload.approved,
+            payload.reason,
+            principal.subject,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if goal["status"] == "cancelled":
+        await store.reconcile_budget(goal)
     return goal
 
 

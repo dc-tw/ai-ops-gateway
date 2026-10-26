@@ -8,6 +8,7 @@ import json
 import socket
 import time
 from contextlib import suppress
+from copy import copy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,7 @@ class BrowserSession:
     page: Any
     lock: asyncio.Lock
     last_used: float
+    guard: BrowserScraper | None = None
 
 
 class BrowserScraper:
@@ -54,6 +56,21 @@ class BrowserScraper:
         self._timeout_ms = settings.playwright_timeout_ms
         self._max_chars = settings.playwright_max_content_chars
         self._allowed_domains = set(settings.playwright_allowed_domains)
+        self._delegated_domains: frozenset[str] = frozenset()
+
+    def _scoped(self, allowed_domains: list[str] | None) -> BrowserScraper:
+        """Copy the global guard and add an exact-host delegated restriction."""
+        if allowed_domains is None:
+            return self
+        if not isinstance(allowed_domains, list) or any(
+            not isinstance(domain, str) or not domain for domain in allowed_domains
+        ):
+            raise ValueError("allowed_domains must be a list of nonempty hostnames")
+        guard = copy(self)
+        guard._delegated_domains = frozenset(
+            domain.lower().rstrip(".") for domain in allowed_domains
+        )
+        return guard
 
     async def _validate_url(self, url: str) -> None:
         parsed = urlparse(url)
@@ -66,6 +83,8 @@ class BrowserScraper:
             for domain in self._allowed_domains
         ):
             raise UnsafeURLError(f"Domain is not allow-listed: {hostname}")
+        if self._delegated_domains and hostname not in self._delegated_domains:
+            raise UnsafeURLError(f"Domain is outside the delegated job policy: {hostname}")
 
         def resolve() -> set[str]:
             return {
@@ -91,7 +110,33 @@ class BrowserScraper:
         except (UnsafeURLError, ValueError):
             await route.abort("blockedbyclient")
             return
+        if self._delegated_domains:
+            # Playwright routing may follow redirects without another callback.
+            # Scoped contexts fetch exactly one response and reject all 30x
+            # before forwarding it, so no redirect destination receives traffic.
+            response = None
+            try:
+                response = await route.fetch(max_redirects=0, timeout=self._timeout_ms)
+                if 300 <= response.status < 400:
+                    await route.abort("blockedbyclient")
+                    return
+                await route.fulfill(response=response)
+            except Exception:
+                await route.abort("failed")
+            finally:
+                if response is not None:
+                    await response.dispose()
+            return
         await route.continue_()
+
+    @staticmethod
+    async def _block_websocket(route: Any) -> None:
+        await route.close(code=1008, reason="WebSockets are disabled by delegated browser policy")
+
+    async def _install_routes(self, context: Any) -> None:
+        await context.route("**/*", self._guard_route)
+        if self._delegated_domains:
+            await context.route_web_socket("**/*", self._block_websocket)
 
     @staticmethod
     def _clean_html(html: str) -> tuple[str, str]:
@@ -106,7 +151,9 @@ class BrowserScraper:
         text = "\n".join(line for line in lines if line)
         return title, text
 
-    async def scrape(self, url: str) -> dict[str, object]:
+    async def scrape(
+        self, url: str, *, allowed_domains: list[str] | None = None
+    ) -> dict[str, object]:
         """Render a public dynamic web page and return clean, bounded main-page text."""
         try:
             from playwright.async_api import Browser, async_playwright
@@ -116,7 +163,8 @@ class BrowserScraper:
                 "Playwright is not installed; install the 'browser' project extra"
             ) from exc
 
-        await self._validate_url(url)
+        guard = self._scoped(allowed_domains)
+        await guard._validate_url(url)
         async with async_playwright() as playwright:
             browser: Browser = await playwright.chromium.launch(
                 headless=self._headless,
@@ -128,7 +176,7 @@ class BrowserScraper:
                     service_workers="block",
                     accept_downloads=False,
                 )
-                await context.route("**/*", self._guard_route)
+                await guard._install_routes(context)
                 page = await context.new_page()
                 response = await page.goto(
                     url,
@@ -145,7 +193,7 @@ class BrowserScraper:
                 except PlaywrightTimeoutError:
                     pass  # Many modern sites keep telemetry sockets open indefinitely.
                 final_url = page.url
-                await self._validate_url(final_url)
+                await guard._validate_url(final_url)
                 title, text = self._clean_html(await page.content())
                 text = text[: self._max_chars]
                 return asdict(
@@ -229,7 +277,7 @@ class BrowserSessionManager:
 
     async def _snapshot(self, session: BrowserSession) -> dict[str, object]:
         final_url = session.page.url
-        await self._scraper._validate_url(final_url)
+        await (session.guard or self._scraper)._validate_url(final_url)
         title, text = self._scraper._clean_html(await session.page.content())
         text = text[: self._max_chars]
         return {
@@ -242,11 +290,14 @@ class BrowserSessionManager:
             "content_sha256": hashlib.sha256(text.encode()).hexdigest(),
         }
 
-    async def start(self, url: str) -> dict[str, object]:
+    async def start(
+        self, url: str, *, allowed_domains: list[str] | None = None
+    ) -> dict[str, object]:
         await self._cleanup_expired()
         if len(self._sessions) >= self._max_sessions:
             raise RuntimeError("Browser session limit reached")
-        await self._scraper._validate_url(url)
+        guard = self._scraper._scoped(allowed_domains)
+        await guard._validate_url(url)
         await self._ensure_browser()
         context = await self._browser.new_context(
             java_script_enabled=True,
@@ -254,7 +305,7 @@ class BrowserSessionManager:
             accept_downloads=False,
             viewport={"width": 1280, "height": 720},
         )
-        await context.route("**/*", self._scraper._guard_route)
+        await guard._install_routes(context)
         page = await context.new_page()
         session_id = str(uuid4())
         session = BrowserSession(
@@ -263,6 +314,7 @@ class BrowserSessionManager:
             page=page,
             lock=asyncio.Lock(),
             last_used=time.monotonic(),
+            guard=guard,
         )
         self._sessions[session_id] = session
         try:
@@ -309,7 +361,7 @@ class BrowserSessionManager:
     async def screenshot(self, session_id: str, *, full_page: bool = False) -> dict[str, object]:
         session = await self._get(session_id)
         async with session.lock:
-            await self._scraper._validate_url(session.page.url)
+            await (session.guard or self._scraper)._validate_url(session.page.url)
             image = await session.page.screenshot(type="png", full_page=full_page)
             if len(image) > 10_000_000:
                 raise RuntimeError("Screenshot exceeds the 10 MB response limit")

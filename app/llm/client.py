@@ -27,6 +27,21 @@ class ModelChunk:
     usage: dict[str, float | int]
 
 
+def validated_token_usage(metadata: object, *, has_output: bool = False) -> dict[str, int] | None:
+    """Accept only complete, nonnegative and internally consistent usage."""
+    if not isinstance(metadata, dict):
+        return None
+    fields = ("input_tokens", "output_tokens", "total_tokens")
+    if any(type(metadata.get(field)) is not int or metadata[field] < 0 for field in fields):
+        return None
+    counts = {field: metadata[field] for field in fields}
+    if counts["total_tokens"] != counts["input_tokens"] + counts["output_tokens"]:
+        return None
+    if has_output and counts["total_tokens"] == 0:
+        return None
+    return counts
+
+
 def _text(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -80,29 +95,32 @@ class OpenAICompatibleModel:
     async def complete(self, system: str, prompt: str) -> str:
         return (await self.complete_result(system, prompt)).text
 
-    def _usage(self, metadata: object) -> dict[str, float | int]:
-        value = metadata if isinstance(metadata, dict) else {}
-        input_tokens = int(value.get("input_tokens", 0))
-        output_tokens = int(value.get("output_tokens", 0))
-        total_tokens = int(value.get("total_tokens", input_tokens + output_tokens))
-        cost = (
-            input_tokens * self._input_cost + output_tokens * self._output_cost
-        ) / 1_000_000
+    def _usage(self, metadata: object, *, has_output: bool = False) -> dict[str, float | int]:
+        counts = validated_token_usage(metadata, has_output=has_output)
+        value = counts or {}
+        input_tokens = value.get("input_tokens", 0)
+        output_tokens = value.get("output_tokens", 0)
+        total_tokens = value.get("total_tokens", 0)
+        cost = (input_tokens * self._input_cost + output_tokens * self._output_cost) / 1_000_000
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "cost_usd": round(cost, 8),
-            "provider_reported": bool(value),
+            "provider_reported": counts is not None,
         }
 
-    async def complete_result(self, system: str, prompt: str) -> ModelResult:
-        response = await self._model.ainvoke(
+    async def complete_result(
+        self, system: str, prompt: str, *, max_output_tokens: int | None = None
+    ) -> ModelResult:
+        model = self._model.bind(max_tokens=max_output_tokens) if max_output_tokens else self._model
+        response = await model.ainvoke(
             [SystemMessage(content=system), HumanMessage(content=prompt)]
         )
+        text = _text(response.content).strip()
         return ModelResult(
-            text=_text(response.content).strip(),
-            usage=self._usage(getattr(response, "usage_metadata", None)),
+            text=text,
+            usage=self._usage(getattr(response, "usage_metadata", None), has_output=bool(text)),
         )
 
     async def stream(self, system: str, prompt: str) -> AsyncIterator[str]:
@@ -110,14 +128,27 @@ class OpenAICompatibleModel:
             if chunk.text:
                 yield chunk.text
 
-    async def stream_result(self, system: str, prompt: str) -> AsyncIterator[ModelChunk]:
-        async for chunk in self._model.astream(
+    async def stream_result(
+        self, system: str, prompt: str, *, max_output_tokens: int | None = None
+    ) -> AsyncIterator[ModelChunk]:
+        model = self._model.bind(max_tokens=max_output_tokens) if max_output_tokens else self._model
+        last_metadata = None
+        has_output = False
+        async for chunk in model.astream(
             [SystemMessage(content=system), HumanMessage(content=prompt)]
         ):
             text = _text(chunk.content)
-            usage = self._usage(getattr(chunk, "usage_metadata", None))
-            if text or usage["provider_reported"]:
-                yield ModelChunk(text=text, usage=usage)
+            has_output = has_output or bool(text)
+            metadata = getattr(chunk, "usage_metadata", None)
+            if metadata:
+                last_metadata = metadata
+            if text:
+                yield ModelChunk(text=text, usage={})
+        # Check usage against the complete output; an early all-zero chunk must
+        # not become a free completed stream once text arrives afterwards.
+        usage = self._usage(last_metadata, has_output=has_output)
+        if usage["provider_reported"]:
+            yield ModelChunk(text="", usage=usage)
 
 
 class ModelRouter:
@@ -143,14 +174,10 @@ class ModelRouter:
                     "model": model,
                     "api_key": str(route.get("api_key", settings.llm_api_key)),
                     "input_cost_per_million": str(
-                        route.get(
-                            "input_cost_per_million", settings.llm_input_cost_per_million
-                        )
+                        route.get("input_cost_per_million", settings.llm_input_cost_per_million)
                     ),
                     "output_cost_per_million": str(
-                        route.get(
-                            "output_cost_per_million", settings.llm_output_cost_per_million
-                        )
+                        route.get("output_cost_per_million", settings.llm_output_cost_per_million)
                     ),
                 }
 
@@ -168,9 +195,7 @@ class ModelRouter:
                 model=route["model"] if route else selection,
                 base_url=route["base_url"] if route else None,
                 api_key=route["api_key"] if route else None,
-                input_cost_per_million=(
-                    float(route["input_cost_per_million"]) if route else None
-                ),
+                input_cost_per_million=(float(route["input_cost_per_million"]) if route else None),
                 output_cost_per_million=(
                     float(route["output_cost_per_million"]) if route else None
                 ),
@@ -184,7 +209,6 @@ class ModelRouter:
     def available_models(self) -> list[dict[str, str]]:
         models = [{"id": self._settings.llm_model, "model": self._settings.llm_model}]
         models.extend(
-            {"id": alias, "model": route["model"]}
-            for alias, route in sorted(self._routes.items())
+            {"id": alias, "model": route["model"]} for alias, route in sorted(self._routes.items())
         )
         return models

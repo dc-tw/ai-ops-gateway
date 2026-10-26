@@ -20,23 +20,29 @@ executor = (
 
 
 @mcp.tool()
-async def scrape_dynamic_page(url: str) -> dict[str, object]:
+async def scrape_dynamic_page(
+    url: str, allowed_domains: list[str] | None = None
+) -> dict[str, object]:
     """Render an allow-listed public webpage and return cleaned, bounded main content."""
-    return await executor.invoke("scrape_dynamic_page", {"url": url})
+    arguments = {"url": url}
+    if allowed_domains is not None:
+        arguments["allowed_domains"] = allowed_domains
+    return await executor.invoke("scrape_dynamic_page", arguments)
 
 
 @mcp.tool()
-async def browser_start(url: str) -> dict[str, object]:
+async def browser_start(url: str, allowed_domains: list[str] | None = None) -> dict[str, object]:
     """Start an isolated browser session and return its id plus a cleaned page snapshot."""
-    return await executor.invoke("browser_start", {"url": url})
+    arguments = {"url": url}
+    if allowed_domains is not None:
+        arguments["allowed_domains"] = allowed_domains
+    return await executor.invoke("browser_start", arguments)
 
 
 @mcp.tool()
 async def browser_click(session_id: str, selector: str) -> dict[str, object]:
     """Click the first matching CSS/text selector in an existing browser session."""
-    return await executor.invoke(
-        "browser_click", {"session_id": session_id, "selector": selector}
-    )
+    return await executor.invoke("browser_click", {"session_id": session_id, "selector": selector})
 
 
 @mcp.tool()

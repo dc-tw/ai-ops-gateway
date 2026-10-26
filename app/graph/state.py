@@ -16,6 +16,8 @@ class AgentState(TypedDict):
     tool_round: int
     max_tool_rounds: int
     interactive_approval: bool
+    require_bound_approval: NotRequired[bool]
+    last_tool_model_selected: NotRequired[bool]
     approved_tools: list[str]
     attempt: int
     max_retries: int

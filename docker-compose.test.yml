@@ -12,6 +12,7 @@ services:
       CONVERSATION_MAX_TURNS: "2"
       ATR_ENABLED: ${ATR_ENABLED:-true}
       ATR_BLOCKING: ${ATR_BLOCKING:-false}
+      AUTOMATION_WEBHOOK_SECRETS_JSON: ${AUTOMATION_WEBHOOK_SECRETS_JSON:-}
 
   browser:
     build:
@@ -20,6 +21,7 @@ services:
 
   worker:
     environment:
+      GOAL_LEASE_MS: "5000"
       LLM_BASE_URL: http://mock-llm:8080/v1
       LLM_API_KEY: test-only
       LLM_MODEL: mock-model
@@ -32,6 +34,13 @@ services:
     depends_on:
       mock-llm:
         condition: service_healthy
+
+  scheduler:
+    environment:
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_API_KEY: test-only
+      LLM_MODEL: mock-model
+      AUTOMATION_POLL_SECONDS: "0.2"
 
   mock-llm:
     build:

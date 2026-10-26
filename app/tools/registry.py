@@ -50,10 +50,15 @@ class LocalBrowserToolExecutor:
         return list(TOOL_SPECS.values())
 
     async def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, object]:
+        scope = (
+            {"allowed_domains": arguments["allowed_domains"]}
+            if "allowed_domains" in arguments
+            else {}
+        )
         if name == "scrape_dynamic_page":
-            return await self._scraper.scrape(str(arguments["url"]))
+            return await self._scraper.scrape(str(arguments["url"]), **scope)
         if name == "browser_start":
-            return await self._sessions.start(str(arguments["url"]))
+            return await self._sessions.start(str(arguments["url"]), **scope)
         if name == "browser_click":
             return await self._sessions.click(
                 str(arguments["session_id"]), str(arguments["selector"])
@@ -177,5 +182,10 @@ class RemoteBrowserScraper:
     def __init__(self, executor: RemoteBrowserToolExecutor) -> None:
         self._executor = executor
 
-    async def scrape(self, url: str) -> dict[str, object]:
-        return await self._executor.invoke("scrape_dynamic_page", {"url": url})
+    async def scrape(
+        self, url: str, *, allowed_domains: list[str] | None = None
+    ) -> dict[str, object]:
+        arguments: dict[str, Any] = {"url": url}
+        if allowed_domains is not None:
+            arguments["allowed_domains"] = allowed_domains
+        return await self._executor.invoke("scrape_dynamic_page", arguments)

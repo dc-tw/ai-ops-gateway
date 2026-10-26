@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     goal_worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
     goal_consumer_group: str = "goal-workers"
     goal_lease_ms: int = Field(default=60_000, ge=5_000)
+    automation_poll_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
+    automation_default_max_runs_per_day: int = Field(default=24, ge=1, le=100_000)
+    automation_default_token_budget: int = Field(default=20_000, ge=256, le=10_000_000)
+    automation_default_approval_timeout_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
+    automation_webhook_secrets_json: str = ""
     tenant_requests_per_minute: int = Field(default=60, ge=1)
     tenant_max_concurrent_runs: int = Field(default=4, ge=1)
     request_token_budget: int = Field(default=16_000, ge=256)
@@ -73,9 +78,7 @@ class Settings(BaseSettings):
     atr_max_content_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     atr_rules_dir: str = ""
     atr_blocking_rule_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    atr_blocking_excluded_rule_ids: Annotated[list[str], NoDecode] = Field(
-        default_factory=list
-    )
+    atr_blocking_excluded_rule_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
     atr_findings_ttl_seconds: int = Field(default=2_592_000, ge=3_600)
     atr_findings_max_records: int = Field(default=10_000, ge=100, le=100_000)
     atr_calibration_min_reviews: int = Field(default=20, ge=1, le=10_000)

@@ -1,6 +1,6 @@
 # Buzz-inspired 架構演進 Roadmap
 
-- 狀態：Proposal
+- 狀態：Proposal；主動工作與 Agent 角色子集已實作（驗證見進度紀錄）
 - 建立日期：2026-10-25
 - 參考資料觀察日期：2026-10-24
 - 適用專案：AI Operations Gateway
@@ -19,8 +19,9 @@ Gateway 執行治理、可恢復性與稽核性的設計模式。
 4. tamper-evident audit；
 5. per-conversation single-flight。
 
-這五項目前都不是「已完成」宣告。每一項必須經 Discussion、ADR、migration plan、測試與 rollout
-gate 才能改為 Implementing 或 Shipped。
+這五項並未全部完成。2026-10-25 已先交付 Redis-based 主動工作與可設定 Agent 角色子集，
+不代表完整 identity／credential lifecycle、統一 envelope 或 Postgres migration 已完成。
+其餘項目仍須經 Discussion、ADR、migration plan、測試與 rollout gate。
 
 ## 參考來源與事實邊界
 
@@ -51,7 +52,7 @@ gate 才能改為 Implementing 或 Shipped。
 | Durable data | Postgres event store | Redis 為主 | 長期查詢、關聯與 migration 邊界未定義 |
 | 即時資料 | Redis pub/sub、presence、typing | Redis Stream、queue、checkpoint、lock | Redis 職責過多且混合長短期資料 |
 | Audit | per-scope SHA-256 hash chain | Redis audit stream | 尚無 tamper evidence 與 chain verification |
-| Identity | 人類與 Agent 都有明確身份 | user principal；Agent identity 不完整 | policy 主要綁在 request／部署設定 |
+| Identity | 人類與 Agent 都有明確身份 | user principal；server-owned Agent 設定、persona 與 policy snapshot | Agent credential lifecycle、MCP／ATR policy reference 尚未完成 |
 | 同一工作空間的併發 | per-channel single-flight | tenant/run quota，未鎖定 conversation | 同一 conversation 可能發生次序競爭 |
 | 安全 | 身份、簽章、membership | RBAC、ATR、quota、approval、Evidence Validation | 可互補，不應互相取代 |
 
@@ -123,6 +124,12 @@ Client 不得自行宣告或擴權 Agent principal。Human approval 仍是特定
 驗收證據：impersonation rejection、owner/policy authorization matrix、credential rotation、跨 tenant
 isolation，以及 audit actor attribution。
 
+2026-10-25 子集進度：已加入 admin 管理的 Agent directory、獨立 persona／模型／工具／網域／
+token／每日次數政策、啟停狀態，以及單層 Chief → Worker 派工。Client 不能指定服務端 Agent ID
+或把任意 webhook data 當成身份／政策。Chief 與子 Agent 共用團隊 token cap。
+這不是完整 Agent principal：獨立 Agent 憑證、rotation、MCP configuration／ATR policy reference
+仍未實作。操作與限制見 [主動工作指南](../proactive-agents.md)。
+
 ### P0-4：Per-conversation Single-flight
 
 同一 `tenant_id + conversation_id` 同時間最多允許一個會改變對話或 browser session 的 run；其餘
@@ -169,11 +176,13 @@ retention/deletion、tenant isolation、FTS permission recheck，以及 Redis un
 - ACP adapter，讓支援 ACP 的 client 使用 Gateway。
 - Declarative Workflow YAML，編譯為 LangGraph，而不是建立第二套 workflow executor。
 - Postgres FTS 搜尋 Conversation、Goal、Evidence 與 Audit；回傳前重新檢查 tenant／resource permission。
-- Agent directory、presence 與 job queue。
-- Webhook、schedule 與 event trigger。
-- Tool execution receipt 與可搜尋 provenance。
+- Agent directory、presence 與 job queue：directory 與 durable queue 已實作；presence 待評估。
+- Webhook、schedule 與 event trigger：已實作 HMAC webhook、cron／interval、ATR finding／Goal failure。
+- Tool execution receipt 與可搜尋 provenance：已加入防止不確定副作用重播的 receipt、子任務來源；
+  全域搜尋仍未實作。
 
-P1 不應在 P0 identity、event semantics 與 durable store 還未穩定前承諾交付日期。
+上述子集由使用者明確確認後先以既有 Redis／LangGraph 架構交付；不要求先完成 Postgres migration，
+但依賴 Redis AOF／volume，且目前無自動歸檔。其餘 P1 不在此承諾交付日期。
 
 ## 明確非目標
 
@@ -196,5 +205,7 @@ P1 不應在 P0 identity、event semantics 與 durable store 還未穩定前承�
 | D-002 | 不把 Buzz vision 文件中的描述自動視為已交付能力 | Accepted | 2026-10-25 |
 | D-003 | 先定義 event semantics，再進行 Postgres migration | Proposed | 2026-10-25 |
 | D-004 | Discussion 保存探索過程；合併後的 repository 文件保存正式決策 | Accepted | 2026-10-25 |
+| D-005 | 先以既有 Redis durable Goal 交付定時／事件工作與單層 Chief 派工，不建立第二套 executor | Accepted | 2026-10-25 |
+| D-006 | 寫入逐次人工核准；共用團隊 token cap；自動化來源預設不得連鎖觸發 | Accepted | 2026-10-25 |
 
 進度與未決問題記錄於 [discussion-log.md](discussion-log.md)。

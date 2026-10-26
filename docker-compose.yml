@@ -74,6 +74,38 @@ services:
     cpus: 2
     networks: [backend]
 
+  scheduler:
+    image: ai-ops-gateway:local
+    pull_policy: never
+    command: ["python", "-m", "app.scheduler"]
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-local-only}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('redis', 6379), 3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1
+    networks: [backend]
+
   browser:
     image: ai-ops-browser:local
     build:

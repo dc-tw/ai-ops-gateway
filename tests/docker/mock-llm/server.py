@@ -30,11 +30,33 @@ class Handler(BaseHTTPRequestHandler):
         if "checkpoint-resume" in serialized_request:
             time.sleep(10)
         if request.get("stream"):
-            self._stream_response(emit_threat="model-output-threat-test" in serialized_request)
+            self._stream_response(
+                request, emit_threat="model-output-threat-test" in serialized_request
+            )
         else:
-            self._json_response()
+            self._json_response(request)
 
-    def _json_response(self) -> None:
+    @staticmethod
+    def _content(request: dict) -> str:
+        content = "Mock model generated a sufficiently detailed verified response."
+        messages = request.get("messages", [])
+        if messages and "You are a Chief Agent." in messages[0].get("content", ""):
+            task = json.loads(messages[-1]["content"])
+            content = json.dumps(
+                {
+                    "assignments": [
+                        {
+                            "agent_id": worker["agent_id"],
+                            "query": f"依專長分析事件：{worker['description']}",
+                        }
+                        for worker in task["approved_workers"][:2]
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        return content
+
+    def _json_response(self, request: dict) -> None:
         body = json.dumps(
             {
                 "id": "chatcmpl-mock",
@@ -46,9 +68,7 @@ class Handler(BaseHTTPRequestHandler):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": (
-                                "Mock model generated a sufficiently detailed verified response."
-                            ),
+                            "content": self._content(request),
                         },
                         "finish_reason": "stop",
                     }
@@ -62,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _stream_response(self, *, emit_threat: bool = False) -> None:
+    def _stream_response(self, request: dict, *, emit_threat: bool = False) -> None:
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -73,6 +93,9 @@ class Handler(BaseHTTPRequestHandler):
             if emit_threat
             else ("Mock ", "streaming ", "final ", "answer")
         )
+        messages = request.get("messages", [])
+        if messages and "You are a Chief Agent." in messages[0].get("content", ""):
+            tokens = (self._content(request),)
         for token in tokens:
             chunk = {
                 "id": "chatcmpl-mock",

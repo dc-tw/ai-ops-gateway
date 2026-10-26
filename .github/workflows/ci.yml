@@ -10,6 +10,17 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,7 +36,8 @@ jobs:
 
   docker-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: sh scripts/test_docker_stack.sh
+      - run: sh scripts/test_proactive_stack.sh

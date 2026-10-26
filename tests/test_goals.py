@@ -1,10 +1,13 @@
+import asyncio
 import hashlib
+import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
 
 import pytest
 
+from app.core.goal_execution import GoalExecutionStore
 from app.worker import execute_goal, recover_goals
 
 
@@ -40,6 +43,31 @@ class FakeRuntime:
         self.events: list[dict[str, Any]] = []
         self.queue: list[str] = []
         self.messages: list[dict[str, str]] = []
+        self.audit = []
+        self.lock = asyncio.Lock()
+
+    async def goal_execution_mutate(self, tenant, goal_id, change):
+        async with self.lock:
+            mutation = change(deepcopy(self.goals.get(goal_id)))
+            if mutation.goal is not None:
+                self.goals[goal_id] = deepcopy(mutation.goal)
+                self.events.extend(deepcopy(mutation.events))
+                self.audit.extend(deepcopy(mutation.audits))
+                if mutation.enqueue:
+                    self.queue.append(goal_id)
+            return deepcopy(mutation.result)
+
+    async def goal_execution_reserve_budget(self, goal, owner, limit):
+        goal["token_reservation"] = {"reserved": 20_000, "reconciled": False}
+
+    async def enforce_rate_limit(self, tenant, limit):
+        return 1
+
+    async def acquire_run_slot(self, *args, **kwargs):
+        return True
+
+    async def release_run_slot(self, *args):
+        pass
 
     async def get_goal(self, goal_id: str, tenant_id: str = "default"):
         goal = self.goals.get(goal_id)
@@ -127,8 +155,7 @@ async def test_goal_worker_completes_and_persists_step_memory() -> None:
     assert saved["status"] == "completed"
     assert saved["steps"][0]["status"] == "completed"
     assert (
-        saved["steps"][0]["answer"]
-        == "A sufficiently detailed result for the durable goal step."
+        saved["steps"][0]["answer"] == "A sufficiently detailed result for the durable goal step."
     )
     assert runtime.messages[-1]["model"] == "model-a"
     assert runtime.events[-1]["type"] == "goal_completed"
@@ -140,3 +167,34 @@ async def test_worker_restart_recovers_running_goal() -> None:
     await recover_goals(runtime)
     assert runtime.goals["goal-1"]["status"] == "queued"
     assert runtime.queue == ["goal-1"]
+
+
+@pytest.mark.asyncio
+async def test_worker_restart_does_not_steal_a_live_owner() -> None:
+    running = goal(status="running")
+    running.update(execution_owner="live", execution_lease_until=time.time() + 120)
+    runtime = FakeRuntime(running)
+    await recover_goals(runtime)
+    assert runtime.goals["goal-1"]["status"] == "running"
+    assert runtime.queue == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_pause_cannot_skip_the_worker_pause_boundary() -> None:
+    runtime = FakeRuntime(goal())
+    store = GoalExecutionStore(runtime)
+    await store.claim("goal-1", "default", "original", 60_000)
+    assert (await store.control("default", "goal-1", "pause", "u"))["status"] == "pausing"
+    assert (await store.control("default", "goal-1", "pause", "u"))["status"] == "pausing"
+    with pytest.raises(ValueError, match="Only paused"):
+        await store.control("default", "goal-1", "resume", "u")
+    assert await store.claim("goal-1", "default", "replacement", 60_000) is None
+    # Expiry reaches the pause boundary but must never restart the paused work.
+    assert (
+        await store.claim("goal-1", "default", "replacement", 60_000, now=time.time() + 120) is None
+    )
+    assert runtime.goals["goal-1"]["status"] == "paused"
+    await store.control("default", "goal-1", "resume", "u")
+    assert (await store.claim("goal-1", "default", "replacement", 60_000))["execution_owner"] == (
+        "replacement"
+    )

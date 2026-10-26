@@ -7,6 +7,8 @@ from typing import Any
 
 from redis.asyncio import Redis
 
+from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+
 
 class RedisRuntime:
     """Small Redis abstraction for event audit, task queueing, and short-term memory."""
@@ -25,12 +27,14 @@ class RedisRuntime:
     async def append_event(
         self, request_id: str, event: dict[str, Any], tenant_id: str = "default"
     ) -> str:
-        return str(await self._client.xadd(
-            self._tenant_key(tenant_id, f"agent:events:{request_id}"),
-            {"payload": json.dumps(event, ensure_ascii=False)},
-            maxlen=self._stream_maxlen,
-            approximate=True,
-        ))
+        return str(
+            await self._client.xadd(
+                self._tenant_key(tenant_id, f"agent:events:{request_id}"),
+                {"payload": json.dumps(event, ensure_ascii=False)},
+                maxlen=self._stream_maxlen,
+                approximate=True,
+            )
+        )
 
     async def read_agent_events(
         self,
@@ -100,9 +104,7 @@ class RedisRuntime:
     ) -> int:
         day = datetime.now(UTC).strftime("%Y-%m-%d")
         key = self._tenant_key(tenant_id, f"quota:tokens:{day}")
-        marker = self._tenant_key(
-            tenant_id, f"quota:tokens:{day}:reconciled:{request_id}"
-        )
+        marker = self._tenant_key(tenant_id, f"quota:tokens:{day}:reconciled:{request_id}")
         delta = actual_tokens - reserved_tokens
         script = """
         if not redis.call('SET', KEYS[2], '1', 'EX', ARGV[2], 'NX') then
@@ -154,6 +156,7 @@ class RedisRuntime:
         model: str,
         ttl_seconds: int,
         max_records: int,
+        source_automation_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Persist privacy-safe ATR metadata; raw scanned content is never stored."""
         now = datetime.now(UTC)
@@ -173,9 +176,7 @@ class RedisRuntime:
                 "event_type": str(event.get("event_type", "unknown")),
                 "location": str(event.get("location", "unknown")),
                 "block_candidate": bool(finding.get("block_candidate", False)),
-                "enforcement_status": str(
-                    finding.get("enforcement_action", "detected")
-                ),
+                "enforcement_status": str(finding.get("enforcement_action", "detected")),
                 "review_status": "unreviewed",
                 "review_reason": "",
                 "reviewed_by": "",
@@ -194,6 +195,20 @@ class RedisRuntime:
                     ex=ttl_seconds,
                 )
                 pipe.zadd(index_key, {finding_id: now.timestamp()})
+                internal = build_internal_event(
+                    "threat.detected",
+                    finding_id,
+                    record,
+                    source_automation_id=source_automation_id,
+                )
+                if internal is not None:
+                    pipe.xadd(
+                        INTERNAL_STREAM,
+                        {
+                            "tenant_id": tenant_id,
+                            "payload": json.dumps(internal, ensure_ascii=False),
+                        },
+                    )
             pipe.expire(index_key, ttl_seconds)
             pipe.zremrangebyscore(index_key, "-inf", now.timestamp() - ttl_seconds)
             await pipe.execute()
@@ -205,18 +220,14 @@ class RedisRuntime:
                     pipe.zrem(index_key, *stale_ids)
                     pipe.delete(
                         *[
-                            self._tenant_key(
-                                tenant_id, f"security:threat-finding:{finding_id}"
-                            )
+                            self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}")
                             for finding_id in stale_ids
                         ]
                     )
                     await pipe.execute()
         return records
 
-    async def get_threat_finding(
-        self, tenant_id: str, finding_id: str
-    ) -> dict[str, Any] | None:
+    async def get_threat_finding(self, tenant_id: str, finding_id: str) -> dict[str, Any] | None:
         value = await self._client.get(
             self._tenant_key(tenant_id, f"security:threat-finding:{finding_id}")
         )
@@ -236,9 +247,7 @@ class RedisRuntime:
         offset = 0
         batch_size = min(max(limit, 100), 1_000)
         while len(records) < limit:
-            finding_ids = await self._client.zrevrange(
-                index_key, offset, offset + batch_size - 1
-            )
+            finding_ids = await self._client.zrevrange(index_key, offset, offset + batch_size - 1)
             if not finding_ids:
                 break
             offset += len(finding_ids)
@@ -413,9 +422,7 @@ class RedisRuntime:
         if memory_count > 500:
             await self._client.zremrangebyrank(memory_key, 0, memory_count - 501)
 
-    async def delete_conversation(
-        self, conversation_id: str, tenant_id: str = "default"
-    ) -> bool:
+    async def delete_conversation(self, conversation_id: str, tenant_id: str = "default") -> bool:
         return bool(
             await self._client.delete(
                 self._tenant_key(tenant_id, f"conversation:{conversation_id}:messages"),
@@ -436,9 +443,7 @@ class RedisRuntime:
             pipe.sadd("agent:goal:tenants", tenant_id)
             await pipe.execute()
 
-    async def get_goal(
-        self, goal_id: str, tenant_id: str = "default"
-    ) -> dict[str, Any] | None:
+    async def get_goal(self, goal_id: str, tenant_id: str = "default") -> dict[str, Any] | None:
         value = await self._client.get(self._tenant_key(tenant_id, f"agent:goal:{goal_id}"))
         return json.loads(value) if value else None
 
@@ -452,15 +457,11 @@ class RedisRuntime:
         await self._client.xadd(
             "agent:goal:queue",
             {"goal_id": goal_id, "tenant_id": tenant_id},
-            maxlen=self._stream_maxlen,
-            approximate=True,
         )
 
     async def ensure_goal_group(self, group: str) -> None:
         with suppress(Exception):
-            await self._client.xgroup_create(
-                "agent:goal:queue", group, id="0-0", mkstream=True
-            )
+            await self._client.xgroup_create("agent:goal:queue", group, id="0-0", mkstream=True)
 
     async def claim_goal(
         self,
@@ -527,8 +528,6 @@ class RedisRuntime:
             await self._client.xadd(
                 self._tenant_key(tenant_id, f"agent:goal:events:{goal_id}"),
                 {"payload": json.dumps(event, ensure_ascii=False)},
-                maxlen=self._stream_maxlen,
-                approximate=True,
             )
         )
 

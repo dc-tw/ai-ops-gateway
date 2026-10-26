@@ -251,6 +251,11 @@ Session 有 TTL 與數量上限，輸入/點擊只接受 selector，不提供任
 
 ## Durable Goal Mode
 
+定時、webhook、內部事件、Agent persona 與 Chief 派工的設定及操作方式，見
+[`docs/proactive-agents.md`](docs/proactive-agents.md)。可為每個 Agent 獨立設定職責、persona、模型與
+權限；Chief 將主要任務委派給核准的 Worker Agent，等待後彙整。主動工作由獨立 scheduler 建立
+Goal，與一般請求共用 ATR、quota、checkpoint、逐次 human approval 與持久化事件。
+
 Goal state、步驟與事件保存在 Redis，由 Compose 中獨立的 `worker` 執行。未提供 `steps`
 時，worker 會要求選定模型拆解成有限步驟；也可由呼叫端明確指定可稽核的步驟。
 
@@ -287,7 +292,7 @@ Pause 是 cooperative：正在執行的 Agent 會在下一個 LangGraph event �
 ## Kubernetes / HA baseline
 
 [`deploy/kubernetes`](deploy/kubernetes/) 提供 Kustomize baseline：
-Gateway 3 replicas、Worker 2 replicas、Browser Worker 2 replicas、HPA、PDB、non-root／read-only
+Gateway 3 replicas、Worker 2 replicas、Scheduler 2 replicas、Browser Worker 2 replicas、HPA、PDB、non-root／read-only
 security context、NetworkPolicy，以及 Browser Worker 的 ClientIP session affinity。部署前必須建立
 `ai-ops-gateway-secrets`；[`secret.example.yaml`](deploy/kubernetes/secret.example.yaml)
 只是一份不含真實憑證的格式範例。
