@@ -241,6 +241,36 @@ Agent identity、per-conversation single-flight 與 durable event store。
 
 - [完整能力矩陣、重現命令、限制與後續驗收](../releases/2026-10-26-skills-plan-mode.md)
 
+## 2026-10-27 — Postgres 歷史儲存、回填與切讀
+
+### Scope
+
+依使用者指示優先實作 Postgres，再推送 dc-tw/ai-ops-gateway。採獨立 history 平面：
+Redis 繼續掌管即時執行／核准／撤銷／queue／checkpoint，PG 保存長期紀錄與查詢。
+前端、forecast、統一語意事件與 audit hash chain 不在本次範圍。
+
+### Evidence
+
+- 新增原子 mutation outbox，覆蓋 Store pipeline／WATCH／Lua、automation、Chief 與 receipt。
+- 真 Redis／Postgres 測試涵蓋競爭、重送、commit／ACK 中斷點、poison recovery、fence、tenant、
+  FTS、回填與刪除防復活；既有控制 API 不改用 PG 延遲快照。
+- 完整 suite 668 passed、6 個既有第三方 deprecation warnings、零 skip；新增 190 cases。
+- 專用雙 projector Docker stack 已執行 PG／Redis 真停機、補送、零差異對帳、history 切讀、
+  RBAC／隔離及真 pg_dump／pg_restore 逐表摘要比對。
+- 中文操作、rollback／保留政策／備份缺口與實際驗證均留在 repository，未發布 Bohr Issue 留言。
+
+### Decision / open question
+
+- [ADR-002](adr-002-postgres-history.md)明確定義兩個平面的權威；這不是完整替換 Redis。
+- Source ID、outbox 容量、PG 備份/PITR、Redis AOF 與 compact restore 窗口仍需部署方管理。
+- Purge 只刪 PG 歷史 payload，fence 防復活但不等於所有副本資料抹除；excluded 必須揭露。
+- 後續心得與實驗仍記錄於此；Discussion 啟用後再回填，不把本機文件當成已發布遠端主題。
+
+### Links
+
+- [Postgres 操作指南](../postgres-history.md)
+- [本次完整驗證與限制](../postgres-verification-2026-10-27.md)
+
 ## GitHub Discussions 狀態
 
 截至 2026-10-25，`dc-tw/ai-ops-gateway` 尚未啟用 GitHub Discussions。啟用並建立主題後：

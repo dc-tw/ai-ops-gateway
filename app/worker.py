@@ -483,7 +483,11 @@ async def recover_goals(runtime: RedisRuntime) -> None:
 
 async def main() -> None:
     settings = get_settings()
-    runtime = RedisRuntime(settings.redis_url, settings.redis_stream_maxlen)
+    runtime = RedisRuntime(
+        settings.redis_url,
+        settings.redis_stream_maxlen,
+        durable_source_id=settings.postgres_source_id if settings.postgres_dsn else None,
+    )
     router = ModelRouter(settings)
     scraper = BrowserScraper(settings)
     threat_detector = ThreatDetector.from_settings(settings)

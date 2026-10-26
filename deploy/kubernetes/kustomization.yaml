@@ -14,5 +14,11 @@ configMapGenerator:
       - BROWSER_WORKER_URL=http://browser-worker:8010
       - AGENT_MAX_TOOL_ROUNDS=8
       - AGENT_DEFAULT_DEADLINE_SECONDS=300
+      - POSTGRES_SOURCE_ID=gateway
+      - POSTGRES_HISTORY_MODE=shadow
+      - POSTGRES_PROJECTOR_POLL_SECONDS=1
+      - POSTGRES_OUTBOX_LEASE_MS=5000
+# Managed PostgreSQL is opt-in: apply postgres-projector.yaml separately after
+# configuring POSTGRES_DSN, then explicitly complete backfill/reconcile/cutover.
 generatorOptions:
   disableNameSuffixHash: true

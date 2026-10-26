@@ -1,0 +1,47 @@
+# Disposable authenticated HTTP/Redis/PostgreSQL verification stack.
+services:
+  gateway:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-gateway:local
+    ports: !override
+      - "127.0.0.1:${POSTGRES_TEST_PORT:-18083}:8000"
+    environment:
+      APP_ENV: production
+      API_KEYS_JSON: '{"postgres-admin":{"subject":"pg-admin","tenant_id":"postgres-e2e","role":"admin"},"postgres-viewer":{"subject":"pg-reader","tenant_id":"postgres-e2e","role":"viewer"},"postgres-foreign":{"subject":"pg-foreign","tenant_id":"postgres-foreign","role":"admin"}}'
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+      POSTGRES_HISTORY_MODE: ${POSTGRES_TEST_HISTORY_MODE:-shadow}
+      ATR_BLOCKING: "false"
+
+  worker:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-gateway:local
+    environment:
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+      POSTGRES_HISTORY_MODE: shadow
+
+  scheduler:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-gateway:local
+    environment:
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+      POSTGRES_HISTORY_MODE: shadow
+
+  browser:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-browser:local
+
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: local-postgres-only
+
+  pg-migrate:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-gateway:local
+    environment:
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+
+  postgres-projector:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-postgres-test}-gateway:local
+    environment:
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+      POSTGRES_PROJECTOR_POLL_SECONDS: "0.1"

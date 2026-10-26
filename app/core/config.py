@@ -34,6 +34,11 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     redis_stream_maxlen: int = 10_000
+    postgres_dsn: str = Field(default="", repr=False)
+    postgres_source_id: str = Field(default="gateway", pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    postgres_history_mode: str = Field(default="shadow", pattern=r"^(shadow|postgres)$")
+    postgres_projector_poll_seconds: float = Field(default=1.0, ge=0.1, le=30)
+    postgres_outbox_lease_ms: int = Field(default=5_000, ge=1_000, le=300_000)
     langgraph_checkpointing: bool = True
     checkpoint_ttl_minutes: int = Field(default=10_080, ge=60)
     conversation_max_turns: int = Field(default=40, ge=2, le=200)

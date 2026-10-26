@@ -262,6 +262,15 @@ rollback 與 `SKILL.md` 文字匯出。Skill 是可重用的指令流程，不�
 內建十種繁中工作流程可由管理者選擇安裝；詳見[管理指南](docs/skill-management.md)與
 [內建 Skill 清單](docs/skills-catalog.md)。
 
+## PostgreSQL 歷史儲存
+
+可選啟用 Postgres 長期歷史、分頁與中繼資料搜尋；Redis 仍負責即時執行、核准、額度、queue
+及 checkpoint。提供原子 outbox、可重送 projector、回填／對帳、明確歷史切讀與保留政策，
+不將過期的歷史快照當作執行授權。
+
+操作見 [Postgres 指南](docs/postgres-history.md)、[ADR-002](docs/architecture/adr-002-postgres-history.md)
+及[實際驗證紀錄](docs/postgres-verification-2026-10-27.md)。預設不啟用，既有 Redis-only 部署不變。
+
 ## Durable Goal Mode
 
 定時、webhook、內部事件、Agent persona 與 Chief 派工的設定及操作方式，見

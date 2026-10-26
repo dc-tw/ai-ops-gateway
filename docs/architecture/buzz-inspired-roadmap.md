@@ -49,7 +49,7 @@ Gateway 執行治理、可恢復性與稽核性的設計模式。
 | Client interface | WebSocket、CLI、ACP harness | HTTP API、SSE | ACP 僅列入後續評估 |
 | Agent workflow | Agent runtime + YAML workflow | LangGraph + Durable Goal | 應避免建立第二套 runtime |
 | Tool interface | MCP | MCP、Playwright、remote Browser Worker | 方向相容 |
-| Durable data | Postgres event store | Redis 為主 | 長期查詢、關聯與 migration 邊界未定義 |
+| Durable data | Postgres event store | Redis 執行權威＋可選 Postgres 歷史平面 | 已有 outbox、回填／對帳與歷史切讀；不取代即時 runtime |
 | 即時資料 | Redis pub/sub、presence、typing | Redis Stream、queue、checkpoint、lock | Redis 職責過多且混合長短期資料 |
 | Audit | per-scope SHA-256 hash chain | Redis audit stream | 尚無 tamper evidence 與 chain verification |
 | Identity | 人類與 Agent 都有明確身份 | user principal；server-owned Agent 設定、persona 與 policy snapshot | Agent credential lifecycle、MCP／ATR policy reference 尚未完成 |
@@ -154,6 +154,14 @@ cutover、rollback 六個階段。對每種資料先定義 source of truth，避
 
 驗收證據：migration rehearsal、dual-write divergence metrics、reconciliation report、backup/restore、
 retention/deletion、tenant isolation、FTS permission recheck，以及 Redis unavailable degradation tests。
+
+2026-10-27 子集進度：已實作 Postgres 歷史 record／event／conversation、白名單中繼資料搜尋、
+Redis 原子 outbox、可重送 projector、maintenance backfill／reconcile、明確 history read cutover、
+purge 防復活與安全 compact；已執行真實 PG／Redis 停機與 dump／restore 驗證。
+Redis 仍保存即時狀態與控制權威，不以延遲 PG 快照核准／恢復工作；沒有把所有業務讀取搬到 SQL，
+也未完成 audit hash chain、全域正文／provenance 搜尋。決策與運維邊界見
+[ADR-002](adr-002-postgres-history.md)、[操作指南](../postgres-history.md)及
+[本次驗證](../postgres-verification-2026-10-27.md)。
 
 ## 建議實作順序
 

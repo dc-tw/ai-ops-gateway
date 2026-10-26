@@ -193,7 +193,11 @@ async def tick(
 async def run_scheduler() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
-    runtime = RedisRuntime(settings.redis_url, settings.redis_stream_maxlen)
+    runtime = RedisRuntime(
+        settings.redis_url,
+        settings.redis_stream_maxlen,
+        durable_source_id=settings.postgres_source_id if settings.postgres_dsn else None,
+    )
     model_router, detector = ModelRouter(settings), ThreatDetector.from_settings(settings)
     consumer = f"scheduler-{uuid4()}"
     try:

@@ -19,8 +19,21 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_DB: gateway_test
+          POSTGRES_PASSWORD: ci-postgres-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     env:
       TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      TEST_POSTGRES_URL: postgresql://gateway:ci-postgres-only@127.0.0.1:5432/gateway_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,6 +44,7 @@ jobs:
       - run: ruff check .
       - run: pytest -q
       - run: docker compose config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.postgres.yml config --quiet
       - name: Validate Kubernetes YAML
         run: python -c "from pathlib import Path; import yaml; docs=sum((list(yaml.safe_load_all(p.read_text())) for p in Path('deploy/kubernetes').glob('*.yaml')), []); assert all(isinstance(d, dict) for d in docs)"
 
@@ -42,3 +56,10 @@ jobs:
       - run: sh scripts/test_docker_stack.sh
       - run: sh scripts/test_proactive_stack.sh
       - run: sh scripts/test_atr_tool_stack.sh
+
+  postgres-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/test_postgres_stack.sh

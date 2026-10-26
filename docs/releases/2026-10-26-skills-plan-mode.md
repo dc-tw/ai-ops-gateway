@@ -1,5 +1,8 @@
 # 2026-10-26 封版：Skill 管理與計畫快照
 
+本頁保留本次封版時的狀態。2026-10-27 後續已加入 Postgres 歷史平面，最新交付與限制見
+[Postgres 驗證紀錄](../postgres-verification-2026-10-27.md)；不是將 Redis 即時 runtime 全部替換為 SQL。
+
 ## 範圍與結論
 
 本次以 `9fad6b9`（主動工作與 Chief 派工）為已提交基準，將後續 Skill 管理、核心 plan mode／

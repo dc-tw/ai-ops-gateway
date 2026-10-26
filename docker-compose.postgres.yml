@@ -1,0 +1,96 @@
+# Optional durable-history projection. Redis remains the execution authority.
+# For a disposable local stack only; production should use managed PostgreSQL.
+services:
+  gateway:
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://gateway:local-postgres-only@postgres:5432/gateway}
+      POSTGRES_SOURCE_ID: ${POSTGRES_SOURCE_ID:-gateway}
+      POSTGRES_HISTORY_MODE: ${POSTGRES_HISTORY_MODE:-shadow}
+    depends_on:
+      pg-migrate:
+        condition: service_completed_successfully
+
+  worker:
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://gateway:local-postgres-only@postgres:5432/gateway}
+      POSTGRES_SOURCE_ID: ${POSTGRES_SOURCE_ID:-gateway}
+      POSTGRES_HISTORY_MODE: ${POSTGRES_HISTORY_MODE:-shadow}
+    depends_on:
+      pg-migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://gateway:local-postgres-only@postgres:5432/gateway}
+      POSTGRES_SOURCE_ID: ${POSTGRES_SOURCE_ID:-gateway}
+      POSTGRES_HISTORY_MODE: ${POSTGRES_HISTORY_MODE:-shadow}
+    depends_on:
+      pg-migrate:
+        condition: service_completed_successfully
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_DB: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-postgres-only}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1
+    networks: [backend]
+
+  pg-migrate:
+    image: ai-ops-gateway:local
+    pull_policy: never
+    command: ["python", "-m", "app.postgres_worker", "migrate"]
+    # This CLI process does not run the image's HTTP server health probe.
+    healthcheck: {disable: true}
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://gateway:local-postgres-only@postgres:5432/gateway}
+      POSTGRES_SOURCE_ID: ${POSTGRES_SOURCE_ID:-gateway}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]
+
+  postgres-projector:
+    image: ai-ops-gateway:local
+    pull_policy: never
+    command: ["python", "-m", "app.postgres_worker", "project"]
+    healthcheck: {disable: true}
+    init: true
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://gateway:local-postgres-only@postgres:5432/gateway}
+      POSTGRES_SOURCE_ID: ${POSTGRES_SOURCE_ID:-gateway}
+      POSTGRES_PROJECTOR_POLL_SECONDS: ${POSTGRES_PROJECTOR_POLL_SECONDS:-1}
+      POSTGRES_OUTBOX_LEASE_MS: ${POSTGRES_OUTBOX_LEASE_MS:-5000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      pg-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1
+    networks: [backend]
+
+volumes:
+  postgres-data:

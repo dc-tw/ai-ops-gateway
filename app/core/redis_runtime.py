@@ -13,8 +13,16 @@ from app.core.internal_events import INTERNAL_STREAM, build_internal_event
 class RedisRuntime:
     """Small Redis abstraction for event audit, task queueing, and short-term memory."""
 
-    def __init__(self, url: str, stream_maxlen: int = 10_000) -> None:
-        self._client = Redis.from_url(url, decode_responses=True)
+    def __init__(
+        self, url: str, stream_maxlen: int = 10_000, *, durable_source_id: str | None = None
+    ) -> None:
+        if durable_source_id:
+            from app.core.durable_outbox import DurableRedis
+
+            self._client = DurableRedis.from_url(url, decode_responses=True)
+            self._client.durable_source_id = durable_source_id
+        else:
+            self._client = Redis.from_url(url, decode_responses=True)
         self._stream_maxlen = stream_maxlen
 
     async def ping(self) -> bool:

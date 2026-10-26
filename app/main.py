@@ -2,7 +2,11 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.agents import router as agents_router
 from app.api.routes import router
@@ -13,6 +17,7 @@ from app.core.observability import install_observability
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatDetector
 from app.goals import router as goals_router
+from app.history import router as history_router
 from app.llm.client import ModelRouter
 from app.planning import router as planning_router
 from app.skills import router as skills_router
@@ -55,13 +60,32 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         app.state.active_run_tasks = {}
         app.state.redis = redis_runtime
         if app.state.redis is None:
-            candidate = RedisRuntime(app_settings.redis_url, app_settings.redis_stream_maxlen)
+            candidate = RedisRuntime(
+                app_settings.redis_url,
+                app_settings.redis_stream_maxlen,
+                durable_source_id=(
+                    app_settings.postgres_source_id if app_settings.postgres_dsn else None
+                ),
+            )
             try:
                 await candidate.ping()
                 app.state.redis = candidate
             except Exception:
                 await candidate.close()
                 app.state.redis = None
+        app.state.postgres = None
+        if app_settings.postgres_dsn:
+            from app.core.postgres_store import PostgresStore
+
+            store = PostgresStore(app_settings.postgres_dsn, app_settings.postgres_source_id)
+            try:
+                await store.open()
+            except Exception:
+                await store.close()
+                raise RuntimeError(
+                    "Postgres history startup failed; check schema and service"
+                ) from None
+            app.state.postgres = store
         app.state.checkpointer = None
         if app_settings.langgraph_checkpointing and isinstance(app.state.redis, RedisRuntime):
             from langgraph.checkpoint.redis.aio import AsyncRedisSaver
@@ -83,6 +107,9 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         if app.state.redis:
             with contextlib.suppress(Exception):
                 await app.state.redis.close()
+        if app.state.postgres:
+            with contextlib.suppress(Exception):
+                await app.state.postgres.close()
         close_tool_executor = getattr(app.state.tool_executor, "close", None)
         if close_tool_executor:
             with contextlib.suppress(Exception):
@@ -101,6 +128,36 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(agents_router)
     app.include_router(skills_router)
     app.include_router(planning_router)
+    app.include_router(history_router)
+
+    @app.middleware("http")
+    async def durable_execution_boundary(request: Request, call_next):
+        if (
+            app_settings.postgres_dsn
+            and getattr(app.state, "redis", None) is None
+            and request.url.path.startswith("/v1/")
+            and not request.url.path.startswith("/v1/history")
+        ):
+            # Archive availability is NOT permission to fall back to in-memory
+            # execution or revive an old approval/Skill/Goal from Postgres.
+            return JSONResponse(status_code=503, content={"detail": "Execution requires Redis"})
+        try:
+            return await call_next(request)
+        except (RedisConnectionError, RedisTimeoutError):
+            if not app_settings.postgres_dsn:
+                raise
+            return JSONResponse(status_code=503, content={"detail": "Execution requires Redis"})
+        except ResponseError as exc:
+            if "DURABLE_" not in str(exc):
+                raise
+            if "DURABLE_PAYLOAD" in str(exc):
+                return JSONResponse(
+                    status_code=422, content={"detail": "Content cannot be archived safely"}
+                )
+            return JSONResponse(
+                status_code=503, content={"detail": "Durable writes temporarily unavailable"}
+            )
+
     install_observability(app, app_settings)
     return app
 
