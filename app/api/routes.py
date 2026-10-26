@@ -12,7 +12,9 @@ from langgraph.types import Command
 
 from app.api.schemas import AgentRequest, ApprovalDecision
 from app.core.observability import metrics, observe_agent_event
+from app.core.safety_journal import graph_journal
 from app.core.security import authorize, redact_pii
+from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
 from app.graph.workflow import build_agent_graph, initial_state
 
@@ -43,7 +45,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         location="agent_request",
         fields={"user_input": safe_query},
     )
-    if input_threat_scan.findings:
+    if input_threat_scan.needs_record:
         observe_agent_event(input_threat_scan.to_event(), model=model_name)
         await record_threat_findings(
             request.app.state.redis,
@@ -65,6 +67,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                     "event": input_threat_scan.to_event(),
                 },
             )
+        reject_incomplete_scan(input_threat_scan)
         raise HTTPException(
             status_code=403,
             detail={
@@ -93,6 +96,14 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         autonomous_tool_planning=settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
         threat_detector=request.app.state.threat_detector,
+        safety_journal=graph_journal(
+            request.app.state.redis,
+            settings,
+            principal.tenant_id,
+            request_id,
+            model=model_name,
+            subject=principal.subject,
+        ),
     )
     redis_runtime = request.app.state.redis
     max_retries = (
@@ -156,8 +167,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         "target_url": str(payload.target_url) if payload.target_url else None,
         "max_retries": max_retries,
         "max_tool_rounds": payload.max_tool_rounds or settings.agent_max_tool_rounds,
-        "deadline_seconds": payload.deadline_seconds
-        or settings.agent_default_deadline_seconds,
+        "deadline_seconds": payload.deadline_seconds or settings.agent_default_deadline_seconds,
         "approved_tools": payload.approved_tools,
         "reserved_tokens": reserved_tokens,
     }
@@ -204,7 +214,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                     "history_messages": len(history),
                 }
             )
-            if input_threat_scan.findings:
+            if input_threat_scan.needs_record:
                 await publish(input_threat_scan.to_event())
                 if redis_runtime:
                     await redis_runtime.append_audit(
@@ -233,7 +243,11 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                         )
                         metrics.inc("ai_gateway_ttft_observations_total", model=model_name)
                     await publish(event)
-                    if event.get("type") == "threat_detection" and redis_runtime:
+                    if (
+                        event.get("type") == "threat_detection"
+                        and redis_runtime
+                        and not event.get("safety_event_id")
+                    ):
                         await record_threat_findings(
                             redis_runtime,
                             settings,
@@ -252,9 +266,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                                 "event": event,
                             },
                         )
-                    if event.get("type") == "model_usage" and isinstance(
-                        event.get("usage"), dict
-                    ):
+                    if event.get("type") == "model_usage" and isinstance(event.get("usage"), dict):
                         latest_usage = dict(event["usage"])
                         if redis_runtime:
                             await redis_runtime.save_run_state(
@@ -410,9 +422,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                 assert isinstance(item, tuple)
                 persisted_id, event = item
                 sequence += 1
-                yield _sse(
-                    str(event.get("type", "message")), event, persisted_id or sequence
-                )
+                yield _sse(str(event.get("type", "message")), event, persisted_id or sequence)
         finally:
             consumer_attached.clear()
             if not redis_runtime:
@@ -471,6 +481,14 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
         autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
         threat_detector=request.app.state.threat_detector,
+        safety_journal=graph_journal(
+            runtime,
+            request.app.state.settings,
+            principal.tenant_id,
+            request_id,
+            model=model_name,
+            subject=principal.subject,
+        ),
     )
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
@@ -483,9 +501,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
     async def resume() -> None:
         waiting = False
         latest_usage = dict(run.get("usage", {}))
-        await runtime.save_run_state(
-            request_id, {**run, "status": "running"}, principal.tenant_id
-        )
+        await runtime.save_run_state(request_id, {**run, "status": "running"}, principal.tenant_id)
         await runtime.append_audit(
             principal.tenant_id,
             {
@@ -504,7 +520,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                 ):
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
-                    if event.get("type") == "threat_detection":
+                    if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
                         await record_threat_findings(
                             runtime,
                             request.app.state.settings,
@@ -523,9 +539,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                                 "event": event,
                             },
                         )
-                    if event.get("type") == "model_usage" and isinstance(
-                        event.get("usage"), dict
-                    ):
+                    if event.get("type") == "model_usage" and isinstance(event.get("usage"), dict):
                         latest_usage = dict(event["usage"])
                         await runtime.save_run_state(
                             request_id,
@@ -663,9 +677,7 @@ async def decide_agent_approval(
             "reason": payload.reason,
         }
         await runtime.append_event(request_id, event, principal.tenant_id)
-        await runtime.save_run_state(
-            request_id, {**run, "status": "rejected"}, principal.tenant_id
-        )
+        await runtime.save_run_state(request_id, {**run, "status": "rejected"}, principal.tenant_id)
         await runtime.append_audit(
             principal.tenant_id,
             {
@@ -692,6 +704,14 @@ async def decide_agent_approval(
         autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
         checkpointer=request.app.state.checkpointer,
         threat_detector=request.app.state.threat_detector,
+        safety_journal=graph_journal(
+            runtime,
+            request.app.state.settings,
+            principal.tenant_id,
+            request_id,
+            model=model_name,
+            subject=principal.subject,
+        ),
     )
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
@@ -704,9 +724,7 @@ async def decide_agent_approval(
     async def continue_after_approval() -> None:
         waiting = False
         latest_usage = dict(run.get("usage", {}))
-        await runtime.save_run_state(
-            request_id, {**run, "status": "running"}, principal.tenant_id
-        )
+        await runtime.save_run_state(request_id, {**run, "status": "running"}, principal.tenant_id)
         await runtime.append_audit(
             principal.tenant_id,
             {
@@ -725,7 +743,7 @@ async def decide_agent_approval(
                 ):
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
-                    if event.get("type") == "threat_detection":
+                    if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
                         await record_threat_findings(
                             runtime,
                             request.app.state.settings,
@@ -744,9 +762,7 @@ async def decide_agent_approval(
                                 "event": event,
                             },
                         )
-                    if event.get("type") == "model_usage" and isinstance(
-                        event.get("usage"), dict
-                    ):
+                    if event.get("type") == "model_usage" and isinstance(event.get("usage"), dict):
                         latest_usage = dict(event["usage"])
                         await runtime.save_run_state(
                             request_id,
@@ -864,8 +880,10 @@ async def cancel_agent_run(request_id: str, request: Request) -> dict[str, objec
         raise HTTPException(status_code=409, detail="Run is already terminal")
     event = {"type": "cancelled", "request_id": request_id, "by": principal.subject}
     usage = run.get("usage", {})
-    if isinstance(usage, dict) and usage.get("provider_reported") and hasattr(
-        runtime, "reconcile_daily_tokens"
+    if (
+        isinstance(usage, dict)
+        and usage.get("provider_reported")
+        and hasattr(runtime, "reconcile_daily_tokens")
     ):
         await runtime.reconcile_daily_tokens(
             principal.tenant_id,
@@ -874,9 +892,7 @@ async def cancel_agent_run(request_id: str, request: Request) -> dict[str, objec
             request_id=request_id,
         )
     await runtime.append_event(request_id, event, principal.tenant_id)
-    await runtime.save_run_state(
-        request_id, {**run, "status": "cancelled"}, principal.tenant_id
-    )
+    await runtime.save_run_state(request_id, {**run, "status": "cancelled"}, principal.tenant_id)
     await runtime.append_audit(
         principal.tenant_id,
         {
@@ -947,6 +963,8 @@ async def health(request: Request) -> dict[str, object]:
             "enabled": detector.enabled,
             "blocking": detector.blocking,
             "rules": detector.rule_count,
+            "ruleset_fingerprint": detector.ruleset_fingerprint,
+            "full_scan_required": detector.enabled,
         },
     }
 

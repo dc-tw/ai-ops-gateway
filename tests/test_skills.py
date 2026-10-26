@@ -43,7 +43,9 @@ class Detector:
         self.blocked = blocked
 
     async def ascan(self, *args, **kwargs):
-        return SimpleNamespace(findings=[], blocked=self.blocked)
+        from app.core.threat_detection import ThreatScan
+
+        return ThreatScan(kwargs["event_type"], kwargs["location"], (), self.blocked)
 
 
 @pytest.fixture

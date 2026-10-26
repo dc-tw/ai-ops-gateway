@@ -84,6 +84,9 @@ event envelope、Agent identity、tamper-evident audit 與 per-conversation sing
 
 ## 目錄
 
+完整待辦與分階段交付見[實作追蹤](docs/implementation-roadmap.md)；
+本次安全行為變更見[M1 完整掃描／journal 紀錄](docs/releases/2026-10-27-m1-safety.md)。
+
 Gateway 規劃 session、不可變計畫／設定快照與不自動執行的模式切換，見
 [規劃模式操作指南](docs/plan-mode.md)。時間／token 預測與接受計畫後的執行銜接仍未實作。
 

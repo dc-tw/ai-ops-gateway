@@ -28,6 +28,7 @@ from app.core.planning_store import (
     PlanningStore,
 )
 from app.core.security import authorize, redact_pii
+from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
 
 
@@ -192,7 +193,7 @@ async def _scan_plan(request: Request, tenant: str, session_id: str, plan: dict)
     scan = await request.app.state.threat_detector.ascan(
         text, event_type="llm_input", location="planning_plan", fields={"user_input": text}
     )
-    if scan.findings:
+    if scan.needs_record:
         await record_threat_findings(
             request.app.state.redis,
             settings,
@@ -203,6 +204,7 @@ async def _scan_plan(request: Request, tenant: str, session_id: str, plan: dict)
             emit_internal_events=False,
         )
     if scan.blocked:
+        reject_incomplete_scan(scan)
         raise HTTPException(status_code=403, detail="Plan blocked by ATR policy")
     return safe
 

@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     )
     atr_block_severity: str = Field(default="high", pattern=r"^(low|medium|high|critical)$")
     atr_max_content_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    atr_scan_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60)
+    atr_scan_max_workers: int = Field(default=4, ge=1, le=32)
+    atr_scan_memory_mb: int = Field(default=512, ge=64, le=4096)
     atr_rules_dir: str = ""
     atr_blocking_rule_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
     atr_blocking_excluded_rule_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)

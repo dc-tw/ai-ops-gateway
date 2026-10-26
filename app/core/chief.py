@@ -74,7 +74,7 @@ async def _scan(
         location=location,
         fields={"agent_output" if event_type == "llm_output" else "user_input": value},
     )
-    if scan.findings:
+    if scan.needs_record:
         event = scan.to_event()
         await record_threat_findings(
             runtime,

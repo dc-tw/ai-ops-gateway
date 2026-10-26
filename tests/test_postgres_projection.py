@@ -27,6 +27,8 @@ from app.core.config import Settings
 from app.core.durable_outbox import maintenance_key, outbox_key
 from app.core.postgres_store import PostgresStore
 from app.core.redis_runtime import RedisRuntime
+from app.core.safety_journal import SafetyJournal
+from app.core.threat_detection import ThreatScan
 from app.main import create_app
 
 
@@ -94,6 +96,40 @@ async def set_goal(env, resource="goal-one", **changes):
 
 async def pending(env):
     return (await env.raw.xpending(env.stream, worker.GROUP))["pending"]
+
+
+async def test_safety_journal_projects_public_evidence_but_not_secret_or_private_digest(projection):
+    env = projection
+    scan = ThreatScan(
+        "llm_output",
+        "model_output",
+        (
+            {
+                "finding_id": uuid4().hex,
+                "rule_id": "TEST-SAFETY",
+                "title": "test",
+                "severity": "high",
+                "confidence": "high",
+                "block_candidate": True,
+                "enforcement_action": "blocked",
+            },
+        ),
+        True,
+    )
+    journal = SafetyJournal(
+        env.writer, Settings(_env_file=None), env.tenant, "journal-run", model="test"
+    )
+    event = await journal.commit(scan, {"attempt": 1}, "private-content-fingerprint")
+    await env.writer.append_event("journal-run", event, env.tenant)
+    await worker.drain(env.runtime, env.store)
+    rows = await env.store.events(env.tenant, "run", "journal-run")
+    assert len(rows) == 1 and rows[0]["data"]["safety_event_id"] == event["safety_event_id"]
+    assert await env.store.get_record(env.tenant, "finding", event["findings"][0]["finding_id"])
+    assert len(await env.store.events(env.tenant, "audit")) == 1
+    archived = json.dumps(await env.store.events(env.tenant))
+    assert "private-content-fingerprint" not in archived
+    secret = await env.raw.get(env.key("safety:hmac-secret"))
+    assert secret and secret not in archived
 
 
 async def test_two_real_consumers_compete_without_duplicate_projections(projection):

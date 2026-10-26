@@ -13,6 +13,7 @@ from app.api.schemas import GoalCreateRequest
 from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
 from app.core.security import authorize, redact_pii
+from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
 
 router = APIRouter(prefix="/v1/goals", tags=["goals"])
@@ -83,7 +84,7 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
             for index, step in enumerate(steps)
         ],
     ]
-    threat_scans = [scan for scan in threat_scans if scan.findings]
+    threat_scans = [scan for scan in threat_scans if scan.needs_record]
     model_name = payload.model or request.app.state.model_router.default_model
     for scan in threat_scans:
         observe_agent_event(scan.to_event(), model=model_name)
@@ -107,6 +108,7 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
                 "event": blocked_scan.to_event(),
             },
         )
+        reject_incomplete_scan(blocked_scan)
         raise HTTPException(
             status_code=403,
             detail={

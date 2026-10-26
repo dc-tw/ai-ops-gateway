@@ -10,10 +10,12 @@ from uuid import uuid4
 
 from langgraph.types import Command
 
+from app.core.checkpoint_bootstrap import open_checkpointer
 from app.core.config import get_settings
 from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
+from app.core.safety_journal import graph_journal
 from app.core.skill_store import guard_goal_skills
 from app.core.threat_detection import ThreatBlockedError, ThreatDetector
 from app.core.threat_feedback import record_threat_findings
@@ -189,7 +191,7 @@ async def execute_goal(
                     location=location,
                     fields={"user_input": value},
                 )
-                if scan.findings:
+                if scan.needs_record:
                     await record_scan_event(scan.to_event())
                     await save(scan.to_event())
                 if scan.blocked:
@@ -232,7 +234,7 @@ async def execute_goal(
                         location=f"goal_planner_step:{index}",
                         fields={"agent_output": step["query"]},
                     )
-                    if scan.findings:
+                    if scan.needs_record:
                         await record_scan_event(scan.to_event())
                         await runtime.append_goal_event(goal_id, scan.to_event(), tenant_id)
                     if scan.blocked:
@@ -265,6 +267,17 @@ async def execute_goal(
                 checkpointer=checkpointer,
                 tool_executor=executor,
                 threat_detector=threat_detector,
+                safety_journal=graph_journal(
+                    runtime,
+                    settings,
+                    tenant_id,
+                    goal_id,
+                    model=goal["model"],
+                    kind="goal",
+                    step_index=index,
+                    subject=goal.get("agent_id") or "agent",
+                    source_automation_id=goal.get("automation_id"),
+                ),
                 autonomous_tool_planning=(
                     settings.autonomous_tool_planning
                     and goal.get("agent_config", {}).get("role") != "chief"
@@ -301,7 +314,7 @@ async def execute_goal(
                     stream_mode="custom",
                 ):
                     observe_agent_event(event, model=goal["model"])
-                    if event.get("type") == "threat_detection":
+                    if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
                         await record_scan_event(event)
                     await runtime.append_goal_event(
                         goal_id,
@@ -508,13 +521,7 @@ async def main() -> None:
     consumer = f"{socket.gethostname()}-{uuid4().hex[:8]}"
     checkpointer = None
     if settings.langgraph_checkpointing:
-        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-
-        checkpointer = AsyncRedisSaver(
-            redis_url=settings.redis_url,
-            ttl={"default_ttl": settings.checkpoint_ttl_minutes, "refresh_on_read": True},
-        )
-        await checkpointer.__aenter__()
+        checkpointer = await open_checkpointer(runtime, settings)
     await recover_goals(runtime)
     try:
         while True:

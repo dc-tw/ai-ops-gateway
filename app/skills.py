@@ -21,6 +21,7 @@ from app.core.skill_store import (
     SkillStore,
     content_fields,
 )
+from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
 
 
@@ -98,7 +99,7 @@ async def _check_content(request: Request, tenant: str, body: dict[str, Any]) ->
     scan = await request.app.state.threat_detector.ascan(
         text, event_type="llm_input", location="skill_definition", fields={"user_input": text}
     )
-    if scan.findings:
+    if scan.needs_record:
         await record_threat_findings(
             request.app.state.redis,
             settings,
@@ -108,6 +109,7 @@ async def _check_content(request: Request, tenant: str, body: dict[str, Any]) ->
             model="skill-definition",
         )
     if scan.blocked:
+        reject_incomplete_scan(scan)
         raise HTTPException(status_code=403, detail="Skill blocked by ATR policy")
 
 

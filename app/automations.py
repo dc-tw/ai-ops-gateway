@@ -24,6 +24,7 @@ from app.core.automation_scheduling import next_run, utc_datetime
 from app.core.internal_events import INTERNAL_STREAM, build_internal_event
 from app.core.observability import observe_agent_event
 from app.core.security import TENANT_PATTERN, authorize, redact_pii
+from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
 from app.tools.registry import TOOL_SPECS
 
@@ -197,7 +198,7 @@ async def validate_goal_input(
         scan = await detector.ascan(
             value, event_type="llm_input", location=location, fields={"user_input": value}
         )
-        if scan.findings:
+        if scan.needs_record:
             observe_agent_event(scan.to_event(), model=goal["model"])
             # Suppress recursion: this finding was produced by an automation.
             await record_threat_findings(
@@ -220,6 +221,7 @@ async def validate_goal_input(
                     "findings": list(scan.findings),
                 },
             )
+            reject_incomplete_scan(scan)
             raise HTTPException(
                 status_code=403,
                 detail={

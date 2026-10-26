@@ -1,7 +1,7 @@
 """Bounded fault matrix, not a claim that every distributed failure is covered.
 
 Two actual HTTP server processes share real Redis/checkpoints. Only test-local
-subclasses add deterministic fault gates; production scanning is unchanged.
+subclasses add deterministic fault gates; production safety code is exercised unmodified.
 """
 
 import asyncio
@@ -56,8 +56,6 @@ class FaultRuntime(RedisRuntime):
         if event.get("type") == "accepted":
             await self._client.set(f"{self.prefix}:run", request_id, ex=120)
         blocked = event.get("type") == "threat_detection" and event.get("status") == "blocked"
-        if blocked and self.phase == "before_event_write":
-            await _gate(self, self.prefix, self.phase)
         event_id = await super().append_event(request_id, event, tenant_id)
         if blocked and self.phase == "after_event_write":
             await _gate(self, self.prefix, self.phase)
@@ -72,7 +70,10 @@ class FaultDetector(ThreatDetector):
     async def ascan(self, content, **kwargs):
         if kwargs["location"] == "model_output" and self.phase == "during_scan":
             await _gate(self.runtime, self.prefix, self.phase)
-        return await super().ascan(content, **kwargs)
+        scan = await super().ascan(content, **kwargs)
+        if kwargs["location"] == "model_output" and self.phase == "before_event_write":
+            await _gate(self.runtime, self.prefix, self.phase)
+        return scan
 
 
 def _serve(listener, redis_url, tenant, prefix, phase):
@@ -103,7 +104,7 @@ def _serve(listener, redis_url, tenant, prefix, phase):
             yield
 
     app.router.lifespan_context = lifespan
-    server = uvicorn.Server(uvicorn.Config(app, log_level="critical"))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
     server.run(sockets=[listener])
 
 
@@ -197,13 +198,10 @@ async def test_two_replicas_sigkill_during_output_release_never_persist_or_repla
             # before the first process died but not delivered to its live client.
             replay = await client.get(f"http://127.0.0.1:{ports[1]}/v1/agent/runs/{run_id}/events")
             assert replay.status_code == 200
-            if phase != "before_event_write":
-                assert "event: threat_detection" in replay.text
-                assert '"status":"blocked"' in replay.text
-            # A graph checkpoint and the public SSE event append are not one
-            # atomic transaction. A kill before XADD may lose the diagnostic
-            # event even though the blocked candidate remains empty on resume.
-            # Verify safety here; do not claim exactly-once finding delivery.
+            # Before journal commit the node must be rerun; after commit the
+            # public event already exists, independent of stream consumption.
+            assert "event: threat_detection" in replay.text
+            assert '"status":"blocked"' in replay.text
             completed = [
                 json.loads(line[6:])
                 for line in replay.text.splitlines()
@@ -242,9 +240,7 @@ async def test_two_replicas_sigkill_during_output_release_never_persist_or_repla
         await runtime.close()
 
 
-def test_middle_only_injection_demonstrates_truncation_blind_spot():
-    # This is deliberately an observed limitation, not a successful safety gate:
-    # truncation drops the attack in the middle. Production recall is not claimed.
+def test_middle_only_injection_is_rejected_instead_of_truncated():
     detector = ThreatDetector(blocking=True, max_content_chars=1000)
     visible = detector.scan(ATTACK, event_type="tool_result", location="limit-probe")
     assert visible.findings and visible.blocked
@@ -253,5 +249,6 @@ def test_middle_only_injection_demonstrates_truncation_blind_spot():
         event_type="tool_result",
         location="limit-probe",
     )
-    assert obscured.truncated is True
-    assert obscured.findings == () and obscured.blocked is False
+    assert obscured.truncated is False
+    assert obscured.findings == () and obscured.blocked is True
+    assert obscured.complete is False and obscured.reason == "content_limit"

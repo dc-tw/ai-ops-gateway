@@ -35,6 +35,12 @@ class RedisRuntime:
     async def append_event(
         self, request_id: str, event: dict[str, Any], tenant_id: str = "default"
     ) -> str:
+        if event.get("safety_event_id"):
+            from app.core.safety_journal import journal_event_id
+
+            return await journal_event_id(
+                self, tenant_id, event, event, kind="run", resource_id=request_id
+            )
         return str(
             await self._client.xadd(
                 self._tenant_key(tenant_id, f"agent:events:{request_id}"),
@@ -533,6 +539,13 @@ class RedisRuntime:
     async def append_goal_event(
         self, goal_id: str, event: dict[str, Any], tenant_id: str = "default"
     ) -> str:
+        inner = event.get("event") if event.get("type") == "agent_event" else event
+        if isinstance(inner, dict) and inner.get("safety_event_id"):
+            from app.core.safety_journal import journal_event_id
+
+            return await journal_event_id(
+                self, tenant_id, inner, event, kind="goal", resource_id=goal_id
+            )
         return str(
             await self._client.xadd(
                 self._tenant_key(tenant_id, f"agent:goal:events:{goal_id}"),

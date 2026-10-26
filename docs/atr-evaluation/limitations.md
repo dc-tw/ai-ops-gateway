@@ -1,5 +1,9 @@
 # 限制
 
+> 2026-10-27 更新：下列 head/tail 截斷、已知 regex condition warning 及 checkpoint／公開
+> SSE 缺口描述為先前版本觀察；本次修補與驗收狀態見
+> [M1 紀錄](../releases/2026-10-27-m1-safety.md)。歷史結果不改寫，不能直接當成本版效能證據。
+
 - ATR Layer-1 是 pattern-based detection；命中不是已證實攻擊，未命中也不是安全證明。
 - Fake engine 測試驗證 Gateway control flow，不衡量實際 ATR rule corpus 的 precision 或 recall。
 - 在本地以 `pyatr 0.3.1` 載入 bundled rules 時，engine 對 `ATR-2026-00290` 的一個 regex

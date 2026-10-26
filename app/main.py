@@ -12,6 +12,7 @@ from app.agents import router as agents_router
 from app.api.routes import router
 from app.api.security_routes import router as security_router
 from app.automations import router as automations_router
+from app.core.checkpoint_bootstrap import open_checkpointer
 from app.core.config import Settings, get_settings
 from app.core.observability import install_observability
 from app.core.redis_runtime import RedisRuntime
@@ -88,13 +89,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
             app.state.postgres = store
         app.state.checkpointer = None
         if app_settings.langgraph_checkpointing and isinstance(app.state.redis, RedisRuntime):
-            from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-
-            checkpointer = AsyncRedisSaver(
-                redis_url=app_settings.redis_url,
-                ttl={"default_ttl": app_settings.checkpoint_ttl_minutes, "refresh_on_read": True},
-            )
-            await checkpointer.__aenter__()
+            checkpointer = await open_checkpointer(app.state.redis, app_settings)
             app.state.checkpointer = checkpointer
         yield
         for task in list(app.state.active_runs):
