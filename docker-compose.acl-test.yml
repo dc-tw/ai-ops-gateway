@@ -1,0 +1,6 @@
+# Only for the disposable authenticated ACL stack, layered after postgres-test.
+services:
+  gateway:
+    environment:
+      RESOURCE_ACL_ENABLED: "true"
+      API_KEYS_JSON: '{"acl-admin":{"subject":"acl-admin","tenant_id":"acl-e2e","role":"admin"},"acl-bob":{"subject":"acl-bob","tenant_id":"acl-e2e","role":"operator"},"acl-carol":{"subject":"acl-carol","tenant_id":"acl-e2e","role":"operator"},"acl-foreign":{"subject":"acl-bob","tenant_id":"acl-foreign","role":"operator"}}'

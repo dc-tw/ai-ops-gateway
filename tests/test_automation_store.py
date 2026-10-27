@@ -85,6 +85,64 @@ def goal(index=0):
     }
 
 
+async def test_dispatch_ownership_uses_current_acl_not_payload_and_has_no_implicit_shares(storage):
+    from app.core.resource_access import AccessStore, AccessUpdate, acl_key
+    from app.core.security import Principal
+
+    store, tenant = storage
+    saved = await store.create(job(tenant))
+    access = AccessStore(store.runtime)
+    # Simulate a legacy job that an admin explicitly adopts under a known owner.
+    await store._client.delete(acl_key(tenant, "automation", saved["automation_id"]))
+    await access.update(
+        Principal("admin", tenant, "admin", "api_key"),
+        "automation",
+        "job-1",
+        AccessUpdate(
+            expected_version=0,
+            legacy_owner={"subject": "verified-owner"},
+            grants=[{"subject": "reader", "permission": "read"}],
+        ),
+    )
+    candidate = goal(99) | {"created_by": "attacker"}
+    result = await store.submit(
+        tenant,
+        "job-1",
+        "ownership-event",
+        candidate,
+        {"trigger_type": "webhook", "created_by": "attacker"},
+        NOW,
+    )
+    assert result["status"] == "queued"
+    for kind in ("goal", "conversation"):
+        assert await access.can(
+            Principal("verified-owner", tenant, "operator", "api_key"), kind, "goal-99"
+        )
+        assert not await access.can(
+            Principal("attacker", tenant, "operator", "api_key"), kind, "goal-99"
+        )
+        assert not await access.can(
+            Principal("reader", tenant, "viewer", "api_key"), kind, "goal-99"
+        )
+
+
+async def test_bad_access_index_cannot_leave_half_created_or_queued_goal(storage):
+    from app.core.resource_access import actor_index
+
+    store, tenant = storage
+    await store.create(job(tenant))
+    index = actor_index(tenant, {"actor_type": "human", "subject": "test-operator"})
+    await store._client.delete(index)
+    await store._client.set(index, "WRONGTYPE")
+    from redis.exceptions import ResponseError
+
+    with pytest.raises(ResponseError, match="Access index unavailable"):
+        await store.submit(tenant, "job-1", "bad-index", goal(98), {}, NOW)
+    assert await store.runtime.get_goal("goal-98", tenant) is None
+    assert not await queue_for(store, tenant)
+    assert await store._client.get(store._key(tenant, "job-1", ":active")) is None
+
+
 async def queue_for(store, tenant):
     rows = await store._client.xrange("agent:goal:queue")
     return [fields for _, fields in rows if fields.get("tenant_id") == tenant]

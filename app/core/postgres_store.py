@@ -515,18 +515,33 @@ class PostgresStore:
             ).fetchone()
         return self._record_view(row) if row else None
 
-    async def list_records(self, tenant: str, kind: str = "", after: str = "", limit: int = 50):
-        return await self._records(tenant, kind, after, limit)
+    async def list_records(
+        self,
+        tenant: str,
+        kind: str = "",
+        after: str = "",
+        limit: int = 50,
+        authorized_resources=None,
+    ):
+        return await self._records(
+            tenant, kind, after, limit, authorized_resources=authorized_resources
+        )
 
     async def search(
-        self, tenant: str, query: str, kind: str = "", after: str = "", limit: int = 50
+        self,
+        tenant: str,
+        query: str,
+        kind: str = "",
+        after: str = "",
+        limit: int = 50,
+        authorized_resources=None,
     ):
         if not isinstance(query, str) or not query.strip() or len(query) > 512:
             raise ValueError("Invalid archive search query")
         _canonical(query)
-        return await self._records(tenant, kind, after, limit, query)
+        return await self._records(tenant, kind, after, limit, query, authorized_resources)
 
-    async def _records(self, tenant, kind, after, limit, query=None):
+    async def _records(self, tenant, kind, after, limit, query=None, authorized_resources=None):
         self._tenant(tenant)
         self._limit(limit)
         if kind and kind not in RECORD_KINDS:
@@ -537,6 +552,13 @@ class PostgresStore:
             "AND (kind,resource_id)>(%s,%s)"
         )
         params = [self.source_id, tenant, last_kind, last_id]
+        if authorized_resources is not None:
+            sql += """ AND ((CASE kind WHEN 'skill_revision' THEN 'skill'
+                WHEN 'planning_revision' THEN 'planning_session' WHEN 'tool_receipt' THEN 'goal'
+                ELSE kind END) || ':' || (CASE WHEN kind IN
+                ('skill_revision','planning_revision','tool_receipt')
+                THEN split_part(resource_id,':',1) ELSE resource_id END)) = ANY(%s::text[])"""
+            params.append(authorized_resources)
         if kind:
             sql += " AND kind=%s"
             params.append(kind)
@@ -553,7 +575,13 @@ class PostgresStore:
         return [self._record_view(row) for row in rows]
 
     async def events(
-        self, tenant: str, kind: str = "", resource_id: str = "", after: int = 0, limit: int = 100
+        self,
+        tenant: str,
+        kind: str = "",
+        resource_id: str = "",
+        after: int = 0,
+        limit: int = 100,
+        authorized_resources=None,
     ):
         self._tenant(tenant)
         self._limit(limit)
@@ -563,6 +591,12 @@ class PostgresStore:
             raise ValueError("Unsupported archive event kind")
         sql = "SELECT * FROM gateway_events WHERE source_id=%s AND tenant_id=%s AND cursor>%s"
         params = [self.source_id, tenant, after]
+        if authorized_resources is not None:
+            sql += (
+                " AND ((CASE kind WHEN 'planning' THEN 'planning_session' ELSE kind END) "
+                "|| ':' || resource_id) = ANY(%s::text[])"
+            )
+            params.append(authorized_resources)
         if kind:
             sql += " AND kind=%s"
             params.append(kind)

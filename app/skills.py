@@ -13,6 +13,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from app.core.builtin_skills import BUILTIN_SKILLS, get_builtin
+from app.core.resource_access import filter_resources
 from app.core.security import authorize
 from app.core.skill_store import (
     SkillConflict,
@@ -165,9 +166,10 @@ async def create_skill(payload: SkillCreate, request: Request) -> dict[str, Any]
 @router.get("")
 async def list_skills(request: Request) -> dict[str, Any]:
     principal = await authorize(request, "viewer")
-    return {
-        "skills": [_summary(value) for value in await _store(request).list(principal.tenant_id)]
-    }
+    values = await filter_resources(
+        request, principal, "skill", await _store(request).list(principal.tenant_id), "skill_id"
+    )
+    return {"skills": [_summary(value) for value in values]}
 
 
 @router.get("/{skill_id}")

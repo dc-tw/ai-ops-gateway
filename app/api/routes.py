@@ -34,6 +34,8 @@ def _sse(event: str, data: dict[str, Any], event_id: str | int | None = None) ->
 
 @router.post("/v1/agent/stream")
 async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResponse:
+    from app.core.resource_access import claim_conversation, stream_access
+
     principal = await authorize(request, "operator")
     settings = request.app.state.settings
     safe_query = redact_pii(payload.query) if settings.pii_redaction else payload.query
@@ -110,6 +112,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         payload.max_retries if payload.max_retries is not None else settings.agent_max_retries
     )
     history: list[dict[str, str]] = []
+    await claim_conversation(request, principal, conversation_id)
     reserved_tokens = max(1, len(safe_query) // 3) + settings.llm_max_output_tokens
     if redis_runtime and hasattr(redis_runtime, "get_conversation"):
         if hasattr(redis_runtime, "get_conversation_context"):
@@ -161,6 +164,8 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
     consumer_attached = asyncio.Event()
     consumer_attached.set()
     run_metadata = {
+        "created_by": principal.subject,
+        "created_by_type": principal.actor_type,
         "conversation_id": conversation_id,
         "model": model_name,
         "query": safe_query,
@@ -415,12 +420,16 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                         queue.get(), timeout=settings.sse_heartbeat_seconds
                     )
                 except TimeoutError:
+                    if not await stream_access(request, principal, "run", request_id):
+                        break
                     yield ": heartbeat\n\n"
                     continue
                 if item is _DONE:
                     break
                 assert isinstance(item, tuple)
                 persisted_id, event = item
+                if not await stream_access(request, principal, "run", request_id):
+                    break
                 sequence += 1
                 yield _sse(str(event.get("type", "message")), event, persisted_id or sequence)
         finally:
@@ -919,12 +928,16 @@ async def replay_agent_events(request_id: str, request: Request) -> StreamingRes
     last_id = request.headers.get("last-event-id", "0-0")
 
     async def replay_stream() -> AsyncIterator[str]:
+        from app.core.resource_access import stream_access
+
         nonlocal last_id
         while not await request.is_disconnected():
             events = await runtime.read_agent_events(
                 request_id, last_id, block_ms=10_000, tenant_id=principal.tenant_id
             )
             if not events:
+                if not await stream_access(request, principal, "run", request_id):
+                    return
                 state = await runtime.get_run_state(request_id, principal.tenant_id)
                 yield ": heartbeat\n\n"
                 if state and state.get("status") in {
@@ -937,6 +950,8 @@ async def replay_agent_events(request_id: str, request: Request) -> StreamingRes
                     break
                 continue
             for event_id, event in events:
+                if not await stream_access(request, principal, "run", request_id):
+                    return
                 last_id = event_id
                 yield _sse(str(event.get("type", "message")), event, event_id)
 

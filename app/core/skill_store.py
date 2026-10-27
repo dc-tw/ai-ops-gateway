@@ -267,6 +267,10 @@ class SkillStore:
         enabled: bool = True,
         builtin_version: int | None = None,
     ) -> dict[str, Any]:
+        # Runtime snapshot validation is imported by ATR spawn workers too.
+        # Load HTTP-backed ACL management only on the creation path.
+        from app.core.resource_access import guard_owner, queue_owner
+
         body = SkillContent.model_validate(content).model_dump()
         name = body["name"]
         skill_id = (
@@ -311,8 +315,10 @@ class SkillStore:
                     await pipe.watch(revision_key)
                     if await pipe.exists(revision_key):
                         raise SkillConflict("Skill revision already exists")
+                    await guard_owner(pipe, tenant, "skill", skill_id, subject)
                     pipe.multi()
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
+                    queue_owner(pipe, tenant, "skill", skill_id, subject)
                     pipe.set(name_key, skill_id)
                     pipe.set(
                         revision_key,

@@ -144,6 +144,61 @@ async def test_apply_exact_retries_are_deduplicated_under_competition(store):
     assert (await store.status("acme"))["applied_operations"] == 1
 
 
+async def test_resource_acl_is_applied_before_pagination_and_search_limit(store):
+    for index, resource in enumerate(("a-hidden", "b-visible", "c-hidden", "d-visible"), 1):
+        await store.apply(f"{index}-0", record(resource=resource, name="searchable proof"))
+    allowed = ["goal:b-visible", "goal:d-visible"]
+    first = await store.list_records("acme", limit=1, authorized_resources=allowed)
+    assert [row["resource_id"] for row in first] == ["b-visible"]
+    second = await store.list_records(
+        "acme", after=first[0]["cursor"], limit=1, authorized_resources=allowed
+    )
+    assert [row["resource_id"] for row in second] == ["d-visible"]
+    rows = await store.search("acme", "proof", limit=1, authorized_resources=allowed)
+    assert [row["resource_id"] for row in rows] == ["b-visible"]
+    assert await store.list_records("acme", authorized_resources=[]) == []
+    assert await store.search("acme", "proof", authorized_resources=[]) == []
+
+
+@pytest.mark.parametrize(
+    ("suffix", "kind", "resource", "root"),
+    [
+        ("skills:revision:one:2", "skill_revision", "one:2", "skill:one"),
+        ("planning:revision:one:2", "planning_revision", "one:2", "planning_session:one"),
+        ("goal:one:tool-receipt:action", "tool_receipt", "one:action", "goal:one"),
+        (
+            "conversation:prod:incident:messages",
+            "conversation",
+            "prod:incident",
+            "conversation:prod:incident",
+        ),
+    ],
+)
+async def test_history_acl_aliases_reuse_root_authority(store, suffix, kind, resource, root):
+    body = record()
+    body["key"] = "tenant:acme:" + suffix
+    if kind == "conversation":
+        body.update(
+            command="RPUSH",
+            value=[json.dumps({"role": "user", "content": "test", "request_id": "run-one"})],
+        )
+    await store.apply("1-0", body)
+    assert [
+        row["resource_id"] for row in await store.list_records("acme", authorized_resources=[root])
+    ] == [resource]
+    assert await store.list_records("acme", authorized_resources=["goal:foreign"]) == []
+
+
+async def test_event_acl_filters_before_limit_and_excludes_global_audit(store):
+    for index, suffix in enumerate(("audit", "planning:events:one", "agent:goal:events:two"), 1):
+        body = event()
+        body["key"] = "tenant:acme:" + suffix
+        await store.apply(f"{index}-0", body)
+    rows = await store.events("acme", limit=1, authorized_resources=["planning_session:one"])
+    assert len(rows) == 1 and rows[0]["kind"] == "planning"
+    assert await store.events("acme", authorized_resources=[]) == []
+
+
 async def test_source_order_is_numeric_and_stale_records_cannot_replace_newer_state(store):
     await store.apply("10-0", record(status="completed"))
     await store.apply("9-100", record(status="running"))

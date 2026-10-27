@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 from app.core.internal_events import INTERNAL_STREAM, build_internal_event
 
@@ -73,11 +74,37 @@ class RedisRuntime:
     async def save_run_state(
         self, request_id: str, state: dict[str, Any], tenant_id: str = "default"
     ) -> None:
-        await self._client.set(
-            self._tenant_key(tenant_id, f"agent:run:{request_id}"),
-            json.dumps(state, ensure_ascii=False),
-            ex=86_400,
-        )
+        from app.core.resource_access import guard_owner, queue_owner
+
+        while True:
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await guard_owner(
+                        pipe,
+                        tenant_id,
+                        "run",
+                        request_id,
+                        state.get("created_by"),
+                        state.get("created_by_type", "human"),
+                    )
+                    pipe.multi()
+                    pipe.set(
+                        self._tenant_key(tenant_id, f"agent:run:{request_id}"),
+                        json.dumps(state, ensure_ascii=False),
+                        ex=86_400,
+                    )
+                    queue_owner(
+                        pipe,
+                        tenant_id,
+                        "run",
+                        request_id,
+                        state.get("created_by"),
+                        state.get("created_by_type", "human"),
+                    )
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    continue
 
     async def get_run_state(
         self, request_id: str, tenant_id: str = "default"
@@ -438,13 +465,31 @@ class RedisRuntime:
             await self._client.zremrangebyrank(memory_key, 0, memory_count - 501)
 
     async def delete_conversation(self, conversation_id: str, tenant_id: str = "default") -> bool:
-        return bool(
-            await self._client.delete(
-                self._tenant_key(tenant_id, f"conversation:{conversation_id}:messages"),
-                self._tenant_key(tenant_id, f"conversation:{conversation_id}:summary"),
-                self._tenant_key(tenant_id, f"conversation:{conversation_id}:memory"),
-            )
-        )
+        from app.core.resource_access import AccessStore, acl_key
+
+        key = acl_key(tenant_id, "conversation", conversation_id)
+        while True:
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    access = (
+                        AccessStore.decode(raw, "conversation", conversation_id) if raw else None
+                    )
+                    pipe.multi()
+                    pipe.delete(
+                        *(
+                            self._tenant_key(tenant_id, f"conversation:{conversation_id}:{suffix}")
+                            for suffix in ("messages", "summary", "memory")
+                        )
+                    )
+                    if access:
+                        access.update(revoked=True, version=access["version"] + 1)
+                        pipe.set(key, json.dumps(access))
+                    result = await pipe.execute()
+                    return bool(result[0])
+                except WatchError:
+                    continue
 
     async def save_goal(
         self, goal_id: str, goal: dict[str, Any], tenant_id: str = "default"

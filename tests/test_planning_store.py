@@ -91,6 +91,25 @@ async def create(env):
     return await env.store.create(env.tenant, "worker-one", "operator", env.builder)
 
 
+async def test_new_session_registers_owner_in_creation_transaction(storage):
+    from app.core.resource_access import AccessStore
+    from app.core.security import Principal
+
+    session = await create(storage)
+    access = AccessStore(storage.runtime)
+    assert await access.can(
+        Principal("operator", storage.tenant, "operator", "api_key"),
+        "planning_session",
+        session["session_id"],
+        "operate",
+    )
+    assert not await access.can(
+        Principal("other", storage.tenant, "operator", "api_key"),
+        "planning_session",
+        session["session_id"],
+    )
+
+
 async def save(env, session, *, content=None, complete=True):
     return await env.store.save_plan(
         env.tenant,

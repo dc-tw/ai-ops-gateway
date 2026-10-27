@@ -11,6 +11,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
 from app.core.durable_types import EventKind, RecordKind
+from app.core.resource_access import filter_history, history_permissions, require_access
 from app.core.security import authorize
 
 HistoryKind = Literal[
@@ -147,8 +148,15 @@ async def list_history_records(
     _query(request, {"kind", "after", "limit"})
     store = await _read_store(request)
     rows = await _call(
-        store, "list_records", principal.tenant_id, kind=kind or "", after=after, limit=limit
+        store,
+        "list_records",
+        principal.tenant_id,
+        kind=kind or "",
+        after=after,
+        limit=limit,
+        **(await history_permissions(request, principal)),
     )
+    rows = await filter_history(request, principal, rows)
     return _page("records", rows, limit)
 
 
@@ -165,9 +173,11 @@ async def get_history_record(
     except UnicodeEncodeError:
         raise HTTPException(status_code=422, detail="Invalid history request") from None
     store = await _read_store(request)
+    await require_access(request, principal, kind, resource_id)
     record = await _call(store, "get_record", principal.tenant_id, kind, resource_id)
     if record is None:
         raise HTTPException(status_code=404, detail="History record not found")
+    await require_access(request, principal, kind, resource_id)
     return _response({"record": record, "source_cursor": record.get("source_cursor")})
 
 
@@ -190,7 +200,9 @@ async def history_events(
         resource_id=resource_id,
         after=after,
         limit=limit,
+        **(await history_permissions(request, principal)),
     )
+    rows = await filter_history(request, principal, rows)
     return _page("events", rows, limit)
 
 
@@ -208,8 +220,16 @@ async def search_history(
         raise HTTPException(status_code=422, detail="Invalid history request")
     store = await _read_store(request)
     rows = await _call(
-        store, "search", principal.tenant_id, q, kind=kind or "", after=after, limit=limit
+        store,
+        "search",
+        principal.tenant_id,
+        q,
+        kind=kind or "",
+        after=after,
+        limit=limit,
+        **(await history_permissions(request, principal)),
     )
+    rows = await filter_history(request, principal, rows)
     return _page("results", rows, limit)
 
 

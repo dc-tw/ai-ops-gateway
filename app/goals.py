@@ -12,6 +12,7 @@ from app.api.routes import _sse
 from app.api.schemas import GoalCreateRequest
 from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
+from app.core.resource_access import filter_resources, stream_access
 from app.core.security import authorize, redact_pii
 from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
@@ -205,7 +206,7 @@ async def list_goals(request: Request) -> dict[str, Any]:
         if goal:
             goals.append(goal)
     goals.sort(key=lambda item: item.get("created_at", ""), reverse=True)
-    return {"goals": goals}
+    return {"goals": await filter_resources(request, principal, "goal", goals, "goal_id")}
 
 
 @router.get("/{goal_id}")
@@ -345,12 +346,16 @@ async def stream_goal_events(goal_id: str, request: Request) -> StreamingRespons
                 goal_id, last_id, block_ms=10_000, tenant_id=principal.tenant_id
             )
             if not events:
+                if not await stream_access(request, principal, "goal", goal_id):
+                    return
                 goal = await runtime.get_goal(goal_id, principal.tenant_id)
                 yield ": heartbeat\n\n"
                 if goal and goal.get("status") in TERMINAL_STATUSES:
                     break
                 continue
             for event_id, event in events:
+                if not await stream_access(request, principal, "goal", goal_id):
+                    return
                 last_id = event_id
                 yield _sse(str(event.get("type", "message")), event, event_id)
             await asyncio.sleep(0)

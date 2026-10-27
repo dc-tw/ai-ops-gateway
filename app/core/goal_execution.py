@@ -84,8 +84,39 @@ class GoalExecutionStore:
                         await guard_goal_skills(
                             self.runtime, admission_goal, client=pipe, watch=True
                         )
+                    if current is None:
+                        from app.core.resource_access import guard_owner
+
+                        for kind in ("goal", "conversation"):
+                            await guard_owner(
+                                pipe,
+                                tenant,
+                                kind,
+                                goal_id,
+                                mutation.goal.get("created_by"),
+                                mutation.goal.get("created_by_type", "human"),
+                            )
                     pipe.multi()
                     pipe.set(key, json.dumps(mutation.goal, ensure_ascii=False))
+                    if current is None:
+                        from app.core.resource_access import queue_owner
+
+                        queue_owner(
+                            pipe,
+                            tenant,
+                            "goal",
+                            goal_id,
+                            mutation.goal.get("created_by"),
+                            mutation.goal.get("created_by_type", "human"),
+                        )
+                        queue_owner(
+                            pipe,
+                            tenant,
+                            "conversation",
+                            goal_id,
+                            mutation.goal.get("created_by"),
+                            mutation.goal.get("created_by_type", "human"),
+                        )
                     pipe.sadd(f"tenant:{tenant}:agent:goals", goal_id)
                     pipe.sadd("agent:goal:tenants", tenant)
                     for event in mutation.events:

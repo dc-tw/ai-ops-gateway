@@ -143,6 +143,19 @@ class DelegationStore:
                         raise ValueError("Stored Chief identity does not match its tenant key")
                     if current.get("delegation_planned"):
                         return False
+                    from app.core.resource_access import AccessStore, acl_key
+
+                    parent_access_key = acl_key(tenant, "goal", parent_id)
+                    await pipe.watch(parent_access_key)
+                    parent_access_raw = await pipe.get(parent_access_key)
+                    # A legacy Goal without an ACL stays admin-only, including
+                    # descendants. Explicit adoption overrides untrusted metadata.
+                    access_owner = None
+                    if parent_access_raw:
+                        parent_access = AccessStore.decode(parent_access_raw, "goal", parent_id)
+                        if parent_access["revoked"]:
+                            raise ValueError("Parent access is revoked")
+                        access_owner = parent_access["owner"]
                     if (
                         current.get("status") != "running"
                         or current.get("execution_owner") != owner
@@ -241,6 +254,17 @@ class DelegationStore:
                     await guard_goal_skills(self.runtime, updated, client=pipe, watch=True)
                     for child in prepared:
                         await guard_goal_skills(self.runtime, child, client=pipe, watch=True)
+                        from app.core.resource_access import guard_owner
+
+                        for kind in ("goal", "conversation"):
+                            await guard_owner(
+                                pipe,
+                                tenant,
+                                kind,
+                                child["goal_id"],
+                                access_owner["subject"] if access_owner else None,
+                                access_owner["actor_type"] if access_owner else "human",
+                            )
                     pipe.multi()
                     pipe.set(key, json.dumps(updated, ensure_ascii=False))
                     pipe.zrem(f"tenant:{tenant}:quota:active-runs", f"goal:{parent_id}:{owner}")
@@ -255,6 +279,24 @@ class DelegationStore:
                     )
                     for child, child_key in zip(prepared, child_keys, strict=True):
                         pipe.set(child_key, json.dumps(child, ensure_ascii=False))
+                        from app.core.resource_access import queue_owner
+
+                        queue_owner(
+                            pipe,
+                            tenant,
+                            "goal",
+                            child["goal_id"],
+                            access_owner["subject"] if access_owner else None,
+                            access_owner["actor_type"] if access_owner else "human",
+                        )
+                        queue_owner(
+                            pipe,
+                            tenant,
+                            "conversation",
+                            child["goal_id"],
+                            access_owner["subject"] if access_owner else None,
+                            access_owner["actor_type"] if access_owner else "human",
+                        )
                         pipe.sadd(f"tenant:{tenant}:agent:goals", child["goal_id"])
                         pipe.sadd("agent:goal:tenants", tenant)
                         pipe.xadd(

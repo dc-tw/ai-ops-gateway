@@ -122,6 +122,38 @@ async def finish_children(runtime, store, tenant, parent, statuses=("completed",
         await runtime.save_goal(child_id, child, tenant)
 
 
+async def test_children_inherit_verified_owner_not_candidate_creator_or_parent_grants(delegation):
+    from app.core.resource_access import AccessStore, AccessUpdate
+    from app.core.security import Principal
+
+    runtime, store, tenant, parent = delegation
+    access = AccessStore(runtime)
+    await access.update(
+        Principal("admin", tenant, "admin", "api_key"),
+        "goal",
+        parent["goal_id"],
+        AccessUpdate(
+            expected_version=0,
+            legacy_owner={"subject": "verified"},
+            grants=[{"subject": "reader", "permission": "read"}],
+        ),
+    )
+    candidates = [item | {"created_by": "untrusted"} for item in children(parent)]
+    assert await store.create_children(planned(parent), "owner", candidates, {"total_tokens": 100})
+    current = await runtime.get_goal(parent["goal_id"], tenant)
+    for child_id in current["children_goal_ids"]:
+        for kind in ("goal", "conversation"):
+            assert await access.can(
+                Principal("verified", tenant, "operator", "api_key"), kind, child_id
+            )
+            assert not await access.can(
+                Principal("untrusted", tenant, "operator", "api_key"), kind, child_id
+            )
+            assert not await access.can(
+                Principal("reader", tenant, "viewer", "api_key"), kind, child_id
+            )
+
+
 @pytest.mark.asyncio
 async def test_two_creators_atomically_persist_one_plan_and_child_queue(delegation):
     runtime, store, tenant, parent = delegation

@@ -22,6 +22,7 @@ class Principal:
     tenant_id: str
     role: str
     auth_method: str
+    actor_type: str = "human"
 
 
 def redact_pii(text: str) -> str:
@@ -103,4 +104,7 @@ async def authorize(request: Request, minimum_role: str = "viewer") -> Principal
     principal = await authenticate(request)
     if ROLE_LEVEL[principal.role] < ROLE_LEVEL[minimum_role]:
         raise HTTPException(status_code=403, detail=f"{minimum_role} role required")
+    from app.core.resource_access import authorize_resource_route
+
+    await authorize_resource_route(request, principal)
     return principal

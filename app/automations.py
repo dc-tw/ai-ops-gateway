@@ -23,6 +23,7 @@ from app.api.schemas import GoalCreateRequest
 from app.core.automation_scheduling import next_run, utc_datetime
 from app.core.internal_events import INTERNAL_STREAM, build_internal_event
 from app.core.observability import observe_agent_event
+from app.core.resource_access import filter_resources, require_access, stream_access
 from app.core.security import TENANT_PATTERN, authorize, redact_pii
 from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
@@ -409,6 +410,8 @@ async def emit_internal_event(
 @router.post("")
 async def create_automation(payload: AutomationCreate, request: Request) -> dict[str, Any]:
     principal = await authorize(request, "operator")
+    if payload.agent_id:
+        await require_access(request, principal, "agent", payload.agent_id, "operate")
     store = _store(request)
     settings = request.app.state.settings
     _policy_defaults(payload, settings)
@@ -471,7 +474,12 @@ async def create_automation(payload: AutomationCreate, request: Request) -> dict
 @router.get("")
 async def list_automations(request: Request) -> dict[str, Any]:
     principal = await authorize(request, "viewer")
-    return {"automations": await _store(request).list(principal.tenant_id)}
+    rows = await _store(request).list(principal.tenant_id)
+    return {
+        "automations": await filter_resources(
+            request, principal, "automation", rows, "automation_id"
+        )
+    }
 
 
 async def _job(request: Request, tenant_id: str, automation_id: str) -> dict[str, Any]:
@@ -650,7 +658,8 @@ async def run_automation(automation_id: str, request: Request) -> dict[str, Any]
 async def automation_goals(automation_id: str, request: Request) -> dict[str, Any]:
     principal = await authorize(request, "viewer")
     await _job(request, principal.tenant_id, automation_id)
-    return {"goals": await _store(request).list_goals(principal.tenant_id, automation_id)}
+    rows = await _store(request).list_goals(principal.tenant_id, automation_id)
+    return {"goals": await filter_resources(request, principal, "goal", rows, "goal_id")}
 
 
 @router.get("/{automation_id}/events")
@@ -669,8 +678,12 @@ async def automation_events(automation_id: str, request: Request) -> StreamingRe
                 principal.tenant_id, automation_id, last_id, block_ms=10_000
             )
             if not records:
+                if not await stream_access(request, principal, "automation", automation_id):
+                    return
                 yield ": heartbeat\n\n"
             for event_id, event in records:
+                if not await stream_access(request, principal, "automation", automation_id):
+                    return
                 last_id = event_id
                 yield _sse(event.get("type", "message"), event, event_id)
             await asyncio.sleep(0)

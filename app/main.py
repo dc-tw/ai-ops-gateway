@@ -8,6 +8,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from app.access import router as access_router
 from app.agents import router as agents_router
 from app.api.routes import router
 from app.api.security_routes import router as security_router
@@ -121,6 +122,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(goals_router)
     app.include_router(automations_router)
     app.include_router(agents_router)
+    app.include_router(access_router)
     app.include_router(skills_router)
     app.include_router(planning_router)
     app.include_router(history_router)

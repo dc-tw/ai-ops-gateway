@@ -16,6 +16,7 @@ from redis.exceptions import WatchError
 from app.api.schemas import GoalCreateRequest
 from app.automations import AutomationPolicy, validate_goal_input
 from app.core.goal_execution import GoalExecutionStore
+from app.core.resource_access import filter_resources, guard_owner, queue_owner
 from app.core.security import authorize, redact_pii
 from app.core.skill_store import SkillBinding, resolve_skill_bindings, skill_refs
 
@@ -190,8 +191,12 @@ class AgentStore:
                         "skills": skill_refs(skill_snapshots),
                         "time": record["updated_at"],
                     }
+                    if expected_version is None:
+                        await guard_owner(pipe, tenant, "agent", agent_id, record["created_by"])
                     pipe.multi()
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
+                    if expected_version is None:
+                        queue_owner(pipe, tenant, "agent", agent_id, record["created_by"])
                     pipe.sadd(self.runtime._tenant_key(tenant, "agents"), agent_id)
                     pipe.xadd(
                         self.runtime._tenant_key(tenant, "audit"),
@@ -406,7 +411,8 @@ async def create_agent(payload: AgentCreate, request: Request) -> dict[str, Any]
 @router.get("")
 async def list_agents(request: Request) -> dict[str, Any]:
     principal = await authorize(request, "viewer")
-    return {"agents": await _request_store(request).list(principal.tenant_id)}
+    rows = await _request_store(request).list(principal.tenant_id)
+    return {"agents": await filter_resources(request, principal, "agent", rows, "agent_id")}
 
 
 @router.get("/{agent_id}")

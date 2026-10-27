@@ -6,7 +6,7 @@
 | 階段 | 交付內容 | 狀態 |
 | --- | --- | --- |
 | M1 | ATR 完整掃描、超限拒絕、可終止隔離、規則健全性、安全決策 journal | 已實作／本機與 Docker 驗證完成 |
-| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 待實作 |
+| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：owner／分享 ACL 已實作；其餘待實作 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 待實作 |
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 待實作 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 待實作 |
@@ -36,6 +36,9 @@
 
 - M1：[實作與驗證紀錄](releases/2026-10-27-m1-safety.md)。693 tests、四組 Docker E2E，
   另修復並驗證 cold Redis 的 checkpointer 索引初始化競態。M2–M9 尚未交付。
+- M2 第一段：[owner／分享 ACL 實作與驗證](releases/2026-10-27-m2-resource-access.md)。
+  731 tests，新增 strict ACL HTTP／Postgres Docker E2E；M2 的憑證、policy reference、
+  conversation fencing、統一事件與 audit chain 仍待實作。
 
 ## 後續階段的固定實作契約
 

@@ -267,6 +267,9 @@ rollback 與 `SKILL.md` 文字匯出。Skill 是可重用的指令流程，不�
 
 ## PostgreSQL 歷史儲存
 
+可選的 owner／明確分享隔離見[資源 ACL 操作指南](docs/resource-access.md)。預設不啟用，
+舊資料需 admin 明確認領；這不是完整的 Agent 憑證或對話併發治理。
+
 可選啟用 Postgres 長期歷史、分頁與中繼資料搜尋；Redis 仍負責即時執行、核准、額度、queue
 及 checkpoint。提供原子 outbox、可重送 projector、回填／對帳、明確歷史切讀與保留政策，
 不將過期的歷史快照當作執行授權。

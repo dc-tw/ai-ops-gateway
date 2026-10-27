@@ -321,8 +321,14 @@ class PlanningStore:
                         "created_by": subject,
                         "updated_by": subject,
                     }
+                    from app.core.resource_access import guard_owner
+
+                    await guard_owner(pipe, tenant, "planning_session", session_id, subject)
                     pipe.multi()
                     pipe.set(key, _json(session))
+                    from app.core.resource_access import queue_owner
+
+                    queue_owner(pipe, tenant, "planning_session", session_id, subject)
                     pipe.sadd(index, session_id)
                     self._record_event(pipe, session, "planning.session_created", subject)
                     await pipe.execute()

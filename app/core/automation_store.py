@@ -207,7 +207,42 @@ local goalkey = ARGV[7] .. 'agent:goal:' .. goal.goal_id
 if redis.call('EXISTS', goalkey) == 1 then
   return redis.error_reply('automation goal_id already exists')
 end
+local parent_access_key = ARGV[7] .. 'governance:acl:automation:' .. job.automation_id
+local parent_access_raw = redis.call('GET', parent_access_key)
+local owner, actor_key
+if parent_access_raw then
+  -- Identity comes from the current server-owned ACL, never webhook data.
+  local ok, parent_access = pcall(cjson.decode, parent_access_raw)
+  if not ok or type(parent_access) ~= 'table' or parent_access.schema_version ~= 1
+    or parent_access.kind ~= 'automation' or parent_access.resource_id ~= job.automation_id
+    or parent_access.revoked ~= false or type(parent_access.owner) ~= 'table'
+    or (parent_access.owner.actor_type ~= 'human' and parent_access.owner.actor_type ~= 'agent')
+    or type(parent_access.owner.subject) ~= 'string' or parent_access.owner.subject == '' then
+    return redis.error_reply('Invalid automation access record')
+  end
+  owner = parent_access.owner
+  actor_key = ARGV[7] .. 'governance:actor:'
+    .. redis.sha1hex(owner.actor_type .. string.char(0) .. owner.subject)
+  local actor_type = redis.call('TYPE', actor_key).ok
+  if actor_type ~= 'none' and actor_type ~= 'set' then
+    return redis.error_reply('Access index unavailable')
+  end
+  for _, kind in ipairs({'goal', 'conversation'}) do
+    if redis.call('EXISTS', ARGV[7] .. 'governance:acl:' .. kind .. ':' .. goal.goal_id) == 1 then
+      return redis.error_reply('Ownership destination already exists')
+    end
+  end
+end
 redis.call('SET', goalkey, goalraw)
+if owner then
+  for _, kind in ipairs({'goal', 'conversation'}) do
+    local access = {schema_version=1, version=1, kind=kind, resource_id=goal.goal_id,
+      owner=owner, revoked=false}
+    local access_json = string.sub(cjson.encode(access), 1, -2) .. ',"grants":[]}'
+    redis.call('SET', ARGV[7] .. 'governance:acl:' .. kind .. ':' .. goal.goal_id, access_json)
+    redis.call('SADD', actor_key, kind .. '/' .. goal.goal_id)
+  end
+end
 redis.call('SADD', ARGV[7] .. 'agent:goals', goal.goal_id)
 redis.call('SADD', 'agent:goal:tenants', job.tenant_id)
 redis.call('ZADD', KEYS[8], ARGV[6], goal.goal_id)
@@ -254,16 +289,42 @@ class AutomationStore:
         job.setdefault("version", 1)
         job.setdefault("next_run_at", None)
         tenant_id, automation_id = job["tenant_id"], job["automation_id"]
+        from app.core.resource_access import actor_index
+
         member = self._member(tenant_id, automation_id)
         script = """
         if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+        if ARGV[6] ~= '' then
+          if redis.call('EXISTS', ARGV[6]) == 1 then
+            return redis.error_reply('Ownership destination already exists')
+          end
+          local actor_type = redis.call('TYPE', ARGV[8]).ok
+          if actor_type ~= 'none' and actor_type ~= 'set' then
+            return redis.error_reply('Access index unavailable')
+          end
+        end
         redis.call('SET', KEYS[1], ARGV[1])
+        if ARGV[6] ~= '' then
+          redis.call('SET', ARGV[6], ARGV[7], 'NX')
+          redis.call('SADD', ARGV[8], ARGV[9])
+        end
         redis.call('SADD', KEYS[2], ARGV[2])
         redis.call('SADD', KEYS[3], ARGV[3])
         if ARGV[5] ~= '' then redis.call('ZADD', KEYS[4], ARGV[5], ARGV[4]) end
         return 1
         """
         next_at = job.get("next_run_at") if job.get("enabled") else None
+        from app.core.resource_access import acl_key
+
+        access = {
+            "schema_version": 1,
+            "version": 1,
+            "kind": "automation",
+            "resource_id": automation_id,
+            "owner": {"actor_type": "human", "subject": job.get("created_by", "")},
+            "grants": [],
+            "revoked": False,
+        }
         created = await self._client.eval(
             script,
             4,
@@ -276,6 +337,10 @@ class AutomationStore:
             tenant_id,
             member,
             "" if next_at is None else str(next_at),
+            acl_key(tenant_id, "automation", automation_id) if job.get("created_by") else "",
+            json.dumps(access),
+            actor_index(tenant_id, {"actor_type": "human", "subject": job.get("created_by", "")}),
+            f"automation/{automation_id}",
         )
         if not created:
             raise ValueError("Automation already exists")

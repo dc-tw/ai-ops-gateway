@@ -192,10 +192,13 @@ async def test_agent_store_validates_skills_inside_configuration_transaction(mon
         async def get(self, key):
             return None
 
+        async def type(self, key):
+            return "none"
+
         def multi(self):
             self.committed = True
 
-        def set(self, *args):
+        def set(self, *args, **kwargs):
             return self
 
         sadd = set
