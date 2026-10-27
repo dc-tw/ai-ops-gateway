@@ -142,6 +142,152 @@ async def save(env, value, draft=None):
     return response.json()
 
 
+async def test_workflow_flag_yaml_compiled_artifact_and_no_dispatch(environment, monkeypatch):
+    env = environment
+    configured = await env.agent()
+    fresh = await session(env, configured)
+    draft = {
+        "schema_version": 2,
+        "objective": "分析部署證據",
+        "nodes": [{"node_id": "review", "agent_id": configured["agent_id"], "query": "只讀分析"}],
+    }
+    body = {"expected_version": fresh["version"], "plan": draft}
+    assert (await env.client.post(path(fresh) + "/plans", json=body)).status_code == 409
+    env.settings.workflow_enabled = True
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Compilation must never infer, dispatch, or reserve execution")
+
+    monkeypatch.setattr(env.app.state.model_router, "get", forbidden)
+    monkeypatch.setattr(env.runtime, "consume_daily_tokens", forbidden)
+    monkeypatch.setattr(env.runtime, "acquire_run_slot", forbidden)
+    import yaml
+
+    response = await env.client.post(
+        path(fresh) + "/workflow-yaml",
+        json={
+            "expected_version": fresh["version"],
+            "yaml": yaml.safe_dump(draft, allow_unicode=True),
+        },
+    )
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    artifact = (await env.client.get(path(saved) + "/plans/1")).json()
+    view = await env.client.get(path(saved) + "/compiled", headers={"x-api-key": "viewer"})
+    assert view.status_code == 200, view.text
+    assert view.json()["compiled"] == artifact["compiled"]
+    assert view.json()["source_kind"] == "native"
+    assert view.json()["execution_started"] is False
+    assert (
+        await env.client.get(path(saved) + "/compiled", headers={"x-api-key": "foreign"})
+    ).status_code == 404
+    assert (
+        await env.client.post(
+            path(saved) + "/workflow-yaml",
+            json={"expected_version": saved["version"], "yaml": yaml.safe_dump(draft)},
+            headers={"x-api-key": "viewer"},
+        )
+    ).status_code == 403
+    accepted = await env.client.post(
+        path(saved) + "/mode",
+        json={"expected_version": saved["version"], "mode": "execute", "plan_revision": 1},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert await env.runtime.list_goal_ids(env.tenant) == []
+    assert (
+        await env.runtime._client.get(env.runtime._tenant_key(env.tenant, "quota:active-runs"))
+        is None
+    )
+    env.settings.workflow_enabled = False
+    assert (await env.client.get(path(saved) + "/compiled")).status_code == 200
+
+
+async def test_legacy_compile_is_explicit_and_does_not_rewrite_revision(environment):
+    env = environment
+    saved = await save(env, await session(env))
+    before = (await env.client.get(path(saved) + "/plans/1")).json()
+    assert (await env.client.get(path(saved) + "/compiled")).status_code == 409
+    env.settings.workflow_enabled = True
+    response = await env.client.get(path(saved) + "/compiled")
+    assert response.status_code == 200, response.text
+    assert response.json()["source_kind"] == "legacy_adapter"
+    assert (await env.client.get(path(saved) + "/plans/1")).json() == before
+    assert await env.runtime.list_goal_ids(env.tenant) == []
+
+
+async def test_workflow_literals_scanned_limits_and_compiled_tamper_fails_closed(environment):
+    env = environment
+    env.settings.workflow_enabled = True
+    configured = await env.agent()
+    fresh = await session(env, configured)
+    draft = {
+        "schema_version": 2,
+        "objective": "Review",
+        "nodes": [
+            {
+                "node_id": "a",
+                "agent_id": configured["agent_id"],
+                "query": "Evidence",
+                "output_schema": {"type": "object", "description": "SCHEMA_LITERAL\nSECOND_LINE"},
+            }
+        ],
+    }
+    saved = await save(env, fresh, draft)
+    assert any("SCHEMA_LITERAL\nSECOND_LINE" in text for text, _ in env.detector.scans)
+    env.settings.workflow_max_edges = 0
+    draft["nodes"].append({"node_id": "b", "agent_id": configured["agent_id"], "query": "Next"})
+    draft["edges"] = [{"source": "a", "target": "b"}]
+    rejected = await env.client.post(
+        path(saved) + "/plans", json={"expected_version": saved["version"], "plan": draft}
+    )
+    assert rejected.status_code == 422
+    assert (await env.client.get(path(saved))).json()["plan_revision"] == 1
+    from app.core.planning_store import PlanningStore
+
+    store = PlanningStore(env.runtime)
+    key = store.revision_key(env.tenant, saved["session_id"], 1)
+    record = json.loads(await env.runtime._client.get(key))
+    record["compiled"]["nodes"][0]["query"] = "PRIVATE_TAMPER"
+    await env.runtime._client.set(key, json.dumps(record))
+    for suffix in ("", "/compiled", "/plans/1"):
+        response = await env.client.get(path(saved) + suffix)
+        assert response.status_code == 409
+        assert "PRIVATE_TAMPER" not in response.text
+
+
+async def test_workflow_compiled_reads_recheck_current_owner_sharing(environment):
+    env = environment
+    env.settings.workflow_enabled = True
+    configured = await env.agent()
+    fresh = await session(env, configured)
+    saved = await save(
+        env,
+        fresh,
+        {
+            "schema_version": 2,
+            "objective": "Review",
+            "nodes": [{"node_id": "a", "agent_id": configured["agent_id"], "query": "Evidence"}],
+        },
+    )
+    env.settings.resource_acl_enabled = True
+    url = path(saved) + "/compiled"
+    assert (await env.client.get(url)).status_code == 200
+    assert (await env.client.get(url, headers={"x-api-key": "viewer"})).status_code == 404
+    access = f"/v1/access/planning_session/{saved['session_id']}"
+    granted = await env.client.put(
+        access,
+        json={
+            "expected_version": 1,
+            "grants": [{"actor_type": "human", "subject": "viewer", "permission": "read"}],
+        },
+    )
+    assert granted.status_code == 200, granted.text
+    assert (await env.client.get(url, headers={"x-api-key": "viewer"})).status_code == 200
+    revoked = await env.client.put(access, json={"expected_version": 2, "grants": []})
+    assert revoked.status_code == 200, revoked.text
+    assert (await env.client.get(url, headers={"x-api-key": "viewer"})).status_code == 404
+
+
 async def test_fresh_sessions_and_immutable_revisions_never_execute(environment, monkeypatch):
     env = environment
 

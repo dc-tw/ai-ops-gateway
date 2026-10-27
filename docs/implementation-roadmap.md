@@ -8,7 +8,7 @@
 | M1 | ATR 完整掃描、超限拒絕、可終止隔離、規則健全性、安全決策 journal | 已實作／本機與 Docker 驗證完成 |
 | M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：owner／分享 ACL 已實作；其餘待實作 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
-| M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 待實作 |
+| M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 進行中：編譯器／YAML／快照已實作；執行 admission／controller 待完成 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 待實作 |
 | M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 待實作 |
 | M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 待實作 |
@@ -44,6 +44,11 @@
 - M3 完整段落：[唯讀 package 匯入與驗證](releases/2026-10-27-m3-package-import.md)。
   809 tests；ZIP／固定 GitHub commit、隔離預覽／原子確認、provenance、故障與 model-context E2E。
   M4–M9 仍按原定契約接續，不以 M3 完成取代整體目標。
+- M4 第一段：[Plan v2／YAML 與安全編譯說明](workflow-plan-v2.md)。保存不可變 compiled artifact，
+  舊 hash 不變；分支／join／核准等待決策與 schema 隔離已加入測試。
+  [驗證紀錄](releases/2026-10-27-m4-workflow-compiler.md)：848 tests，review 後專項 129 tests，
+  無網路 Docker／Python 3.12 相容性與隔離終止／復原。
+  **尚無 DAG dispatch／execute admission**；這一段不代表 M4 完成。
 
 ## 後續階段的固定實作契約
 

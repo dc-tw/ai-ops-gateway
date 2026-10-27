@@ -84,19 +84,28 @@ def _decode(raw: Any) -> dict[str, Any]:
     return value
 
 
-def _plan_hash(plan: dict[str, Any], complete: bool, snapshot: dict[str, Any]) -> str:
-    return canonical_hash(
-        {"schema_version": SCHEMA_VERSION, "plan": plan, "complete": complete, "snapshot": snapshot}
-    )
+def _plan_hash(
+    plan: dict[str, Any], complete: bool, snapshot: dict[str, Any], compiled=None
+) -> str:
+    value = {
+        "schema_version": SCHEMA_VERSION,
+        "plan": plan,
+        "complete": complete,
+        "snapshot": snapshot,
+    }
+    if plan.get("schema_version") == 2:
+        value["compiled"] = compiled
+    return canonical_hash(value)
 
 
 class PlanningStore:
-    def __init__(self, runtime: Any, *, max_watch_retries: int = 8) -> None:
+    def __init__(self, runtime: Any, *, max_watch_retries: int = 8, workflow_limits=None) -> None:
         if type(max_watch_retries) is not int or not 1 <= max_watch_retries <= 50:
             raise ValueError("Planning retries must be between one and fifty")
         self.runtime = runtime
         self.client = runtime._client
         self.max_watch_retries = max_watch_retries
+        self.workflow_limits = workflow_limits or {}
 
     def session_key(self, tenant: str, session_id: str) -> str:
         return self.runtime._tenant_key(tenant, f"planning:session:{session_id}")
@@ -185,7 +194,16 @@ class PlanningStore:
         snapshot = self._snapshot(value.get("snapshot"), tenant, agent_id)
         if value.get("snapshot_sha256") != canonical_hash(snapshot):
             raise PlanningIntegrityError("Plan snapshot hash does not match")
-        if value.get("content_sha256") != _plan_hash(plan, value["complete"], snapshot):
+        if plan.get("schema_version") == 2:
+            from app.core.workflow_plan import verify_compiled
+
+            try:
+                verify_compiled(value.get("compiled"), plan, snapshot)
+            except ValueError:
+                raise PlanningIntegrityError("Compiled workflow is invalid") from None
+        if value.get("content_sha256") != _plan_hash(
+            plan, value["complete"], snapshot, value.get("compiled")
+        ):
             raise PlanningIntegrityError("Plan content hash does not match")
         if value.get("skill_selection") != plan_skill_selections(snapshot, plan):
             raise PlanningIntegrityError("Plan Skill selection does not match its pinned inputs")
@@ -392,6 +410,13 @@ class PlanningStore:
                                 raise ValueError("Plan validator must return a boolean")
                     revision = None
                     if plan is not None:
+                        compiled = None
+                        if plan.get("schema_version") == 2:
+                            from app.core.workflow_plan import compile_workflow
+
+                            compiled = await asyncio.to_thread(
+                                compile_workflow, plan, snapshot, **self.workflow_limits
+                            )
                         number = session["plan_revision"] + 1
                         if number > MAX_REVISIONS:
                             raise PlanningConflict("Planning revision limit reached")
@@ -415,10 +440,12 @@ class PlanningStore:
                             "complete": complete,
                             "snapshot": snapshot,
                             "snapshot_sha256": snapshot_hash,
-                            "content_sha256": _plan_hash(plan, complete, snapshot),
+                            "content_sha256": _plan_hash(plan, complete, snapshot, compiled),
                             "created_at": datetime.now(UTC).isoformat(),
                             "created_by": subject,
                         }
+                        if compiled is not None:
+                            revision["compiled"] = compiled
                         selections = plan_skill_selections(snapshot, plan)
                         if selections is not None:
                             revision["skill_selection"] = selections

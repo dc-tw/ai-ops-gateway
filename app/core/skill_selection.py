@@ -81,6 +81,8 @@ def select_skills(explicit, rules, task):
 
 def plan_skill_selections(snapshot, plan):
     """Freeze execution selections from the already pinned planning whitelist."""
+    if plan.get("schema_version") == 2:
+        return None  # Native DAG selections live in each compiled node.
     agents = [snapshot.get("root_agent", {}), *snapshot.get("workers", [])]
     if not any(agent.get("skill_selection_rules") for agent in agents):
         return None  # Never change v1 Plan hashes/artifacts merely by upgrading code.

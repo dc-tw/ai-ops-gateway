@@ -169,6 +169,11 @@ def validate_planning_plan(snapshot: dict[str, Any], plan: dict[str, Any] | None
     try:
         if not isinstance(plan, dict):
             raise ValueError
+        if plan.get("schema_version") == 2:
+            from app.core.workflow_plan import compile_workflow
+
+            compile_workflow(plan, snapshot, check_schemas=False)
+            return True
         steps, assignments = plan.get("steps", []), plan.get("assignments", [])
         if not isinstance(steps, list) or not isinstance(assignments, list):
             raise ValueError
