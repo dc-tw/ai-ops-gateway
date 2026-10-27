@@ -16,6 +16,14 @@ from uuid import NAMESPACE_URL, uuid5
 from redis.exceptions import WatchError
 
 from app.core.goal_execution import GoalExecutionStore, GoalMutation
+from app.core.goal_protocol import (
+    WORKFLOW_PREFIX,
+    WORKFLOW_QUEUE,
+    goal_index,
+    goal_key,
+    require_goal_protocol,
+    tenants_key,
+)
 from app.core.planning_store import (
     PlanningConflict,
     PlanningIntegrityError,
@@ -44,12 +52,8 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
 
-def goal_key(tenant, goal_id):
-    return f"tenant:{tenant}:agent:goal:{goal_id}"
-
-
 def node_id(tenant, root_id, key):
-    return str(uuid5(NAMESPACE_URL, f"gateway:workflow:{tenant}:{root_id}:{key}"))
+    return WORKFLOW_PREFIX + str(uuid5(NAMESPACE_URL, f"gateway:workflow:{tenant}:{root_id}:{key}"))
 
 
 def charged(goal):
@@ -57,16 +61,54 @@ def charged(goal):
     return max(int(usage.get("total_tokens", 0)), int(usage.get("policy_charged_tokens", 0)))
 
 
-async def guard_access(runtime, pipe, principal, kind, resource_id, enabled, permission="operate"):
+async def guard_access(
+    runtime, pipe, principal, kind, resource_id, enabled, permission="operate", *, watch=True
+):
     if not enabled:
         return
     key = acl_key(principal.tenant_id, kind, resource_id)
-    await pipe.watch(key)
+    if watch:
+        await pipe.watch(key)
     raw = await pipe.get(key)
     if raw and AccessStore.decode(raw, kind, resource_id)["revoked"]:
         raise PermissionError("Workflow resource access was revoked")
     if not await AccessStore(runtime).can(principal, kind, resource_id, permission):
         raise PermissionError("Workflow resource is not authorized")
+
+
+async def guard_workflow_access(
+    runtime, root, child=None, *, client=None, watch=False, current_acl=False
+):
+    require_goal_protocol(root)
+    workflow = root["workflow"]
+    if not (workflow["acl_enforced"] or current_acl):
+        return
+    principal = Principal(**workflow["principal"])
+    if principal.tenant_id != root["tenant_id"]:
+        raise PermissionError("Workflow authority tenant does not match")
+    reader = client if client is not None else runtime._client
+    resources = [
+        ("goal", root["goal_id"], "operate"),
+        ("planning_session", workflow["session_id"], "operate"),
+    ]
+    if child:
+        require_goal_protocol(child)
+        if (
+            child["tenant_id"] != root["tenant_id"]
+            or child["workflow_node"]["root_id"] != root["goal_id"]
+        ):
+            raise PermissionError("Workflow child authority does not match")
+        resources.extend(
+            [("goal", child["goal_id"], "operate"), ("agent", child["agent_id"], "operate")]
+        )
+        resources.extend(
+            ("skill", ref["skill_id"], "read")
+            for ref in child.get("agent_config", {}).get("skills", [])
+        )
+    for kind, resource_id, permission in resources:
+        await guard_access(
+            runtime, reader, principal, kind, resource_id, True, permission, watch=watch
+        )
 
 
 async def destinations(pipe, mapping):
@@ -83,7 +125,7 @@ class WorkflowExecutionStore:
 
     @staticmethod
     def root_id(tenant, session_id, idempotency_key):
-        return str(
+        return WORKFLOW_PREFIX + str(
             uuid5(NAMESPACE_URL, f"gateway:workflow:{tenant}:{session_id}:{idempotency_key}")
         )
 
@@ -237,6 +279,7 @@ class WorkflowExecutionStore:
                     ):
                         raise PlanningConflict("Tenant daily token budget exceeded")
                     root = {
+                        "workflow_protocol": 1,
                         "goal_id": root_id,
                         "tenant_id": tenant,
                         "created_by": principal.subject,
@@ -259,6 +302,7 @@ class WorkflowExecutionStore:
                         },
                         "workflow": {
                             "version": 1,
+                            "acl_enforced": settings.resource_acl_enabled,
                             "session_id": session_id,
                             "accepted_hash": accepted_hash,
                             "revision": revision["revision"],
@@ -286,9 +330,9 @@ class WorkflowExecutionStore:
                             key: "string",
                             receipt_key: "string",
                             quota_key: "string",
-                            f"tenant:{tenant}:agent:goals": "set",
-                            "agent:goal:tenants": "set",
-                            "agent:goal:queue": "stream",
+                            goal_index(tenant, root_id): "set",
+                            tenants_key(root_id): "set",
+                            WORKFLOW_QUEUE: "stream",
                             f"tenant:{tenant}:agent:goal:events:{root_id}": "stream",
                             f"tenant:{tenant}:audit": "stream",
                             store.events_key(tenant, session_id): "stream",
@@ -321,9 +365,9 @@ class WorkflowExecutionStore:
                         queue_owner(
                             pipe, tenant, kind, root_id, principal.subject, principal.actor_type
                         )
-                    pipe.sadd(f"tenant:{tenant}:agent:goals", root_id)
-                    pipe.sadd("agent:goal:tenants", tenant)
-                    pipe.xadd("agent:goal:queue", {"tenant_id": tenant, "goal_id": root_id})
+                    pipe.sadd(goal_index(tenant, root_id), root_id)
+                    pipe.sadd(tenants_key(root_id), tenant)
+                    pipe.xadd(WORKFLOW_QUEUE, {"tenant_id": tenant, "goal_id": root_id})
                     self._event(pipe, root, "workflow.admitted")
                     store._record_event(
                         pipe, session, "planning.execution_admitted", principal.subject
@@ -371,6 +415,7 @@ class WorkflowExecutionStore:
             )
         child_id = node_id(tenant, root["goal_id"], node["node_id"])
         return {
+            "workflow_protocol": 1,
             "goal_id": child_id,
             "tenant_id": tenant,
             "created_by": root["created_by"],
@@ -412,7 +457,7 @@ class WorkflowExecutionStore:
     async def reconcile(self, tenant, root_id, settings):
         try:
             return await self._reconcile(tenant, root_id, settings)
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             # Corrupt tenant data is not a reason to stop every scheduler tick.
             # Never dispatch from an unverifiable artifact; retain it for
             # diagnosis and fence its children before proceeding to other roots.
@@ -460,7 +505,7 @@ class WorkflowExecutionStore:
             for child_id in await self.runtime.list_goal_ids(tenant):
                 child = await self.runtime.get_goal(child_id, tenant)
                 if (
-                    child
+                    isinstance(child, dict)
                     and child.get("parent_goal_id") == root_id
                     and child.get("status") not in TERMINAL
                 ):
@@ -482,7 +527,9 @@ class WorkflowExecutionStore:
                     root = json.loads(await pipe.get(key) or "null")
                     if not root or not root.get("workflow"):
                         return None
+                    require_goal_protocol(root)
                     workflow = root["workflow"]
+                    acl_required = settings.resource_acl_enabled or workflow["acl_enforced"]
                     prior_status = root["status"]
                     compiled = workflow["compiled"]
                     verify_compiled(compiled, workflow["plan"], workflow["snapshot"])
@@ -520,7 +567,7 @@ class WorkflowExecutionStore:
                                 principal,
                                 kind,
                                 resource,
-                                settings.resource_acl_enabled,
+                                acl_required,
                             )
                     except PermissionError:
                         revoked = True
@@ -606,7 +653,7 @@ class WorkflowExecutionStore:
                                 principal,
                                 "agent",
                                 node["agent_id"],
-                                settings.resource_acl_enabled,
+                                acl_required,
                             )
                             for skill in node["skills"]:
                                 await guard_access(
@@ -615,7 +662,7 @@ class WorkflowExecutionStore:
                                     principal,
                                     "skill",
                                     skill["skill_id"],
-                                    settings.resource_acl_enabled,
+                                    acl_required,
                                     "read",
                                 )
                             agent_key = f"tenant:{tenant}:agents:record:{node['agent_id']}"
@@ -727,8 +774,8 @@ class WorkflowExecutionStore:
                         )
                     mapping = {
                         key: "string",
-                        "agent:goal:queue": "stream",
-                        f"tenant:{tenant}:agent:goals": "set",
+                        WORKFLOW_QUEUE: "stream",
+                        goal_index(tenant, root_id): "set",
                         f"tenant:{tenant}:agent:goal:events:{root_id}": "stream",
                         f"tenant:{tenant}:audit": "stream",
                     }
@@ -753,9 +800,9 @@ class WorkflowExecutionStore:
                                 root["created_by"],
                                 root.get("created_by_type", "human"),
                             )
-                        pipe.sadd(f"tenant:{tenant}:agent:goals", child["goal_id"])
+                        pipe.sadd(goal_index(tenant, child["goal_id"]), child["goal_id"])
                         pipe.xadd(
-                            "agent:goal:queue", {"tenant_id": tenant, "goal_id": child["goal_id"]}
+                            WORKFLOW_QUEUE, {"tenant_id": tenant, "goal_id": child["goal_id"]}
                         )
                         self._event(pipe, child, "workflow.node_queued")
                     self._event(pipe, root, "workflow.reconciled")
@@ -815,7 +862,7 @@ class WorkflowExecutionStore:
                         count += 1
         return count
 
-    async def reserve_node_budget(self, goal, owner, limit, usage=None):
+    async def reserve_node_budget(self, goal, owner, limit, usage=None, *, current_acl=False):
         """Children use the root reservation, including one atomic UTC rollover."""
         tenant, child_id = goal["tenant_id"], goal["goal_id"]
         key = goal_key(tenant, child_id)
@@ -834,6 +881,9 @@ class WorkflowExecutionStore:
                         or root["workflow"]["phase"] != "running"
                     ):
                         raise PermissionError("Workflow execution ownership was revoked")
+                    await guard_workflow_access(
+                        self.runtime, root, child, client=pipe, watch=True, current_acl=current_acl
+                    )
                     compiled = root["workflow"]["compiled"]
                     all_keys = [
                         goal_key(tenant, node_id(tenant, root["goal_id"], node["node_id"]))

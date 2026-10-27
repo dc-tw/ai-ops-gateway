@@ -15,6 +15,13 @@ from typing import Any
 
 from redis.exceptions import WatchError
 
+from app.core.goal_protocol import (
+    goal_index,
+    goal_key,
+    goal_queue,
+    require_goal_protocol,
+    tenants_key,
+)
 from app.core.skill_store import skill_refs
 
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -49,7 +56,7 @@ class GoalExecutionStore:
 
     @staticmethod
     def key(tenant: str, goal_id: str) -> str:
-        return f"tenant:{tenant}:agent:goal:{goal_id}"
+        return goal_key(tenant, goal_id)
 
     async def _mutate(
         self,
@@ -80,6 +87,23 @@ class GoalExecutionStore:
                     mutation = change(current)
                     if mutation.goal is None:
                         return mutation.result
+                    if mutation.goal.get("status") not in TERMINAL:
+                        try:
+                            require_goal_protocol(mutation.goal)
+                        except ValueError:
+                            if current is None:
+                                raise
+                            mutation.goal.update(
+                                status="failed",
+                                error_type="WorkflowProtocolInvalid",
+                                error="Workflow protocol requires operator review",
+                                execution_owner=None,
+                                execution_lease_until=0,
+                            )
+                            mutation.enqueue = False
+                            mutation.events = [
+                                {"type": "goal_failed", "error_type": "WorkflowProtocolInvalid"}
+                            ]
                     if mutation.enqueue and mutation.goal.get("workflow_node"):
                         parent_key = self.key(tenant, mutation.goal["workflow_node"]["root_id"])
                         await pipe.watch(parent_key)
@@ -203,8 +227,8 @@ class GoalExecutionStore:
                             mutation.goal.get("created_by"),
                             mutation.goal.get("created_by_type", "human"),
                         )
-                    pipe.sadd(f"tenant:{tenant}:agent:goals", goal_id)
-                    pipe.sadd("agent:goal:tenants", tenant)
+                    pipe.sadd(goal_index(tenant, goal_id), goal_id)
+                    pipe.sadd(tenants_key(goal_id), tenant)
                     for event in mutation.events:
                         pipe.xadd(
                             f"tenant:{tenant}:agent:goal:events:{goal_id}",
@@ -239,7 +263,7 @@ class GoalExecutionStore:
                             {"payload": json.dumps(audit, ensure_ascii=False)},
                         )
                     if mutation.enqueue:
-                        pipe.xadd("agent:goal:queue", {"goal_id": goal_id, "tenant_id": tenant})
+                        pipe.xadd(goal_queue(goal_id), {"goal_id": goal_id, "tenant_id": tenant})
                     if mutation.release_slot:
                         pipe.zrem(f"tenant:{tenant}:quota:active-runs", mutation.release_slot)
                     if mutation.goal.get("status") == "failed" and prior_status != "failed":
@@ -693,13 +717,15 @@ class GoalExecutionStore:
         owner: str,
         limit: int,
         usage: dict[str, Any] | None = None,
+        *,
+        current_acl: bool = False,
     ) -> None:
         """Reserve the entire bounded job budget once, including approval resumes."""
         if goal.get("workflow_node") and self.client is not None:
             from app.core.workflow_execution import WorkflowExecutionStore
 
             await WorkflowExecutionStore(self.runtime).reserve_node_budget(
-                goal, owner, limit, usage
+                goal, owner, limit, usage, current_acl=current_acl
             )
             return
         if self.client is None:

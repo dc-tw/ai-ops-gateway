@@ -8,6 +8,9 @@ from threading import Lock
 ATR_CASE = re.compile(r"atr-remote-tool-e2e:([0-9a-f]{32})")
 ATR_RECEIPTS = deque(maxlen=1_000)
 ATR_RECEIPT_LOCK = Lock()
+WORKFLOW_CASE = re.compile(r"workflow-e2e:([0-9a-f]{32})")
+WORKFLOW_STATS = {}
+WORKFLOW_LOCK = Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -17,6 +20,11 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self) -> None:
+        workflow = re.fullmatch(r"/test/workflow/([0-9a-f]{32})", self.path)
+        if workflow:
+            with WORKFLOW_LOCK:
+                self._reply_json(dict(WORKFLOW_STATS.get(workflow[1], {})))
+            return
         match = re.fullmatch(r"/test/atr-model-receipts/([0-9a-f]{32})", self.path)
         if match:
             with ATR_RECEIPT_LOCK:
@@ -40,6 +48,25 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         serialized_request = json.dumps(request)
+        workflow = WORKFLOW_CASE.search(serialized_request)
+        if workflow and request.get("stream"):
+            case_id = workflow[1]
+            with WORKFLOW_LOCK:
+                stats = WORKFLOW_STATS.setdefault(
+                    case_id, {"calls": 0, "active": 0, "max_active": 0}
+                )
+                stats["calls"] += 1
+                stats["active"] += 1
+                stats["max_active"] = max(stats["max_active"], stats["active"])
+            try:
+                time.sleep(12 if "workflow-e2e-hold" in serialized_request else 5)
+                self._stream_response(request)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # SIGKILL test: provider may finish after its client disappears.
+            finally:
+                with WORKFLOW_LOCK:
+                    stats["active"] -= 1
+            return
         case = ATR_CASE.search(serialized_request)
         if case:
             # Test evidence contains only booleans and the neutral case ID.
@@ -157,7 +184,13 @@ class Handler(BaseHTTPRequestHandler):
             else ("Mock ", "streaming ", "final ", "answer")
         )
         messages = request.get("messages", [])
-        if messages and "You are a Chief Agent." in messages[0].get("content", ""):
+        if WORKFLOW_CASE.search(json.dumps(messages)):
+            tokens = (
+                json.dumps({"ready": True})
+                if "<OUTPUT_SCHEMA>" in json.dumps(messages)
+                else "Workflow model returned a sufficiently detailed evidence review.",
+            )
+        elif messages and "You are a Chief Agent." in messages[0].get("content", ""):
             tokens = (self._content(request),)
         elif ATR_CASE.search(json.dumps(messages)) and "<OBSERVATIONS>" in messages[-1].get(
             "content", ""

@@ -8,6 +8,15 @@ from typing import Any
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
+from app.core.goal_protocol import (
+    LEGACY_QUEUE,
+    QUEUES,
+    WORKFLOW_QUEUE,
+    goal_index,
+    goal_key,
+    goal_queue,
+    tenants_key,
+)
 from app.core.internal_events import INTERNAL_STREAM, build_internal_event
 
 
@@ -496,32 +505,39 @@ class RedisRuntime:
     ) -> None:
         async with self._client.pipeline(transaction=True) as pipe:
             pipe.set(
-                self._tenant_key(tenant_id, f"agent:goal:{goal_id}"),
+                goal_key(tenant_id, goal_id),
                 json.dumps(goal, ensure_ascii=False),
             )
-            pipe.sadd(self._tenant_key(tenant_id, "agent:goals"), goal_id)
-            pipe.sadd("agent:goal:tenants", tenant_id)
+            pipe.sadd(goal_index(tenant_id, goal_id), goal_id)
+            pipe.sadd(tenants_key(goal_id), tenant_id)
             await pipe.execute()
 
     async def get_goal(self, goal_id: str, tenant_id: str = "default") -> dict[str, Any] | None:
-        value = await self._client.get(self._tenant_key(tenant_id, f"agent:goal:{goal_id}"))
+        value = await self._client.get(goal_key(tenant_id, goal_id))
         return json.loads(value) if value else None
 
     async def list_goal_ids(self, tenant_id: str = "default") -> list[str]:
-        return sorted(await self._client.smembers(self._tenant_key(tenant_id, "agent:goals")))
+        return sorted(
+            await self._client.sunion(
+                self._tenant_key(tenant_id, "agent:goals"),
+                self._tenant_key(tenant_id, "workflow:v1:goals"),
+            )
+        )
 
     async def list_goal_tenants(self) -> list[str]:
-        return sorted(await self._client.smembers("agent:goal:tenants"))
+        return sorted(await self._client.sunion("agent:goal:tenants", "workflow:v1:tenants"))
 
     async def enqueue_goal(self, goal_id: str, tenant_id: str = "default") -> None:
         await self._client.xadd(
-            "agent:goal:queue",
+            goal_queue(goal_id),
             {"goal_id": goal_id, "tenant_id": tenant_id},
         )
 
-    async def ensure_goal_group(self, group: str) -> None:
+    async def ensure_goal_group(self, group: str, queue: str = LEGACY_QUEUE) -> None:
+        if queue not in QUEUES:
+            raise ValueError("Unsupported Goal protocol queue")
         with suppress(Exception):
-            await self._client.xgroup_create("agent:goal:queue", group, id="0-0", mkstream=True)
+            await self._client.xgroup_create(queue, group, id="0-0", mkstream=True)
 
     async def claim_goal(
         self,
@@ -530,10 +546,11 @@ class RedisRuntime:
         consumer: str,
         block_seconds: int = 2,
         lease_ms: int = 60_000,
+        queue: str = LEGACY_QUEUE,
     ) -> tuple[str, str, str] | None:
-        await self.ensure_goal_group(group)
+        await self.ensure_goal_group(group, queue)
         reclaimed = await self._client.xautoclaim(
-            "agent:goal:queue",
+            queue,
             group,
             consumer,
             min_idle_time=lease_ms,
@@ -548,9 +565,9 @@ class RedisRuntime:
         result = await self._client.xreadgroup(
             group,
             consumer,
-            {"agent:goal:queue": ">"},
+            {queue: ">"},
             count=1,
-            block=block_seconds * 1_000,
+            block=block_seconds * 1_000 if block_seconds > 0 else None,
         )
         if not result:
             return None
@@ -566,10 +583,13 @@ class RedisRuntime:
         goal_id: str,
         tenant_id: str = "default",
         error: str | None = None,
+        queue: str = LEGACY_QUEUE,
     ) -> None:
+        if queue not in QUEUES:
+            raise ValueError("Unsupported Goal protocol queue")
         if error:
             await self._client.xadd(
-                "agent:goal:dead-letter",
+                "workflow:v1:dead-letter" if queue == WORKFLOW_QUEUE else "agent:goal:dead-letter",
                 {
                     "goal_id": goal_id,
                     "tenant_id": tenant_id,
@@ -579,7 +599,7 @@ class RedisRuntime:
                 maxlen=self._stream_maxlen,
                 approximate=True,
             )
-        await self._client.xack("agent:goal:queue", group, event_id)
+        await self._client.xack(queue, group, event_id)
 
     async def append_goal_event(
         self, goal_id: str, event: dict[str, Any], tenant_id: str = "default"

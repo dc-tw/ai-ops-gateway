@@ -98,6 +98,132 @@ async def pending(env):
     return (await env.raw.xpending(env.stream, worker.GROUP))["pending"]
 
 
+async def test_real_max_default_dag_with_large_pinned_skill_projects_inside_record_limit(
+    projection,
+):
+    from datetime import UTC, datetime
+
+    from app.agents import AgentStore
+    from app.automations import AutomationPolicy
+    from app.core.planning_snapshot import build_planning_snapshot
+    from app.core.planning_store import PlanningStore
+    from app.core.security import Principal
+    from app.core.skill_store import SkillContent, SkillStore
+    from app.core.workflow_execution import WorkflowExecutionStore
+    from app.llm.client import ModelRouter
+
+    env, stamp = projection, datetime.now(UTC).isoformat()
+    settings = Settings(_env_file=None, llm_model="mock-model", tenant_daily_token_budget=10000000)
+    router = ModelRouter(settings)
+    skill = await SkillStore(env.writer).create(
+        env.tenant,
+        SkillContent(
+            name="large-evidence",
+            display_name="大型唯讀證據",
+            description="僅投影驗證，不執行模型",
+            instructions="證據與未知。" * 600,
+        ).model_dump(),
+        "actor",
+    )
+    agent = await AgentStore(env.writer).create(
+        {
+            "agent_id": str(uuid4()),
+            "tenant_id": env.tenant,
+            "name": "Projection reviewer",
+            "description": "Bounded artifact test",
+            "persona": "Retain uncertainty",
+            "model": "mock-model",
+            "role": "worker",
+            "version": 1,
+            "enabled": True,
+            "delegate_agent_ids": [],
+            "skills": [{"skill_id": skill["skill_id"], "revision": 1}],
+            "policy": AutomationPolicy(token_budget=2560000, allowed_tools=[]).model_dump(),
+            "created_by": "actor",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+    )
+
+    async def builder(pipe):
+        return await build_planning_snapshot(
+            env.writer, router, env.tenant, agent["agent_id"], client=pipe, watch=True
+        )
+
+    planning = PlanningStore(env.writer)
+    session = await planning.create(env.tenant, agent["agent_id"], "actor", builder)
+    saved = await planning.save_plan(
+        env.tenant,
+        session["session_id"],
+        {
+            "schema_version": 2,
+            "objective": "Bounded large artifact",
+            "token_budget": 2560000,
+            "nodes": [
+                {
+                    "node_id": f"n{i}",
+                    "agent_id": agent["agent_id"],
+                    "query": "Review supplied evidence",
+                    "token_budget": 80000,
+                }
+                for i in range(32)
+            ],
+        },
+        session["version"],
+        "actor",
+        builder,
+        complete=True,
+    )
+    accepted = await planning.set_mode(
+        env.tenant,
+        session["session_id"],
+        "execute",
+        saved["version"],
+        "actor",
+        builder,
+        plan_revision=1,
+    )
+    root = await WorkflowExecutionStore(env.writer).admit(
+        Principal("actor", env.tenant, "operator", "test"),
+        session["session_id"],
+        accepted["version"],
+        accepted["accepted_hash"],
+        "large-test",
+        builder,
+        settings,
+        scanned_hash=accepted["accepted_hash"],
+    )
+    # This test attests bounded persistence, not ATR or real-model quality.
+    assert 350000 < len(json.dumps(root, ensure_ascii=False).encode()) < 2097152
+    await worker.drain(env.runtime, env.store)
+    record = await env.store.get_record(env.tenant, "goal", root["goal_id"])
+    assert record["data"] == root and len(record["data"]["workflow"]["compiled"]["nodes"]) == 32
+
+
+async def test_versioned_workflow_goal_namespace_projects_and_backfills_as_same_goal_family(
+    projection,
+):
+    from app.core.goal_protocol import goal_key
+
+    env = projection
+    resource = "wfv1-" + str(uuid4())
+    key = goal_key(env.tenant, resource)
+    value = {
+        "tenant_id": env.tenant,
+        "goal_id": resource,
+        "status": "completed",
+        "workflow_protocol": 1,
+    }
+    await env.writer._client.set(key, json.dumps(value))
+    await worker.drain(env.runtime, env.store)
+    record = await env.store.get_record(env.tenant, "goal", resource)
+    assert record["data"] == value
+    # Backfill uses the same allowlist and must neither omit nor rename v1 Goals.
+    report = await worker.backfill(env.runtime, env.store)
+    assert report["status"] == "backfilled"
+    assert (await env.store.get_record(env.tenant, "goal", resource))["data"] == value
+
+
 async def test_safety_journal_projects_public_evidence_but_not_secret_or_private_digest(projection):
     env = projection
     scan = ThreatScan(

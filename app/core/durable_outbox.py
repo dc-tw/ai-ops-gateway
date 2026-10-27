@@ -58,7 +58,7 @@ local function family(key)
   end
   if identifier(string.match(suffix, '^automation:([^:]+):events$'), 128) then return 'events' end
   for _, prefix in ipairs({'agents:record:', 'skills:record:', 'planning:session:',
-    'agent:goal:', 'agent:run:', 'security:threat-finding:', 'automation:'}) do
+    'agent:goal:', 'workflow:v1:goal:', 'agent:run:', 'security:threat-finding:', 'automation:'}) do
     if string.sub(suffix, 1, #prefix) == prefix
       and identifier(string.sub(suffix, #prefix+1), 128) then return 'record' end
   end

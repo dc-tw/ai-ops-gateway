@@ -13,6 +13,7 @@ from langgraph.types import Command
 from app.core.checkpoint_bootstrap import open_checkpointer
 from app.core.config import get_settings
 from app.core.goal_execution import GoalExecutionStore
+from app.core.goal_protocol import QUEUES, is_workflow_id, require_goal_protocol
 from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.safety_journal import graph_journal
@@ -102,6 +103,21 @@ async def execute_goal(
 
     settings = settings or get_settings()
     existing = await runtime.get_goal(goal_id, tenant_id)
+    if existing and (
+        is_workflow_id(goal_id) or existing.get("workflow") or existing.get("workflow_node")
+    ):
+        try:
+            require_goal_protocol(existing)
+        except ValueError:
+            if existing.get("workflow"):
+                from app.core.workflow_execution import WorkflowExecutionStore
+
+                await WorkflowExecutionStore(runtime).quarantine(tenant_id, goal_id)
+            elif existing.get("status") not in {"completed", "failed", "cancelled"}:
+                await GoalExecutionStore(runtime).control(
+                    tenant_id, goal_id, "cancel", "system:protocol"
+                )
+            return
     if existing and existing.get("workflow"):
         from app.core.workflow_execution import WorkflowExecutionStore
 
@@ -130,7 +146,13 @@ async def execute_goal(
 
     async def on_usage(usage):
         await require_enabled_agent()
-        await store.reserve_budget(goal, owner, settings.tenant_daily_token_budget, usage=usage)
+        await store.reserve_budget(
+            goal,
+            owner,
+            settings.tenant_daily_token_budget,
+            usage=usage,
+            current_acl=settings.resource_acl_enabled,
+        )
         goal["usage"] = dict(usage)
         await save()
 
@@ -155,6 +177,12 @@ async def execute_goal(
             parent = await runtime.get_goal(goal["parent_goal_id"], tenant_id)
             if not parent or parent["status"] in {"completed", "failed", "cancelled", "cancelling"}:
                 raise PermissionError("Chief task is no longer active")
+            if goal.get("workflow_node"):
+                from app.core.workflow_execution import guard_workflow_access
+
+                await guard_workflow_access(
+                    runtime, parent, goal, current_acl=settings.resource_acl_enabled
+                )
 
     async def record_scan_event(event):
         await record_threat_findings(
@@ -440,7 +468,12 @@ async def execute_goal(
             await store.finish(goal, owner, {"type": "goal_capacity_wait"})
             return
         goal.pop("execution_waiting_capacity", None)
-        await store.reserve_budget(goal, owner, settings.tenant_daily_token_budget)
+        await store.reserve_budget(
+            goal,
+            owner,
+            settings.tenant_daily_token_budget,
+            current_acl=settings.resource_acl_enabled,
+        )
         heartbeat = asyncio.create_task(keep_alive())
         model = BudgetedModel(
             router.get(goal["model"]),
@@ -458,6 +491,7 @@ async def execute_goal(
             tenant_id=tenant_id,
             goal_id=goal_id,
             execution_owner=owner,
+            current_acl=settings.resource_acl_enabled,
         )
         total_deadline = min(
             3_600, float(goal.get("step_deadline_seconds", 300)) * max(1, len(goal["steps"]) or 10)
@@ -556,13 +590,17 @@ async def main() -> None:
     if settings.langgraph_checkpointing:
         checkpointer = await open_checkpointer(runtime, settings)
     await recover_goals(runtime)
+    queue_index = 0
     try:
         while True:
+            queue = QUEUES[queue_index % len(QUEUES)]
+            queue_index += 1
             claimed = await runtime.claim_goal(
                 group=settings.goal_consumer_group,
                 consumer=consumer,
                 block_seconds=max(1, int(settings.goal_worker_poll_seconds)),
                 lease_ms=settings.goal_lease_ms,
+                queue=queue,
             )
             if claimed:
                 event_id, tenant_id, goal_id = claimed
@@ -591,6 +629,7 @@ async def main() -> None:
                     goal_id=goal_id,
                     tenant_id=tenant_id,
                     error=error,
+                    queue=queue,
                 )
     finally:
         if checkpointer:

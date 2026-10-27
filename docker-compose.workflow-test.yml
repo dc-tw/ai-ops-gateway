@@ -1,0 +1,70 @@
+# Isolated v1 protocol test. Legacy services use a pinned existing M3 image.
+services:
+  gateway:
+    environment:
+      WORKFLOW_ENABLED: "true"
+      WORKFLOW_EXECUTION_ENABLED: "true"
+      PII_REDACTION: "false"
+      LLM_ROUTES_JSON: '{}'
+  worker:
+    environment:
+      RESOURCE_ACL_ENABLED: "false" # Intentional drift: captured admission posture must win.
+      PII_REDACTION: "false"
+      LLM_ROUTES_JSON: '{}'
+  scheduler:
+    environment:
+      RESOURCE_ACL_ENABLED: "false"
+      PII_REDACTION: "false"
+      LLM_ROUTES_JSON: '{}'
+  legacy-gateway:
+    image: ${WORKFLOW_LEGACY_IMAGE:?Set a pinned local pre-Workflow image ID}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_MODEL: mock-model
+      LLM_API_KEY: test-only
+      RESOURCE_ACL_ENABLED: "true"
+      API_KEYS_JSON: '{"acl-admin":{"subject":"acl-admin","tenant_id":"acl-e2e","role":"admin"},"acl-bob":{"subject":"acl-bob","tenant_id":"acl-e2e","role":"operator"}}'
+    depends_on:
+      redis: {condition: service_healthy}
+      mock-llm: {condition: service_healthy}
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+  legacy-worker:
+    image: ${WORKFLOW_LEGACY_IMAGE:?Set a pinned local pre-Workflow image ID}
+    command: ["python", "-m", "app.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_MODEL: mock-model
+      LLM_API_KEY: test-only
+      GOAL_LEASE_MS: "5000"
+    healthcheck: {disable: true}
+    depends_on:
+      redis: {condition: service_healthy}
+      mock-llm: {condition: service_healthy}
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+  legacy-scheduler:
+    image: ${WORKFLOW_LEGACY_IMAGE:?Set a pinned local pre-Workflow image ID}
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_MODEL: mock-model
+      LLM_API_KEY: test-only
+      AUTOMATION_POLL_SECONDS: "0.2"
+    healthcheck: {disable: true}
+    depends_on:
+      redis: {condition: service_healthy}
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]

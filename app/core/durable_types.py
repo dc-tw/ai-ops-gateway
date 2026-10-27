@@ -43,6 +43,7 @@ _RECORDS = (
     ("planning_session", re.compile(rf"^planning:session:({_ID})$")),
     ("planning_revision", re.compile(rf"^planning:revision:({_ID}:[1-9][0-9]*)$")),
     ("goal", re.compile(rf"^agent:goal:({_ID})$")),
+    ("goal", re.compile(rf"^workflow:v1:goal:({_ID})$")),
     ("run", re.compile(rf"^agent:run:({_ID})$")),
     ("finding", re.compile(rf"^security:threat-finding:({_ID})$")),
     ("automation", re.compile(rf"^automation:({_ID})$")),

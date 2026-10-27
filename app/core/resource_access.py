@@ -69,6 +69,10 @@ def actor_index(tenant, actor):
 
 def resource_keys(tenant, kind, resource_id):
     """Live existence only; archived copies never authorize legacy adoption."""
+    if kind == "goal":
+        from app.core.goal_protocol import goal_key
+
+        return [goal_key(tenant, resource_id)]
     suffixes = {
         "agent": "agents:record",
         "skill": "skills:record",

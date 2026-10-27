@@ -193,6 +193,7 @@ class PolicyToolExecutor:
         tenant_id: str = "default",
         goal_id: str = "",
         execution_owner: str | None = None,
+        current_acl: bool = False,
     ) -> None:
         self.executor = executor
         self.allowed = frozenset(policy.get("allowed_tools", [s.name for s in executor.specs()]))
@@ -203,6 +204,7 @@ class PolicyToolExecutor:
         self.tenant_id = tenant_id
         self.goal_id = goal_id
         self.execution_owner = execution_owner
+        self.current_acl = current_acl
         self.sessions: dict[str, str] = {}
 
     def specs(self) -> list[ToolSpec]:
@@ -283,6 +285,12 @@ class PolicyToolExecutor:
                 "cancelling",
             }:
                 raise PermissionError("Chief task is no longer active")
+            if goal.get("workflow_node"):
+                from app.core.workflow_execution import guard_workflow_access
+
+                await guard_workflow_access(
+                    self.runtime, parent, goal, current_acl=self.current_acl
+                )
 
     async def invoke_action(
         self, name: str, arguments: dict[str, Any], action_id: str
@@ -307,17 +315,15 @@ class PolicyToolExecutor:
         while True:
             async with self.runtime._client.pipeline(transaction=True) as pipe:
                 try:
-                    goal_key = self.runtime._tenant_key(
-                        self.tenant_id, f"agent:goal:{self.goal_id}"
-                    )
+                    from app.core.goal_protocol import goal_key as protocol_goal_key
+
+                    goal_key = protocol_goal_key(self.tenant_id, self.goal_id)
                     await pipe.watch(goal_key, key, index)
                     current = json.loads(await pipe.get(goal_key) or "null")
                     if current:
                         if current.get("parent_goal_id"):
                             await pipe.watch(
-                                self.runtime._tenant_key(
-                                    self.tenant_id, f"agent:goal:{current['parent_goal_id']}"
-                                )
+                                protocol_goal_key(self.tenant_id, current["parent_goal_id"])
                             )
                         if current.get("agent_id"):
                             await pipe.watch(
@@ -326,6 +332,23 @@ class PolicyToolExecutor:
                                 )
                             )
                         await guard_goal_skills(self.runtime, current, client=pipe, watch=True)
+                        if current.get("workflow_node"):
+                            from app.core.workflow_execution import guard_workflow_access
+
+                            parent_raw = await pipe.get(
+                                protocol_goal_key(self.tenant_id, current["parent_goal_id"])
+                            )
+                            parent = json.loads(parent_raw or "null")
+                            if not parent:
+                                raise PermissionError("Workflow parent is unavailable")
+                            await guard_workflow_access(
+                                self.runtime,
+                                parent,
+                                current,
+                                client=pipe,
+                                watch=True,
+                                current_acl=self.current_acl,
+                            )
                     await self._check_owner()
                     if await pipe.exists(key):
                         raise ToolReconciliationRequired(

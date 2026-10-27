@@ -1,9 +1,9 @@
-# Plan v2、Workflow YAML 與明確執行（M4 進行中）
+# Plan v2、Workflow YAML 與明確執行
 
 已接上規劃、不可變編譯產物、明確 admission 與 Redis 持久化 controller。
 保存、編譯及切換 `mode=execute` 都不建立 Goal、不呼叫模型、不保留 token 額度。
-只有明確的 `POST .../execute` 才建立執行工作。Docker 多副本／程序故障 E2E 與最終 review
-仍在 M4 待辦；本機 Redis／實際 LangGraph 路徑測試不取代整合驗收。
+只有明確的 `POST .../execute` 才建立執行工作。已有本機完整回歸、實際 Redis checkpoint／
+LangGraph 與雙 worker Docker／SIGKILL／Postgres E2E；正式部署、壓測與 PITR 仍屬 M9。
 
 ## 啟用與界線
 
@@ -23,9 +23,26 @@ WORKFLOW_MAX_PARALLELISM=4
 純 readiness 與 Redis 跨 Goal Agent lease 都限制同 Agent 同時一個執行節點。
 租戶 execution slot 額滿時持久化等待，不把正常競爭誤判為節點失敗。
 兩個 flag 獨立且預設關閉；execution gate 關閉只拒絕新 admission，既有任務仍受管理與結算。
-目前尚未驗收新舊服務混跑；啟用前須將 Gateway／worker／scheduler 全部升級並保持安全設定一致。
-協定／命名空間隔離與設定漂移防護仍在 M4 待補，不可視為已可直接滾動上線的版本。
+Workflow v1 使用 `wfv1-` ID、`workflow:v1:queue`、獨立的 runtime record／index namespace。
+沒有舊資料鍵 fallback；不認得協定的舊 worker／API 不會把它當成普通 Goal 執行或控制。
+新 worker 交替處理普通與 Workflow queue；重送、恢復、核准都回到對應 queue。
+入場時啟用的 ACL posture 保存在 root，後續副本只能收緊、不能用較鬆本機設定將它降級。
+模型呼叫與寫入 receipt CAS 都重查這份治理及當前 ACL，並保留 epoch／scope 的即時檢查。
 不可循環、遞迴派工或使用快照未核可的 Agent。Chief 只可當無工具權限的 synthesis 節點。
+
+## 升級與降版界線
+
+- 先升級公開的 mutating API／controller／history projector，保持 execution gate 關閉，
+  對帳／驗證完再啟用。不要將任意更舊版本稱為受支援的混版。
+- 已驗證不認得 Workflow 的 M3 版本能處理普通工作，卻看不到／取消不了 v1 新工作。
+  這不代表舊 executor 會遵守新 Agent lease；涉及同 Agent 的舊任務須先排空，
+  或將所有 Agent executor 更新後才承諾跨 Goal 的嚴格併發限制。
+- 降版先關 admission，保留 v1-capable worker／scheduler 排空新工作，確認 quota／receipt 結算。
+  不可把 v1 工作搬進 legacy queue／record namespace 強迫舊程式處理；普通 Goal 的舊 key／hash 不變。
+- `430b618` 的未發布 prototype（普通 UUID、未帶協定）不自動升格；新執行器會拒絕／隔離。
+  若本機曾啟用它，先停止舊執行器、完成人工查核／取消，再用新 session 明確建立 v1 工作。
+- M5 仍待提供跨副本 route／deployment／profile 的版本 publication；目前安全 route fingerprint
+  不代表已查明實際模型 weights／tokenizer 版本，亦不自動升級已在跑的工作。
 
 ## API
 
@@ -135,6 +152,9 @@ root 只保存節點狀態及子 Goal 參照，不複製各節點完整輸出；
 - 保存計畫的 ATR／content policy 包含 query、URL、schema、condition 與 default 的文字，
   保留 literal newline，超限不截斷。唯讀預覽不產生自動化觸發事件。
 - `scripts/verify_workflow_compiler.py` 可在無網路 Docker／Python 3.12 執行，
-  驗證編譯、中文 YAML、schema、惡意 regex 終止與後續復原；不代表 DAG dispatch E2E 已完成。
+  驗證編譯、中文 YAML、schema、惡意 regex 終止與後續復原。
+- `sh scripts/test_workflow_runtime_stack.sh` 另驗證真實 HTTP、兩個新 worker、舊版服務並存、
+  typed join、SIGKILL、duplicate delivery、ACL posture 與歷史對帳；會清理專用容器／volumes。
+  舊版 fixture 由固定 Git commit 重建，不依賴某個可變 tag 恰好還在本機。
 
 本段不是正式部署／模型品質／壓測／PITR 驗收，進度見 [roadmap](implementation-roadmap.md)。

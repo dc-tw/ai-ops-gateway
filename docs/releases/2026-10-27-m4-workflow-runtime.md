@@ -89,6 +89,9 @@ git diff --check
 
 ## 未完成，必須接續
 
+以下是本段 `430b618` 當時的待辦紀錄；後續 namespace／ACL posture／Docker／故障矩陣／大型投影
+已於 [M4 收尾紀錄](2026-10-27-m4-protocol-e2e.md) 補齊，不刪除中間限制來掩蓋實作過程。
+
 - Docker 真實 HTTP／worker／scheduler，多副本以及程序中斷、重新啟動、queue redelivery E2E。
 - 滾動升級／降版隔離尚未驗證：目前 workflow 仍沿用 Goal queue／record namespace。
   **不得在新舊 worker／scheduler／API 混跑時開啟 admission**。接續需要協定／佇列與資料命名空間

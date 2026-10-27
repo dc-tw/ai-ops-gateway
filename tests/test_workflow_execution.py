@@ -8,9 +8,271 @@ import test_planning_api as planning_fixtures
 from test_planning_api import path, save, session
 
 from app.core.goal_execution import GoalExecutionStore
+from app.core.goal_protocol import LEGACY_QUEUE, WORKFLOW_QUEUE, goal_key
 from app.core.workflow_execution import WorkflowExecutionStore, node_id
 
 planning_environment = planning_fixtures.environment
+
+
+async def test_tenant_capacity_wait_preserves_node_and_requeues_only_its_protocol(environment):
+    env = environment
+    env.settings.tenant_max_concurrent_runs = 1
+    saved, _ = await accepted(env)
+    value = await root(env, saved)
+    await WorkflowExecutionStore(env.runtime).reconcile(env.tenant, value["goal_id"], env.settings)
+    a = await child(env, value, "a")
+    assert await env.runtime.acquire_run_slot(env.tenant, "synthetic-existing", 1)
+
+    class NoModel(Router):
+        def get(self, selection):
+            raise AssertionError("Capacity waiting must not instantiate a model")
+
+    await run_node(env, a, NoModel(ReportModel()))
+    waiting = await child(env, value, "a")
+    assert waiting["status"] == "queued" and waiting["execution_waiting_capacity"]
+    assert waiting["agent_admitted"] and not waiting.get("usage")
+    await env.runtime.release_run_slot(env.tenant, "synthetic-existing")
+    await GoalExecutionStore(env.runtime).recover_expired()
+    await run_node(env, waiting, Router(ReportModel()))
+    assert (await child(env, value, "a"))["status"] == "completed"
+    assert (await env.runtime.get_goal(value["goal_id"], env.tenant))["status"] == "completed"
+    legacy = await env.runtime._client.xrange(LEGACY_QUEUE)
+    assert not any(fields.get("tenant_id") == env.tenant for _, fields in legacy)
+
+
+@pytest.mark.parametrize("interrupted_action", ["pause", "resume"])
+async def test_controller_pause_resume_intent_survives_failure_after_root_cas(
+    environment, monkeypatch, interrupted_action
+):
+    env = environment
+    saved, _ = await accepted(env)
+    value = await root(env, saved)
+    controller = WorkflowExecutionStore(env.runtime)
+    await controller.reconcile(env.tenant, value["goal_id"], env.settings)
+    execution = GoalExecutionStore(env.runtime)
+    await execution.control(env.tenant, value["goal_id"], "pause", "operator")
+    if interrupted_action == "resume":
+        await controller.reconcile(env.tenant, value["goal_id"], env.settings)
+        await controller.reconcile(env.tenant, value["goal_id"], env.settings)
+        await execution.control(env.tenant, value["goal_id"], "resume", "operator")
+    original = GoalExecutionStore.control
+
+    async def interrupted(self, tenant, goal_id, action, subject):
+        if goal_id != value["goal_id"] and action == interrupted_action:
+            raise RuntimeError("synthetic process exit after root CAS")
+        return await original(self, tenant, goal_id, action, subject)
+
+    monkeypatch.setattr(GoalExecutionStore, "control", interrupted)
+    with pytest.raises(RuntimeError, match="synthetic process exit"):
+        await controller.reconcile(env.tenant, value["goal_id"], env.settings)
+    monkeypatch.setattr(GoalExecutionStore, "control", original)
+    for _ in range(2):
+        await WorkflowExecutionStore(env.runtime).reconcile(
+            env.tenant, value["goal_id"], env.settings
+        )
+    assert (await child(env, value, "a"))["status"] == (
+        "paused" if interrupted_action == "pause" else "queued"
+    )
+
+
+async def test_acl_revocation_between_receipt_checks_and_multi_aborts_write_intent(
+    environment, monkeypatch
+):
+    from test_goal_execution import Writes
+
+    from app.automations import AutomationPolicy
+    from app.core.execution_policy import PolicyToolExecutor
+
+    env = environment
+    writer = await env.agent(policy=AutomationPolicy(allowed_tools=["browser_click"]).model_dump())
+    saved, _ = await accepted(env, agent=writer)
+    env.settings.resource_acl_enabled = True
+    access = f"/v1/access/agent/{writer['agent_id']}"
+    response = await env.client.put(
+        access,
+        headers={"x-api-key": "admin"},
+        json={"expected_version": 1, "grants": [{"subject": "operator", "permission": "operate"}]},
+    )
+    assert response.status_code == 200
+    value = await root(env, saved)
+    await WorkflowExecutionStore(env.runtime).reconcile(env.tenant, value["goal_id"], env.settings)
+    a = await child(env, value, "a")
+    assert await GoalExecutionStore(env.runtime).claim(
+        a["goal_id"], env.tenant, "race-owner", 60000
+    )
+    tools = Writes()
+    policy = PolicyToolExecutor(
+        tools,
+        a["policy"],
+        runtime=env.runtime,
+        tenant_id=env.tenant,
+        goal_id=a["goal_id"],
+        execution_owner="race-owner",
+    )
+    original, checks = policy._check_owner, 0
+
+    async def revoke_after_authority_read():
+        nonlocal checks
+        await original()
+        checks += 1
+        if checks == 2:
+            reply = await env.client.put(
+                access, headers={"x-api-key": "admin"}, json={"expected_version": 2, "grants": []}
+            )
+            assert reply.status_code == 200
+
+    monkeypatch.setattr(policy, "_check_owner", revoke_after_authority_read)
+    with pytest.raises(PermissionError):
+        await policy.invoke_action("browser_click", {"selector": "#one"}, "raced-action")
+    assert checks == 2 and tools.calls == []
+    assert not await env.runtime._client.exists(
+        f"tenant:{env.tenant}:goal:{a['goal_id']}:tool-receipt:raced-action"
+    )
+
+
+@pytest.mark.parametrize("bad_states", [[], None, "invalid-private-state"])
+async def test_ill_typed_workflow_states_quarantine_only_the_corrupt_root(environment, bad_states):
+    env = environment
+    saved, _ = await accepted(env)
+    value = await root(env, saved)
+    value["workflow"]["states"] = bad_states
+    await env.runtime._client.set(goal_key(env.tenant, value["goal_id"]), json.dumps(value))
+    await WorkflowExecutionStore(env.runtime).reconcile_all(env.settings)
+    result = await env.runtime.get_goal(value["goal_id"], env.tenant)
+    assert result["status"] == "failed" and result["workflow"]["phase"] == "quarantined"
+
+
+async def test_protocol_namespaces_are_invisible_to_legacy_queue_and_record_readers(environment):
+    from uuid import uuid4
+
+    env = environment
+    group = "wf-protocol-" + uuid4().hex
+    for queue in (LEGACY_QUEUE, WORKFLOW_QUEUE):
+        await env.runtime._client.xgroup_create(queue, group, id="$", mkstream=True)
+    saved, _ = await accepted(env)
+    value = await root(env, saved)
+    assert value["workflow_protocol"] == 1 and value["goal_id"].startswith("wfv1-")
+    assert (
+        await env.runtime._client.get(f"tenant:{env.tenant}:agent:goal:{value['goal_id']}") is None
+    )
+    assert value["goal_id"] not in await env.runtime._client.smembers(
+        f"tenant:{env.tenant}:agent:goals"
+    )
+    assert (
+        await env.runtime.claim_goal(
+            group=group, consumer="old", queue=LEGACY_QUEUE, block_seconds=0
+        )
+        is None
+    )
+    delivery = await env.runtime.claim_goal(
+        group=group, consumer="new", queue=WORKFLOW_QUEUE, block_seconds=0
+    )
+    assert delivery[1:] == (env.tenant, value["goal_id"])
+    await env.runtime.acknowledge_goal(
+        delivery[0],
+        group=group,
+        tenant_id=env.tenant,
+        goal_id=value["goal_id"],
+        queue=WORKFLOW_QUEUE,
+    )
+    assert (await env.runtime._client.xpending(WORKFLOW_QUEUE, group))["pending"] == 0
+    await WorkflowExecutionStore(env.runtime).reconcile(env.tenant, value["goal_id"], env.settings)
+    a = await child(env, value, "a")
+    assert a["workflow_protocol"] == 1 and a["goal_id"].startswith("wfv1-")
+    assert await env.runtime._client.get(f"tenant:{env.tenant}:agent:goal:{a['goal_id']}") is None
+
+
+async def test_protocol_missing_marker_and_unversioned_prototype_never_infer(environment):
+    from copy import deepcopy
+    from uuid import uuid4
+
+    env = environment
+    saved, _ = await accepted(env)
+    value = await root(env, saved)
+    broken = deepcopy(value)
+    broken.pop("workflow_protocol")
+    await env.runtime._client.set(goal_key(env.tenant, value["goal_id"]), json.dumps(broken))
+    await run_node(env, value, Router(ReportModel()))
+    assert (await env.runtime.get_goal(value["goal_id"], env.tenant))["workflow"][
+        "phase"
+    ] == "quarantined"
+    prototype = deepcopy(value) | {"goal_id": str(uuid4())}
+    prototype.pop("workflow_protocol")
+    await env.runtime.save_goal(prototype["goal_id"], prototype, env.tenant)
+    await run_node(env, prototype, Router(ReportModel()))
+    assert (await env.runtime.get_goal(prototype["goal_id"], env.tenant))["status"] == "failed"
+
+
+async def test_admission_acl_posture_cannot_be_downgraded_by_worker_or_scheduler(environment):
+    from test_goal_execution import Writes
+
+    from app.automations import AutomationPolicy
+    from app.core.execution_policy import PolicyToolExecutor
+
+    env = environment
+    writer = await env.agent(policy=AutomationPolicy(allowed_tools=["browser_click"]).model_dump())
+    saved, _ = await accepted(env, agent=writer)
+    env.settings.resource_acl_enabled = True
+    access = f"/v1/access/agent/{writer['agent_id']}"
+    granted = await env.client.put(
+        access,
+        headers={"x-api-key": "admin"},
+        json={"expected_version": 1, "grants": [{"subject": "operator", "permission": "operate"}]},
+    )
+    assert granted.status_code == 200, granted.text
+    value = await root(env, saved)
+    assert value["workflow"]["acl_enforced"] is True
+    loose = env.settings.model_copy(update={"resource_acl_enabled": False})
+    controller = WorkflowExecutionStore(env.runtime)
+    await controller.reconcile(env.tenant, value["goal_id"], loose)
+    a = await child(env, value, "a")
+    execution = GoalExecutionStore(env.runtime)
+    active = await execution.claim(a["goal_id"], env.tenant, "acl-owner", 60000)
+    revoked = await env.client.put(
+        access, headers={"x-api-key": "admin"}, json={"expected_version": 2, "grants": []}
+    )
+    assert revoked.status_code == 200, revoked.text
+    tools = Writes()
+    policy = PolicyToolExecutor(
+        tools,
+        a["policy"],
+        runtime=env.runtime,
+        tenant_id=env.tenant,
+        goal_id=a["goal_id"],
+        execution_owner="acl-owner",
+        current_acl=False,
+    )
+    with pytest.raises(PermissionError):
+        await policy.invoke_action("browser_click", {"selector": "#one"}, "exact-action")
+    with pytest.raises(PermissionError):
+        await execution.reserve_budget(active, "acl-owner", 1000000, current_acl=False)
+    assert tools.calls == []
+    assert not await env.runtime._client.exists(
+        f"tenant:{env.tenant}:goal:{a['goal_id']}:tool-receipt:exact-action"
+    )
+    active["status"] = "queued"
+    assert await execution.finish(active, "acl-owner", {"type": "goal_queued"})
+    # Model admission also keeps the captured strict posture, even on a worker
+    # whose local ACL setting is accidentally false.
+    from app.worker import execute_goal
+
+    class NoModel(Router):
+        def get(self, selection):
+            raise AssertionError("Revoked ACL must deny before model initialization")
+
+    router = NoModel(ReportModel())
+    router.routes = env.app.state.model_router
+    await execute_goal(
+        a["goal_id"],
+        env.runtime,
+        router,
+        object(),
+        tenant_id=env.tenant,
+        settings=loose,
+        conversation_max_turns=20,
+        conversation_ttl_seconds=3600,
+    )
+    assert (await child(env, value, "a"))["error_type"] == "PermissionError"
 
 
 @pytest.fixture
@@ -25,6 +287,7 @@ async def environment(planning_environment):
         if keys:
             await env.runtime._client.delete(*keys)
         await env.runtime._client.srem("agent:goal:tenants", env.tenant)
+        await env.runtime._client.srem("workflow:v1:tenants", env.tenant)
 
 
 async def run_node(env, value, router, **kwargs):
@@ -71,10 +334,10 @@ class Router:
         return self.routes.planning_route(selection)
 
 
-async def accepted(env, *, nodes=None, edges=None, **changes):
+async def accepted(env, *, nodes=None, edges=None, agent=None, **changes):
     env.settings.workflow_enabled = True
     env.settings.workflow_execution_enabled = True
-    configured = await env.agent()
+    configured = agent or await env.agent()
     fresh = await session(env, configured)
     draft = {
         "schema_version": 2,
@@ -154,7 +417,7 @@ async def test_admission_is_explicit_atomic_and_concurrent_retries_return_one_go
         int(await env.runtime._client.get(f"tenant:{env.tenant}:quota:tokens:{quota['day']}"))
         == 20000
     )
-    queue = await env.runtime._client.xrange("agent:goal:queue")
+    queue = await env.runtime._client.xrange(WORKFLOW_QUEUE)
     assert len([fields for _, fields in queue if fields.get("tenant_id") == env.tenant]) == 1
     assert (await admit(env, saved, accepted_hash="f" * 64)).status_code == 409
     assert (await admit(env, saved, key="different-attempt")).status_code == 409
@@ -178,7 +441,7 @@ async def test_admission_stale_epoch_atr_quota_and_wrongtype_leave_no_partial_go
     assert await env.runtime.list_goal_ids(env.tenant) == []
     changed["version"] -= 1
     await env.runtime._client.set(key, json.dumps(changed))
-    index = f"tenant:{env.tenant}:agent:goals"
+    index = f"tenant:{env.tenant}:workflow:v1:goals"
     await env.runtime._client.set(index, "WRONGTYPE")
     assert (await admit(env, saved)).status_code == 503
     deterministic = WorkflowExecutionStore.root_id(env.tenant, saved["session_id"], "attempt-1")
@@ -233,7 +496,7 @@ async def test_controller_replicas_enqueue_each_node_once_and_reconcile_shared_b
         int(await env.runtime._client.get(f"tenant:{env.tenant}:quota:tokens:{reservation['day']}"))
         == 304
     )
-    queue = await env.runtime._client.xrange("agent:goal:queue")
+    queue = await env.runtime._client.xrange(WORKFLOW_QUEUE)
     ids = [fields["goal_id"] for _, fields in queue if fields.get("tenant_id") == env.tenant]
     assert len(ids) == len(set(ids)) == 3
 
@@ -675,13 +938,11 @@ async def test_receipt_replay_revalidates_compiled_integrity_without_reenqueue(e
     saved, _ = await accepted(env)
     value = await root(env, saved)
     value["workflow"]["compiled"]["nodes"][0]["query"] = "PRIVATE_CORRUPT_COMPILED"
-    await env.runtime._client.set(
-        f"tenant:{env.tenant}:agent:goal:{value['goal_id']}", json.dumps(value)
-    )
+    await env.runtime._client.set(goal_key(env.tenant, value["goal_id"]), json.dumps(value))
     response = await admit(env, saved)
     assert response.status_code == 409
     assert "PRIVATE_CORRUPT_COMPILED" not in response.text
-    queue = await env.runtime._client.xrange("agent:goal:queue")
+    queue = await env.runtime._client.xrange(WORKFLOW_QUEUE)
     assert len([fields for _, fields in queue if fields.get("tenant_id") == env.tenant]) == 1
     healthy_saved, _ = await accepted(env)
     healthy = await root(env, healthy_saved)

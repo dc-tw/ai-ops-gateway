@@ -552,7 +552,9 @@ class PlanningStore:
                             )
                     elif session.get("active_goal_id"):
                         goal_id = session["active_goal_id"]
-                        goal_key = self.runtime._tenant_key(tenant, f"agent:goal:{goal_id}")
+                        from app.core.goal_protocol import goal_key as protocol_goal_key
+
+                        goal_key = protocol_goal_key(tenant, goal_id)
                         await pipe.watch(goal_key)
                         raw = await pipe.get(goal_key)
                         goal = _decode(raw) if raw else None
