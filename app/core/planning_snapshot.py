@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from app.automations import AutomationPolicy
 from app.core.security import TENANT_PATTERN
+from app.core.skill_selection import SkillSelectionRule, selection_candidates
 from app.core.skill_store import SkillBinding, resolve_skill_bindings
 
 _CONFIG_FIELDS = ("schema_version", "tenant_id", "agent_id", "root_agent", "workers")
@@ -46,6 +47,8 @@ class _StoredAgent(BaseModel):
     version: StrictInt = Field(ge=1)
     delegate_agent_ids: list[str] = Field(default_factory=list, max_length=8)
     skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
+    planning_skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
+    skill_selection_rules: list[SkillSelectionRule] = Field(default_factory=list, max_length=8)
 
 
 def _decode_agent(raw: Any, tenant: str, agent_id: str, *, root: bool = False) -> _StoredAgent:
@@ -71,6 +74,8 @@ def _decode_agent(raw: Any, tenant: str, agent_id: str, *, root: bool = False) -
         or (agent.role == "worker" and delegates)
         or (agent.role == "chief" and agent.policy.allowed_tools)
         or len({binding.skill_id for binding in agent.skills}) != len(agent.skills)
+        or len({binding.skill_id for binding in agent.planning_skills})
+        != len(agent.planning_skills)
     ):
         raise PlanningSnapshotInvalid(_UNAVAILABLE)
     return agent
@@ -105,6 +110,10 @@ async def _snapshot_agent(
     runtime: Any, router: Any, tenant: str, agent: _StoredAgent, client: Any, watch: bool
 ) -> dict[str, Any]:
     value = agent.model_dump(mode="json", exclude={"enabled"})
+    if not agent.skill_selection_rules:
+        value.pop("skill_selection_rules", None)
+    if not agent.planning_skills:
+        value.pop("planning_skills", None)  # Existing v1 planning fingerprints stay unchanged.
     value["persona_sha256"] = hashlib.sha256(agent.persona.encode("utf-8")).hexdigest()
     value["model_route"] = _safe_route(router, agent.model)
     value["skill_snapshots"] = await resolve_skill_bindings(
@@ -116,6 +125,22 @@ async def _snapshot_agent(
         client=client,
         watch=watch,
     )
+    if agent.planning_skills:
+        value["planning_skill_snapshots"] = await resolve_skill_bindings(
+            runtime,
+            tenant,
+            value["planning_skills"],
+            value["policy"],
+            agent.role,
+            client=client,
+            watch=watch,
+            mode="plan",
+        )
+    if agent.skill_selection_rules:
+        candidates = selection_candidates(value["skills"], value["skill_selection_rules"])
+        value["skill_selection_candidates"] = await resolve_skill_bindings(
+            runtime, tenant, candidates, value["policy"], agent.role, client=client, watch=watch
+        )
     return value
 
 

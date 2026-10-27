@@ -147,6 +147,20 @@ local function check_skills(goal)
       return false, 'invalid_binding', refs
     end
     seen[snapshot.skill_id] = true
+    if snapshot.schema_version == 2 then
+      local executable = false
+      if type(snapshot.execution_modes) ~= 'table' then
+        return false, 'invalid_mode', refs
+      end
+      for _, mode in ipairs(snapshot.execution_modes) do
+        if mode == 'execute' then executable = true end
+      end
+      if not executable or snapshot.name == 'plan-forecast' then
+        return false, 'invalid_mode', refs
+      end
+    elseif snapshot.schema_version ~= nil and snapshot.schema_version ~= 1 then
+      return false, 'invalid_snapshot', refs
+    end
     table.insert(refs, {skill_id=snapshot.skill_id, revision=snapshot.revision,
       content_sha256=snapshot.content_sha256, revocation_epoch=snapshot.revocation_epoch})
     local skill = decode_record(ARGV[7] .. 'skills:record:' .. snapshot.skill_id)

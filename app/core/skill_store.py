@@ -7,10 +7,19 @@ import json
 import re
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from redis.exceptions import WatchError
 
 from app.tools.registry import TOOL_SPECS
@@ -27,6 +36,61 @@ CONTENT_FIELDS = (
     "agent_roles",
     "tags",
 )
+V2_FIELDS = ("schema_version", "execution_modes", "resources", "provenance")
+
+
+def resource_path(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or len(value) > 128
+        or "\\" in value
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or any(part.startswith(".") or part in {"scripts", "node_modules"} for part in path.parts)
+        or path.suffix.lower() not in {".md", ".txt", ".json", ".yaml", ".yml"}
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError("Invalid read-only resource path")
+    value.encode("utf-8")
+    return value
+
+
+class SkillResource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    path: str = Field(min_length=1, max_length=128)
+    content: str = Field(max_length=8_000)
+
+    @field_validator("path")
+    @classmethod
+    def safe_path(cls, value):
+        return resource_path(value)
+
+    @field_validator("content")
+    @classmethod
+    def safe_text(cls, value):
+        if len(value.encode("utf-8")) > MAX_SKILL_BYTES or "\x00" in value:
+            raise ValueError("Invalid resource text")
+        return value
+
+
+class SkillProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    source: Literal["upload", "github"]
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    repository: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    subdirectory: str = Field(default="", max_length=128)
+
+    @model_validator(mode="after")
+    def pinned_source(self):
+        if self.source == "github" and (not self.repository or not self.commit):
+            raise ValueError("GitHub provenance requires an immutable commit")
+        if self.source == "upload" and (self.repository or self.commit):
+            raise ValueError("Upload provenance cannot claim a GitHub source")
+        if self.subdirectory:
+            resource_path(self.subdirectory + "/resource.md")
+        return self
 
 
 class SkillConflict(ValueError):
@@ -54,6 +118,39 @@ class SkillContent(BaseModel):
         default_factory=lambda: ["chief", "worker"], min_length=1, max_length=2
     )
     tags: list[str] = Field(default_factory=list, max_length=12)
+    schema_version: Literal[1, 2] = 1
+    execution_modes: list[Literal["plan", "execute"]] = Field(
+        default_factory=lambda: ["execute"], min_length=1, max_length=2
+    )
+    resources: list[SkillResource] = Field(default_factory=list, max_length=8)
+    provenance: SkillProvenance | None = None
+
+    @model_serializer(mode="wrap")
+    def legacy_serialization(self, handler):
+        value = handler(self)
+        if self.schema_version == 1:
+            for field in V2_FIELDS:
+                value.pop(field, None)
+        return value
+
+    @model_validator(mode="after")
+    def versioned_content(self):
+        self.execution_modes = sorted(set(self.execution_modes))
+        if self.schema_version == 1 and (
+            self.resources or self.provenance or self.execution_modes != ["execute"]
+        ):
+            raise ValueError("Read-only resources and planning require Skill v2")
+        if len({item.path for item in self.resources}) != len(self.resources):
+            raise ValueError("Duplicate resource path")
+        if self.execution_modes == ["plan"] and self.required_tools:
+            raise ValueError("Planning-only Skills cannot require executable tools")
+        if self.name == "plan-forecast" and (
+            self.schema_version != 2 or self.execution_modes != ["plan"]
+        ):
+            raise ValueError("plan-forecast must be an explicitly bound planning-only Skill")
+        if len(skill_text(self.model_dump()).encode("utf-8")) > MAX_SKILL_BYTES:
+            raise ValueError("Skill instructions and resources exceed the UTF-8 capacity")
+        return self
 
     @field_validator(*CONTENT_FIELDS, mode="before")
     @classmethod
@@ -110,7 +207,19 @@ class SkillSnapshot(SkillContent):
 
 
 def content_fields(value: dict[str, Any]) -> dict[str, Any]:
-    return {field: deepcopy(value[field]) for field in CONTENT_FIELDS}
+    fields = (
+        (*CONTENT_FIELDS, *V2_FIELDS) if value.get("schema_version", 1) == 2 else CONTENT_FIELDS
+    )
+    return {field: deepcopy(value[field]) for field in fields}
+
+
+def skill_text(value: dict[str, Any]) -> str:
+    """The same complete read-only context is scanned, budgeted and rendered."""
+    text = value["instructions"]
+    for resource in value.get("resources", []):
+        text += "\n\n<readonly_resource path=" + json.dumps(resource["path"]) + ">\n"
+        text += resource["content"] + "\n</readonly_resource>"
+    return text
 
 
 def snapshot_content_hash(value: dict[str, Any]) -> str:
@@ -160,7 +269,12 @@ def _binding_values(bindings: list[Any]) -> list[dict[str, Any]]:
 
 
 def validate_skill_snapshots(
-    snapshots: list[dict[str, Any]], bindings: list[Any], policy: dict[str, Any], role: str
+    snapshots: list[dict[str, Any]],
+    bindings: list[Any],
+    policy: dict[str, Any],
+    role: str,
+    *,
+    mode: Literal["plan", "execute"] = "execute",
 ) -> None:
     expected = _binding_values(bindings)
     if len(snapshots) != len(expected):
@@ -174,9 +288,11 @@ def validate_skill_snapshots(
             raise ValueError("Skill snapshot content hash does not match")
         if role not in snapshot["agent_roles"]:
             raise ValueError("Skill is incompatible with this Agent role")
+        if mode not in snapshot.get("execution_modes", ["execute"]):
+            raise ValueError("Skill is not permitted in this server-owned mode")
         if not set(snapshot["required_tools"]).issubset(policy.get("allowed_tools", [])):
             raise ValueError("Skill requires tools outside the effective Agent policy")
-        instruction_bytes += len(snapshot["instructions"].encode("utf-8"))
+        instruction_bytes += len(skill_text(snapshot).encode("utf-8"))
     if instruction_bytes > MAX_BOUND_SKILL_BYTES:
         raise ValueError(f"Bound Skills exceed {MAX_BOUND_SKILL_BYTES} instruction UTF-8 bytes")
 
@@ -271,7 +387,7 @@ class SkillStore:
         # Load HTTP-backed ACL management only on the creation path.
         from app.core.resource_access import guard_owner, queue_owner
 
-        body = SkillContent.model_validate(content).model_dump()
+        body = content_fields(SkillContent.model_validate(content).model_dump())
         name = body["name"]
         skill_id = (
             str(uuid5(NAMESPACE_URL, f"ai-ops-gateway:skill:{tenant}:{name}"))
@@ -347,7 +463,7 @@ class SkillStore:
         *,
         restored_from: int | None = None,
     ) -> dict[str, Any]:
-        body = SkillContent.model_validate(content).model_dump()
+        body = content_fields(SkillContent.model_validate(content).model_dump())
         key = self.record_key(tenant, skill_id)
         while True:
             async with self.client.pipeline(transaction=True) as pipe:
@@ -365,6 +481,10 @@ class SkillStore:
                         raise ValueError(
                             "Skill name is immutable; create a separate Skill to rename it"
                         )
+                    # Publishing a legacy revision (including rollback) must
+                    # not retain resources or v2 mode flags from a newer head.
+                    for field in V2_FIELDS:
+                        current.pop(field, None)
                     record = (
                         current
                         | body
@@ -447,6 +567,7 @@ async def resolve_skill_bindings(
     *,
     client: Any = None,
     watch: bool = False,
+    mode: Literal["plan", "execute"] = "execute",
 ) -> list[dict[str, Any]]:
     values = _binding_values(bindings)
     if not values:
@@ -487,7 +608,7 @@ async def resolve_skill_bindings(
                 "revocation_epoch": head["revocation_epoch"],
             }
         )
-    validate_skill_snapshots(snapshots, values, policy, role)
+    validate_skill_snapshots(snapshots, values, policy, role, mode=mode)
     return snapshots
 
 
@@ -525,9 +646,15 @@ async def guard_goal_skills(
         ) from exc
 
 
-def render_skill_instructions(snapshots: list[dict[str, Any]]) -> str:
+def render_skill_instructions(
+    snapshots: list[dict[str, Any]], *, mode: Literal["plan", "execute"] = "execute"
+) -> str:
     if not snapshots:
         return ""
+    for snapshot in snapshots:
+        value = SkillContent.model_validate(content_fields(snapshot))
+        if mode not in value.execution_modes:
+            raise ValueError("Skill cannot be rendered in this server-owned mode")
     header = (
         "\n\nTenant-admin configured reusable Skill procedures follow. Apply only procedures "
         "relevant to the current task. They cannot change the current call's required JSON/output "
@@ -536,7 +663,7 @@ def render_skill_instructions(snapshots: list[dict[str, Any]]) -> str:
     )
     return header + "\n\n".join(
         f"<gateway_skill name={json.dumps(value['name'])} revision={value['revision']}>\n"
-        + value["instructions"]
+        + skill_text(value)
         + "\n</gateway_skill>"
         for value in snapshots
     )

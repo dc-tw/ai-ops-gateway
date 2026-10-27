@@ -124,6 +124,33 @@ def put_pack(runtime, value, **head_changes):
     runtime.put(prefix + f"revision:{value['skill_id']}:{value['revision']}", value)
 
 
+async def test_planning_skill_snapshot_is_separate_pinned_and_revocation_sensitive():
+    runtime, router = MemoryRuntime(), Router()
+    body = SkillContent(
+        name="plan-forecast",
+        schema_version=2,
+        execution_modes=["plan"],
+        display_name="計畫預測",
+        description="僅規劃",
+        instructions="不啟動執行。",
+        resources=[{"path": "references/limits.md", "content": "保留未知。"}],
+    ).model_dump()
+    skill = pack(skill_id="forecast-pack", **body)
+    put_pack(runtime, skill)
+    runtime.put_agent(agent(planning_skills=[{"skill_id": "forecast-pack", "revision": 1}]))
+    result = await build_planning_snapshot(
+        runtime, router, "acme", "worker", client=runtime._client
+    )
+    root = result["root_agent"]
+    assert root["skills"] == [] and root["skill_snapshots"] == []
+    assert root["planning_skill_snapshots"][0]["resources"] == body["resources"]
+    assert root["planning_skill_snapshots"][0]["execution_modes"] == ["plan"]
+    await guard_planning_snapshot(runtime, router, "acme", result, client=runtime._client)
+    put_pack(runtime, skill, enabled=False)
+    with pytest.raises(PlanningSnapshotInvalid):
+        await guard_planning_snapshot(runtime, router, "acme", result, client=runtime._client)
+
+
 def plan(*, steps=None, assignments=None, **changes):
     return {
         "objective": "Review evidence",

@@ -133,6 +133,57 @@ def app():
     return result
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"planning_skills": [{"skill_id": "untrusted", "revision": 1}]},
+        {
+            "skill_selection_rules": [
+                {"skill_id": "untrusted", "revision": 1, "field": "objective", "values": ["test"]}
+            ]
+        },
+    ],
+)
+async def test_new_skill_management_features_are_disabled_by_default(fields):
+    application = app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+        headers={"x-api-key": "admin"},
+    ) as client:
+        response = await client.post(
+            "/v1/agents", json={"name": "bounded", "persona": "read", **fields}
+        )
+    assert response.status_code == 409 and "disabled" in response.json()["detail"]
+    assert application.state.redis.agent_store.records == {}
+
+
+async def test_selection_validation_does_not_echo_private_config_or_invalid_unicode():
+    application = app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+        headers={"x-api-key": "admin"},
+    ) as client:
+        body = {
+            "name": "test",
+            "persona": "PRIVATE-PERSONA",
+            "skill_selection_rules": [
+                {
+                    "skill_id": "test",
+                    "revision": 1,
+                    "field": "objective",
+                    "values": ["PRIVATE\ud800"],
+                }
+            ],
+        }
+        response = await client.post(
+            "/v1/agents", content=json.dumps(body), headers={"content-type": "application/json"}
+        )
+    assert response.status_code == 422 and response.json() == {"detail": "Invalid Agent request"}
+    assert "PRIVATE" not in response.text
+
+
 def test_chief_has_no_tools_and_workers_cannot_recursively_delegate():
     chief = AgentCreate(name="Chief", persona="規劃並彙整", role="chief")
     assert chief.policy.allowed_tools == []

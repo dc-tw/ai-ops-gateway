@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     oidc_tenant_claim: str = "tenant_id"
     oidc_role_claim: str = "role"
     resource_acl_enabled: bool = False
+    skill_v2_enabled: bool = False
+    skill_auto_selection_enabled: bool = False
     log_level: str = "INFO"
     otel_service_name: str = "ai-ops-gateway"
     otel_exporter_otlp_endpoint: str = ""

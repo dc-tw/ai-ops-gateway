@@ -16,7 +16,7 @@ from app.core.goal_execution import GoalExecutionStore
 from app.core.observability import observe_agent_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.safety_journal import graph_journal
-from app.core.skill_store import guard_goal_skills
+from app.core.skill_store import guard_goal_skills, skill_text
 from app.core.threat_detection import ThreatBlockedError, ThreatDetector
 from app.core.threat_feedback import record_threat_findings
 from app.graph.workflow import build_agent_graph, initial_state
@@ -172,7 +172,7 @@ async def execute_goal(
         values.extend(
             (
                 f"skill:{snapshot['skill_id']}:r{snapshot['revision']}",
-                snapshot["instructions"],
+                skill_text(snapshot),
             )
             for snapshot in (goal.get("agent_config") or {}).get("skill_snapshots", [])
         )

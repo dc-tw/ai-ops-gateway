@@ -476,3 +476,53 @@ async def test_skill_extra_keys_and_sensitive_version_errors_are_safe(environmen
     # The scoped Skill route does not replace error contracts on legacy APIs.
     legacy = await env.client.post("/v1/agent/stream", json={"query": []})
     assert legacy.status_code == 422 and isinstance(legacy.json()["detail"], list)
+
+
+async def test_v2_api_is_opt_in_scans_resources_and_exports_mode_metadata(environment):
+    env = environment
+    body = content() | {
+        "schema_version": 2,
+        "execution_modes": ["plan"],
+        "resources": [{"path": "references/evidence.md", "content": "RESOURCE-CANARY"}],
+        "provenance": None,
+    }
+    assert (await env.client.post("/v1/skills", json=body)).status_code == 409
+    env.app.state.settings.skill_v2_enabled = True
+    inspected = []
+
+    class ResourceDetector:
+        async def ascan(self, text, **kwargs):
+            from app.core.threat_detection import ThreatScan
+
+            inspected.append(text)
+            return ThreatScan(
+                kwargs["event_type"], kwargs["location"], (), "BLOCK-RESOURCE" in text
+            )
+
+    env.app.state.threat_detector = ResourceDetector()
+    bad = body | {"resources": [{"path": "refs/bad.txt", "content": "BLOCK-RESOURCE"}]}
+    assert (await env.client.post("/v1/skills", json=bad)).status_code == 403
+    assert await env.store.list(env.tenant) == []
+    created = await env.client.post("/v1/skills", json=body)
+    assert created.status_code == 200
+    skill = created.json()
+    assert skill["resources"] == body["resources"]
+    assert any("RESOURCE-CANARY" in text for text in inspected)
+    listing = (await env.client.get("/v1/skills")).json()
+    assert "RESOURCE-CANARY" not in json.dumps(listing)
+    exported = await env.client.get(f"/v1/skills/{skill['skill_id']}/export")
+    assert "RESOURCE-CANARY" in exported.text and 'gateway-execution-modes: "plan"' in exported.text
+
+
+async def test_v2_direct_api_cannot_forge_package_provenance(environment):
+    env = environment
+    env.app.state.settings.skill_v2_enabled = True
+    body = content() | {
+        "schema_version": 2,
+        "execution_modes": ["execute"],
+        "resources": [],
+        "provenance": {"source": "upload", "artifact_sha256": "a" * 64},
+    }
+    response = await env.client.post("/v1/skills", json=body)
+    assert response.status_code == 422
+    assert await env.store.list(env.tenant) == []

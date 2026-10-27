@@ -1,0 +1,5 @@
+services:
+  gateway:
+    environment:
+      SKILL_V2_ENABLED: "true"
+      SKILL_AUTO_SELECTION_ENABLED: "true"

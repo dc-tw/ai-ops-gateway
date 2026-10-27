@@ -10,8 +10,9 @@ metadata:
 
 # 計畫用量與時間預估
 
-這是 Gateway Skill 設計草案，尚未安裝或啟用。以上 metadata 是文件標記，不是目前 API
-支援的模式閘門；完整待實作契約見 [design.md](design.md)。不可直接當現有內建 Skill 匯入。
+這是 Gateway Skill 設計草案，尚未安裝或啟用 estimator。以上 metadata 是文件標記；
+M3 已提供 v2 execution_modes／planning_skills 的服務端閘門，但估算服務仍未實作。
+完整待實作契約見 [design.md](design.md)。不可直接當現有內建 Skill 匯入。
 
 ## 觸發條件
 

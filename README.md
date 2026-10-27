@@ -265,6 +265,9 @@ rollback 與 `SKILL.md` 文字匯出。Skill 是可重用的指令流程，不�
 內建十種繁中工作流程可由管理者選擇安裝；詳見[管理指南](docs/skill-management.md)與
 [內建 Skill 清單](docs/skills-catalog.md)。
 
+新增的 opt-in v2 模式／唯讀資源、獨立規劃綁定與確定性自動選擇，見
+[Skill v2 指南](docs/skills-v2.md)。完整外部套件匯入與 forecast estimator 尚未完成。
+
 ## PostgreSQL 歷史儲存
 
 可選的 owner／明確分享隔離見[資源 ACL 操作指南](docs/resource-access.md)。預設不啟用，

@@ -89,14 +89,21 @@ def test_openapi_does_not_advertise_forecasts_execution_bridge_or_skill_import()
         ("import", {"path": "/untrusted/SKILL.md"}),
     ],
 )
-def test_future_skill_and_execution_fields_are_rejected_by_live_request_schemas(
-    model, payload, field, value
-):
+def test_skill_and_execution_fields_have_explicit_schema_boundaries(model, payload, field, value):
     # Validate the baseline first, so rejection cannot be caused by missing input.
     model.model_validate(payload)
     assert model.model_json_schema()["additionalProperties"] is False
+    if model is AgentCreate and field == "planning_skills":
+        # M3 now supports this only on administrator-managed Agent config.
+        # Default-off HTTP gating and live binding checks are tested separately.
+        parsed = model.model_validate(payload | {field: value})
+        assert [item.model_dump() for item in parsed.planning_skills] == value
+        return
     with pytest.raises(ValidationError) as error:
         model.model_validate(payload | {field: value})
+    if model is SkillCreate and field == "execution_modes":
+        assert any(entry["type"] == "value_error" for entry in error.value.errors())
+        return  # v1 cannot gain planning permission by adding a modes field.
     assert any(
         entry["type"] == "extra_forbidden" and entry["loc"] == (field,)
         for entry in error.value.errors()

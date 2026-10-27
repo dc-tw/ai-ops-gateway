@@ -21,6 +21,7 @@ from app.core.skill_store import (
     SkillNotFound,
     SkillStore,
     content_fields,
+    skill_text,
 )
 from app.core.threat_detection import reject_incomplete_scan
 from app.core.threat_feedback import record_threat_findings
@@ -79,7 +80,7 @@ def _store(request: Request) -> SkillStore:
 
 
 def _summary(value: dict[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if key != "instructions"}
+    return {key: item for key, item in value.items() if key not in {"instructions", "resources"}}
 
 
 def _error(exc: ValueError) -> HTTPException:
@@ -92,7 +93,13 @@ def _error(exc: ValueError) -> HTTPException:
 async def _check_content(request: Request, tenant: str, body: dict[str, Any]) -> None:
     """Admin authors remain subject to content checks; this is not authorization."""
     settings = request.app.state.settings
-    text = "\n\n".join(body[field] for field in ("display_name", "description", "instructions"))
+    if body.get("schema_version", 1) == 2 and not settings.skill_v2_enabled:
+        raise HTTPException(status_code=409, detail="Skill v2 management is disabled")
+    if body.get("provenance") is not None:
+        raise HTTPException(
+            status_code=422, detail="Provenance requires the package import workflow"
+        )
+    text = "\n\n".join([body["display_name"], body["description"], skill_text(body)])
     if any(
         re.search(pattern, text, re.IGNORECASE) for pattern in settings.content_blocked_patterns
     ):
@@ -291,8 +298,14 @@ async def export_skill(
         + f"  gateway-revision: {quote(value['revision'])}\n"
         + f"  gateway-content-sha256: {quote(value['content_sha256'])}\n"
         + f"  gateway-required-tools: {quote(' '.join(value['required_tools']))}\n"
+        + (
+            f"  gateway-schema-version: {quote(2)}\n"
+            + f"  gateway-execution-modes: {quote(' '.join(value['execution_modes']))}\n"
+            if value.get("schema_version") == 2
+            else ""
+        )
         + "---\n\n"
-        + value["instructions"]
+        + skill_text(value)
         + "\n"
     )
     return Response(

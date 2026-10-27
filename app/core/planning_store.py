@@ -13,6 +13,8 @@ from uuid import uuid4
 
 from redis.exceptions import WatchError
 
+from app.core.skill_selection import plan_skill_selections
+
 SCHEMA_VERSION = 1
 MAX_PLAN_BYTES = 64 * 1_024
 MAX_SNAPSHOT_BYTES = 512 * 1_024
@@ -185,6 +187,8 @@ class PlanningStore:
             raise PlanningIntegrityError("Plan snapshot hash does not match")
         if value.get("content_sha256") != _plan_hash(plan, value["complete"], snapshot):
             raise PlanningIntegrityError("Plan content hash does not match")
+        if value.get("skill_selection") != plan_skill_selections(snapshot, plan):
+            raise PlanningIntegrityError("Plan Skill selection does not match its pinned inputs")
         return value
 
     async def _current_revision(
@@ -415,6 +419,9 @@ class PlanningStore:
                             "created_at": datetime.now(UTC).isoformat(),
                             "created_by": subject,
                         }
+                        selections = plan_skill_selections(snapshot, plan)
+                        if selections is not None:
+                            revision["skill_selection"] = selections
                         session.update(plan_revision=number, plan_sha256=revision["content_sha256"])
                     session.update(
                         snapshot=snapshot,

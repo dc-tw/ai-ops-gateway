@@ -91,6 +91,41 @@ async def create(env):
     return await env.store.create(env.tenant, "worker-one", "operator", env.builder)
 
 
+async def test_plan_revision_freezes_selection_and_detects_artifact_tampering(storage):
+    env = storage
+    source = configuration(env.tenant)
+    source["root_agent"].update(
+        agent_id="worker-one",
+        skills=[],
+        skill_selection_rules=[
+            {
+                "skill_id": "review",
+                "revision": 1,
+                "field": "objective",
+                "values": ["evidence"],
+                "priority": 1,
+            }
+        ],
+        skill_selection_candidates=[
+            {"skill_id": "review", "revision": 1, "content_sha256": "b" * 64, "revocation_epoch": 0}
+        ],
+    )
+    source.pop("snapshot_fingerprint")
+    source["snapshot_fingerprint"] = canonical_hash(source)
+    await env.runtime._client.set(env.source_key, json.dumps(source))
+    saved = await save(env, await create(env), content=plan(objective="review evidence"))
+    revision = await env.store.get_revision(env.tenant, saved["session_id"], 1)
+    selected = revision["skill_selection"]["agents"][0]
+    assert selected["bindings"][0]["skill_id"] == "review"
+    assert selected["selection"]["selected"][0]["source"] == "rule"
+    revision["skill_selection"]["agents"][0]["bindings"] = []
+    await env.runtime._client.set(
+        env.store.revision_key(env.tenant, saved["session_id"], 1), json.dumps(revision)
+    )
+    with pytest.raises(PlanningIntegrityError, match="selection"):
+        await env.store.get_revision(env.tenant, saved["session_id"], 1)
+
+
 async def test_new_session_registers_owner_in_creation_transaction(storage):
     from app.core.resource_access import AccessStore
     from app.core.security import Principal

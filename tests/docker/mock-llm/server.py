@@ -57,6 +57,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
         messages = request.get("messages", [])
         system = messages[0].get("content", "") if messages else ""
+        if "skills-v2-resource-required:" in system:
+            if "READONLY-RESOURCE-CANARY" not in system or "<readonly_resource path=" not in system:
+                self.send_error(400, "Pinned read-only resource was not supplied")
+                return
         required = re.findall(r"skills-e2e-required:([a-z0-9-]+)", system)
         for name in required:
             marker = f'<gateway_skill name="{name}" revision=1>'

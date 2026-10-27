@@ -10,6 +10,9 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from redis.exceptions import WatchError
 
@@ -18,9 +21,24 @@ from app.automations import AutomationPolicy, validate_goal_input
 from app.core.goal_execution import GoalExecutionStore
 from app.core.resource_access import filter_resources, guard_owner, queue_owner
 from app.core.security import authorize, redact_pii
+from app.core.skill_selection import SkillSelectionRule, select_skills, selection_candidates
 from app.core.skill_store import SkillBinding, resolve_skill_bindings, skill_refs
 
-router = APIRouter(prefix="/v1/agents", tags=["agents"])
+
+class AgentRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handle(request):
+            try:
+                return await original(request)
+            except RequestValidationError:
+                return JSONResponse(status_code=422, content={"detail": "Invalid Agent request"})
+
+        return handle
+
+
+router = APIRouter(prefix="/v1/agents", tags=["agents"], route_class=AgentRoute)
 
 
 class AgentCreate(BaseModel):
@@ -34,11 +52,16 @@ class AgentCreate(BaseModel):
     enabled: bool = True
     delegate_agent_ids: list[str] = Field(default_factory=list, max_length=8)
     skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
+    planning_skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
+    skill_selection_rules: list[SkillSelectionRule] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def finite_delegation(self) -> AgentCreate:
         if len({binding.skill_id for binding in self.skills}) != len(self.skills):
             raise ValueError("An Agent cannot bind the same Skill more than once")
+        if len({binding.skill_id for binding in self.planning_skills}) != len(self.planning_skills):
+            raise ValueError("An Agent cannot bind a planning Skill more than once")
+        selection_candidates(self.skills, self.skill_selection_rules)
         self.delegate_agent_ids = list(dict.fromkeys(self.delegate_agent_ids))
         if any(not item or len(item) > 128 for item in self.delegate_agent_ids):
             raise ValueError("Delegate Agent IDs must contain 1-128 characters")
@@ -172,15 +195,30 @@ class AgentStore:
                     rows = await pipe.mget(delegate_keys) if delegate_keys else []
                     self._check_delegates(record, rows)
                     skill_snapshots = []
-                    if record.get("skills"):
+                    candidates = selection_candidates(
+                        record.get("skills", []), record.get("skill_selection_rules", [])
+                    )
+                    if candidates:
                         skill_snapshots = await resolve_skill_bindings(
                             self.runtime,
                             tenant,
-                            record["skills"],
+                            candidates,
                             record["policy"],
                             record["role"],
                             client=pipe,
                             watch=True,
+                        )
+                    planning_snapshots = []
+                    if record.get("planning_skills"):
+                        planning_snapshots = await resolve_skill_bindings(
+                            self.runtime,
+                            tenant,
+                            record["planning_skills"],
+                            record["policy"],
+                            record["role"],
+                            client=pipe,
+                            watch=True,
+                            mode="plan",
                         )
                     audit = {
                         "action": "agent.create" if expected_version is None else "agent.update",
@@ -191,6 +229,8 @@ class AgentStore:
                         "skills": skill_refs(skill_snapshots),
                         "time": record["updated_at"],
                     }
+                    if planning_snapshots:
+                        audit["planning_skills"] = skill_refs(planning_snapshots)
                     if expected_version is None:
                         await guard_owner(pipe, tenant, "agent", agent_id, record["created_by"])
                     pipe.multi()
@@ -309,6 +349,9 @@ async def apply_agent(
             policy["approval_timeout_seconds"], int(requested_approval)
         )
     bindings = deepcopy(agent.get("skills", []))
+    selection = None
+    if agent.get("skill_selection_rules"):
+        bindings, selection = select_skills(bindings, agent["skill_selection_rules"], goal)
     try:
         skill_snapshots = (
             await resolve_skill_bindings(runtime, tenant, bindings, policy, agent["role"])
@@ -332,6 +375,8 @@ async def apply_agent(
         )
     }
     snapshot.update(skills=bindings, skill_snapshots=skill_snapshots)
+    if selection is not None:
+        snapshot["skill_selection"] = selection
     trusted_goal = deepcopy(goal)
     trusted_goal.pop("skills", None)
     trusted_goal.pop("skill_snapshots", None)
@@ -382,6 +427,13 @@ async def build_agent_goal(
 
 
 def _record(payload: AgentCreate, principal: Any, request: Request) -> dict[str, Any]:
+    if payload.planning_skills and not request.app.state.settings.skill_v2_enabled:
+        raise HTTPException(status_code=409, detail="Planning Skill management is disabled")
+    if (
+        payload.skill_selection_rules
+        and not request.app.state.settings.skill_auto_selection_enabled
+    ):
+        raise HTTPException(status_code=409, detail="Automatic Skill selection is disabled")
     model = payload.model or request.app.state.model_router.default_model
     try:
         request.app.state.model_router.get(model)
