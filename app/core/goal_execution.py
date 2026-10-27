@@ -80,6 +80,87 @@ class GoalExecutionStore:
                     mutation = change(current)
                     if mutation.goal is None:
                         return mutation.result
+                    if mutation.enqueue and mutation.goal.get("workflow_node"):
+                        parent_key = self.key(tenant, mutation.goal["workflow_node"]["root_id"])
+                        await pipe.watch(parent_key)
+                        parent = json.loads(await pipe.get(parent_key) or "null")
+                        if not parent or parent.get("status") in TERMINAL | {"cancelling"}:
+                            mutation.goal.update(
+                                status="cancelled", execution_owner=None, execution_lease_until=0
+                            )
+                            mutation.enqueue = False
+                            if mutation.goal.get("approval_decision"):
+                                mutation.goal["approval_decision"].update(
+                                    approved=False, reason="parent_stopped"
+                                )
+                            for audit in mutation.audits:
+                                audit.update(status="cancelled", reason="parent_stopped")
+                            mutation.events = [
+                                {
+                                    "type": "goal_status",
+                                    "status": "cancelled",
+                                    "reason": "parent_stopped",
+                                }
+                            ]
+                            if mutation.goal.get("approval_decision"):
+                                mutation.events.insert(
+                                    0,
+                                    {
+                                        "type": "approval_decided",
+                                        **mutation.goal["approval_decision"],
+                                    },
+                                )
+                    agent_slot = None
+                    goal = mutation.goal
+                    if goal.get("agent_config") and goal.get("agent_id"):
+                        agent_slot = f"tenant:{tenant}:agents:execution:{goal['agent_id']}"
+                        await pipe.watch(agent_slot)
+                        holder = json.loads(await pipe.get(agent_slot) or "null")
+                        owns_execution = (
+                            goal.get("status") in {"running", "pausing"}
+                            and goal.get("execution_owner")
+                            and float(goal.get("execution_lease_until", 0)) > time.time()
+                        )
+                        if (
+                            owns_execution
+                            and holder
+                            and (
+                                holder.get("goal_id") != goal_id
+                                or holder.get("owner") != goal["execution_owner"]
+                            )
+                            and float(holder.get("lease_until", 0)) > time.time()
+                        ):
+                            # A claim may wait, but a stale existing owner must
+                            # never overwrite the current Agent lease.
+                            previous = json.loads(raw) if raw else None
+                            if previous and previous.get("execution_owner") == goal.get(
+                                "execution_owner"
+                            ):
+                                return None if isinstance(mutation.result, dict) else False
+                            waiting = previous or goal
+                            waiting.update(
+                                status="queued",
+                                execution_owner=None,
+                                execution_lease_until=0,
+                                execution_waiting_agent=True,
+                            )
+                            mutation = GoalMutation(
+                                waiting, result=None, release_slot=mutation.release_slot
+                            )
+                            goal = waiting
+                            owns_execution = False
+                        slot_value = (
+                            {
+                                "goal_id": goal_id,
+                                "owner": goal["execution_owner"],
+                                "lease_until": goal["execution_lease_until"],
+                            }
+                            if owns_execution
+                            else None
+                        )
+                        delete_slot = bool(
+                            not owns_execution and holder and holder.get("goal_id") == goal_id
+                        )
                     if admission_goal is not None:
                         await guard_goal_skills(
                             self.runtime, admission_goal, client=pipe, watch=True
@@ -97,6 +178,11 @@ class GoalExecutionStore:
                                 mutation.goal.get("created_by_type", "human"),
                             )
                     pipe.multi()
+                    if agent_slot:
+                        if slot_value:
+                            pipe.set(agent_slot, json.dumps(slot_value))
+                        elif delete_slot:
+                            pipe.delete(agent_slot)
                     pipe.set(key, json.dumps(mutation.goal, ensure_ascii=False))
                     if current is None:
                         from app.core.resource_access import queue_owner
@@ -246,6 +332,7 @@ class GoalExecutionStore:
                 execution_fence=int(goal.get("execution_fence", 0)) + 1,
                 updated_at=utc_now(),
             )
+            goal.pop("execution_waiting_agent", None)
             return GoalMutation(
                 goal,
                 [{"type": "goal_status", "status": "running"}],
@@ -401,7 +488,11 @@ class GoalExecutionStore:
             elif action == "pause":
                 if status == "waiting_approval":
                     raise ValueError("Resolve or cancel the pending approval before pausing")
-                goal["status"] = "pausing" if status in {"running", "pausing"} else "paused"
+                goal["status"] = (
+                    "pausing"
+                    if goal.get("workflow") or status in {"running", "pausing"}
+                    else "paused"
+                )
             elif action == "resume":
                 if status != "paused":
                     raise ValueError("Only paused goals can be resumed")
@@ -531,6 +622,17 @@ class GoalExecutionStore:
 
                 def change(goal, goal_id=goal_id):
                     if (
+                        goal
+                        and goal.get("status") == "queued"
+                        and (
+                            goal.get("execution_waiting_agent")
+                            or goal.get("execution_waiting_capacity")
+                        )
+                    ):
+                        goal.pop("execution_waiting_agent", None)
+                        goal.pop("execution_waiting_capacity", None)
+                        return GoalMutation(goal, enqueue=True, result=True)
+                    if (
                         not goal
                         or goal.get("status") not in {"running", "pausing"}
                         or float(goal.get("execution_lease_until", 0)) > instant
@@ -593,6 +695,13 @@ class GoalExecutionStore:
         usage: dict[str, Any] | None = None,
     ) -> None:
         """Reserve the entire bounded job budget once, including approval resumes."""
+        if goal.get("workflow_node") and self.client is not None:
+            from app.core.workflow_execution import WorkflowExecutionStore
+
+            await WorkflowExecutionStore(self.runtime).reserve_node_budget(
+                goal, owner, limit, usage
+            )
+            return
         if self.client is None:
             adapter = getattr(self.runtime, "goal_execution_reserve_budget", None)
             if adapter is None:

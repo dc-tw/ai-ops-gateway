@@ -101,6 +101,12 @@ async def execute_goal(
     from app.core.execution_policy import BudgetedModel, PolicyToolExecutor
 
     settings = settings or get_settings()
+    existing = await runtime.get_goal(goal_id, tenant_id)
+    if existing and existing.get("workflow"):
+        from app.core.workflow_execution import WorkflowExecutionStore
+
+        await WorkflowExecutionStore(runtime).reconcile(tenant_id, goal_id, settings)
+        return
     store = GoalExecutionStore(runtime)
     owner = uuid4().hex
     lease_ms = settings.goal_lease_ms
@@ -129,6 +135,13 @@ async def execute_goal(
         await save()
 
     async def require_enabled_agent():
+        if goal.get("workflow_node"):
+            from app.core.planning_snapshot import _safe_route
+
+            if _safe_route(router, goal["model"]) != goal.get("agent_config", {}).get(
+                "model_route"
+            ):
+                raise PermissionError("Workflow model route differs from its accepted snapshot")
         if goal.get("agent_config"):
             from app.agents import AgentStore
 
@@ -140,7 +153,7 @@ async def execute_goal(
             await guard_goal_skills(runtime, goal)
         if goal.get("parent_goal_id"):
             parent = await runtime.get_goal(goal["parent_goal_id"], tenant_id)
-            if not parent or parent["status"] in {"completed", "failed", "cancelled"}:
+            if not parent or parent["status"] in {"completed", "failed", "cancelled", "cancelling"}:
                 raise PermissionError("Chief task is no longer active")
 
     async def record_scan_event(event):
@@ -303,6 +316,7 @@ async def execute_goal(
                     max_tool_rounds=int(goal.get("max_tool_rounds", 8)),
                     interactive_approval=checkpointer is not None,
                     require_bound_approval=True,
+                    structured_output_schema=(goal.get("workflow_node") or {}).get("output_schema"),
                 )
             )
             config = {"configurable": {"thread_id": f"{tenant_id}:{goal_id}:{step['id']}"}}
@@ -391,6 +405,12 @@ async def execute_goal(
             )
             await save({"type": "goal_step", "status": "completed", "index": index, "step": step})
 
+        if goal.get("workflow_node"):
+            from app.core.workflow_plan import node_output
+
+            goal["workflow_output"] = await asyncio.to_thread(
+                node_output, goal["workflow_node"], goal["steps"][-1]["answer"]
+            )
         await finish(
             "completed", {"type": "goal_completed", "goal": {**goal, "status": "completed"}}
         )
@@ -415,7 +435,11 @@ async def execute_goal(
             ttl_seconds=max(60, int(lease_ms / 1_000)),
         )
         if not slot_acquired:
-            raise RuntimeError("Tenant concurrent run limit exceeded")
+            goal["execution_waiting_capacity"] = True
+            goal["status"] = "queued"
+            await store.finish(goal, owner, {"type": "goal_capacity_wait"})
+            return
+        goal.pop("execution_waiting_capacity", None)
         await store.reserve_budget(goal, owner, settings.tenant_daily_token_budget)
         heartbeat = asyncio.create_task(keep_alive())
         model = BudgetedModel(
@@ -442,7 +466,9 @@ async def execute_goal(
         if remaining <= 0:
             raise TimeoutError("Goal total runtime budget exhausted")
         async with asyncio.timeout(remaining):
-            if goal.get("agent_config", {}).get("role") == "chief":
+            if goal.get("agent_config", {}).get("role") == "chief" and not goal.get(
+                "workflow_node"
+            ):
                 from app.core.chief import prepare_chief, prepare_summary
 
                 await validate_inputs()
@@ -483,9 +509,16 @@ async def execute_goal(
             await runtime.release_run_slot(tenant_id, slot_id)
         await store.reconcile_budget(goal, owner)
         if goal.get("parent_goal_id"):
-            from app.core.delegation import DelegationStore
+            if goal.get("workflow_node"):
+                from app.core.workflow_execution import WorkflowExecutionStore
 
-            await DelegationStore(runtime).requeue_parent(tenant_id, goal["parent_goal_id"])
+                await WorkflowExecutionStore(runtime).reconcile(
+                    tenant_id, goal["parent_goal_id"], settings
+                )
+            else:
+                from app.core.delegation import DelegationStore
+
+                await DelegationStore(runtime).requeue_parent(tenant_id, goal["parent_goal_id"])
 
 
 async def recover_goals(runtime: RedisRuntime) -> None:

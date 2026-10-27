@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     skill_auto_selection_enabled: bool = False
     skill_package_import_enabled: bool = False
     workflow_enabled: bool = False
+    workflow_execution_enabled: bool = False
     workflow_max_nodes: int = Field(default=32, ge=1, le=128)
     workflow_max_edges: int = Field(default=64, ge=0, le=256)
     workflow_max_parallelism: int = Field(default=4, ge=1, le=16)

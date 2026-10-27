@@ -29,3 +29,4 @@ class AgentState(TypedDict):
     usage: dict[str, float | int]
     answer: str
     last_error: NotRequired[str]
+    structured_output_schema: NotRequired[dict[str, object] | None]

@@ -1,10 +1,11 @@
 import asyncio
+import json
 import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -207,6 +208,68 @@ async def list_goals(request: Request) -> dict[str, Any]:
             goals.append(goal)
     goals.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return {"goals": await filter_resources(request, principal, "goal", goals, "goal_id")}
+
+
+@router.get("/{goal_id}/receipts")
+async def goal_receipts(
+    goal_id: str,
+    request: Request,
+    after: str = Query(default="", max_length=512),
+    limit: int = Query(default=50, ge=1, le=100),
+):
+    """Read bounded side-effect facts; never exposes arguments or grants replay."""
+    principal = await authorize(request, "viewer")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", goal_id):
+        raise HTTPException(status_code=404, detail="Goal not found")
+    runtime = _require_redis(request)
+    if await runtime.get_goal(goal_id, principal.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    prefix = runtime._tenant_key(principal.tenant_id, f"goal:{goal_id}:tool-receipt:")
+    index = runtime._tenant_key(principal.tenant_id, f"goal:{goal_id}:tool-receipts")
+    keys = await runtime._client.smembers(index)
+    if not keys:
+        # Bounded compatibility read for pre-index receipts, never a backfill.
+        async for key in runtime._client.scan_iter(prefix + "*"):
+            keys.add(key)
+            if len(keys) > 256:
+                raise HTTPException(
+                    status_code=413, detail="Legacy receipts exceed bounded listing"
+                )
+    if len(keys) > 256 or any(not key.startswith(prefix) for key in keys):
+        raise HTTPException(status_code=409, detail="Receipt index failed integrity verification")
+    candidates = sorted(key for key in keys if key[len(prefix) :] > after)
+    selected = candidates[:limit]
+    items = []
+    for key, raw in zip(
+        selected, await runtime._client.mget(selected) if selected else [], strict=True
+    ):
+        try:
+            value = json.loads(raw or "null")
+            if (
+                not isinstance(value, dict)
+                or value.get("status") not in {"started", "completed"}
+                or not isinstance(value.get("tool"), str)
+                or len(value["tool"]) > 128
+            ):
+                raise ValueError
+            items.append(
+                {
+                    "action_id": key[len(prefix) :],
+                    "tool": value.get("tool"),
+                    "status": value.get("status"),
+                    "review_required": value.get("status") != "completed",
+                }
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="Receipt failed integrity verification"
+            ) from None
+    return {
+        "goal_id": goal_id,
+        "receipts": items,
+        "automatic_replay": False,
+        "next_after": selected[-1][len(prefix) :] if len(candidates) > limit else None,
+    }
 
 
 @router.get("/{goal_id}")

@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictInt, model_validator
+from redis.exceptions import RedisError
 
 from app.core.planning_snapshot import (
     PlanningSnapshotInvalid,
@@ -112,6 +113,12 @@ class PlanSave(PlanningInput):
 class WorkflowYamlSave(PlanningInput):
     expected_version: StrictInt = Field(ge=1)
     yaml: str = Field(min_length=1, max_length=65_536)
+
+
+class WorkflowExecute(PlanningInput):
+    expected_version: StrictInt = Field(ge=1)
+    accepted_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 def _validate_plan(request, snapshot, plan):
@@ -389,6 +396,85 @@ async def get_compiled_plan(
             "execution_started": False,
             "execution_authority": False,
         }
+    except ValueError as exc:
+        raise _error(exc) from exc
+
+
+@router.post("/planning-sessions/{session_id}/execute")
+async def execute_plan(
+    payload: WorkflowExecute, request: Request, session_id: str = Path(pattern=ID_PATTERN)
+):
+    from app.core.skill_store import skill_text
+    from app.core.workflow_execution import WorkflowExecutionStore
+
+    principal = await authorize(request, "operator")
+    settings = request.app.state.settings
+    if not settings.workflow_execution_enabled:
+        raise HTTPException(status_code=409, detail="Explicit Workflow execution is disabled")
+    store = _store(request)
+    execution = WorkflowExecutionStore(store.runtime)
+    try:
+        saved = await _session(store, principal.tenant_id, session_id)
+        root_id = execution.root_id(principal.tenant_id, session_id, payload.idempotency_key)
+        existing = await store.runtime.get_goal(root_id, principal.tenant_id)
+        scanned_hash = None
+        if existing is None:
+            if saved["accepted_hash"] != payload.accepted_hash or saved["mode"] != "execute":
+                raise PlanningConflict("Accept this complete Plan before execution")
+            revision = await store.get_revision(
+                principal.tenant_id, session_id, saved["plan_revision"]
+            )
+            await _rate_limit(request, principal.tenant_id)
+            await _scan_plan(request, principal.tenant_id, session_id, revision["plan"])
+            # Governance context is also re-scanned; a prior save is not a
+            # permanent exemption from the current ATR policy.
+            agents = [revision["snapshot"]["root_agent"], *revision["snapshot"]["workers"]]
+            for agent in agents:
+                values = [agent.get("persona", "")]
+                values.extend(
+                    skill_text(item)
+                    for item in agent.get(
+                        "skill_selection_candidates", agent.get("skill_snapshots", [])
+                    )
+                )
+                for value in values:
+                    scan = await request.app.state.threat_detector.ascan(
+                        value,
+                        event_type="llm_input",
+                        location="workflow_admission_context",
+                        fields={"user_input": value},
+                    )
+                    if scan.needs_record:
+                        await record_threat_findings(
+                            store.runtime,
+                            settings,
+                            principal.tenant_id,
+                            scan.to_event(),
+                            context_id=f"planning:{session_id}",
+                            model="planning-input",
+                            emit_internal_events=False,
+                        )
+                    if scan.blocked:
+                        reject_incomplete_scan(scan)
+                        raise HTTPException(
+                            status_code=403, detail="Workflow context blocked by ATR"
+                        )
+            scanned_hash = revision["content_sha256"]
+        result = await execution.admit(
+            principal,
+            session_id,
+            payload.expected_version,
+            payload.accepted_hash,
+            payload.idempotency_key,
+            _builder(request, principal.tenant_id, saved["agent_id"]),
+            settings,
+            scanned_hash=scanned_hash,
+        )
+        return {"goal": result, "execution_started": True}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="Workflow execution is not authorized") from exc
+    except (RuntimeError, RedisError) as exc:
+        raise HTTPException(status_code=503, detail="Workflow admission unavailable") from exc
     except ValueError as exc:
         raise _error(exc) from exc
 

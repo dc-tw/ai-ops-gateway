@@ -34,11 +34,14 @@ def draft(objective="Prepare a source-based report"):
     }
 
 
-def test_openapi_advertises_package_review_but_not_forecasts_or_execution_bridge():
-    document = create_app(settings=Settings(_env_file=None)).openapi()
+def test_openapi_advertises_opt_in_execution_but_not_forecasts_or_unsupported_aliases():
+    settings = Settings(_env_file=None)
+    assert settings.workflow_execution_enabled is False
+    document = create_app(settings=settings).openapi()
     paths = document["paths"]
     assert "/v1/planning-sessions/{session_id}/mode" in paths
     assert "/v1/agents/{agent_id}/goals" in paths
+    assert "/v1/planning-sessions/{session_id}/execute" in paths
     assert "/v1/skills/{skill_id}/export" in paths
     assert "/v1/skill-imports/upload" in paths
     assert "/v1/skill-imports/github" in paths
@@ -48,7 +51,6 @@ def test_openapi_advertises_package_review_but_not_forecasts_or_execution_bridge
         assert "forecasts" not in segments
         assert "forecast" not in segments
     for unsupported in (
-        "/v1/planning-sessions/{session_id}/execute",
         "/v1/planning-sessions/{session_id}/goals",
         "/v1/planning-sessions/{session_id}/run",
         "/v1/skills/import",

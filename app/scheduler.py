@@ -187,6 +187,9 @@ async def tick(
     from app.core.delegation import DelegationStore
 
     await DelegationStore(runtime).reconcile_parents()
+    from app.core.workflow_execution import WorkflowExecutionStore
+
+    await WorkflowExecutionStore(runtime).reconcile_all(settings)
     return {"scheduled": scheduled, "flushed": flushed, "internal_events": internal}
 
 

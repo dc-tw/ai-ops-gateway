@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
+from redis.exceptions import WatchError
+
 from app.core.skill_store import guard_goal_skills, render_skill_instructions
 from app.llm.client import ModelChunk, ModelResult, OpenAICompatibleModel, validated_token_usage
 from app.tools.registry import (
@@ -274,7 +276,12 @@ class PolicyToolExecutor:
             await guard_goal_skills(self.runtime, goal)
         if goal.get("parent_goal_id"):
             parent = await self.runtime.get_goal(goal["parent_goal_id"], self.tenant_id)
-            if not parent or parent.get("status") in {"cancelled", "failed", "completed"}:
+            if not parent or parent.get("status") in {
+                "cancelled",
+                "failed",
+                "completed",
+                "cancelling",
+            }:
                 raise PermissionError("Chief task is no longer active")
 
     async def invoke_action(
@@ -293,10 +300,49 @@ class PolicyToolExecutor:
             self.tenant_id, f"goal:{self.goal_id}:tool-receipt:{action_id}"
         )
         started = json.dumps({"status": "started", "tool": name, "action_id": action_id})
-        if not await self.runtime._client.set(key, started, nx=True):
-            raise ToolReconciliationRequired(
-                "This action was already attempted; inspect the external result before retrying"
-            )
+        # Receipt creation and its Goal/parent authority must be one CAS. A
+        # cancelled workflow may not acquire a new write intent after the
+        # controller has collected receipts for its terminal accounting.
+        index = self.runtime._tenant_key(self.tenant_id, f"goal:{self.goal_id}:tool-receipts")
+        while True:
+            async with self.runtime._client.pipeline(transaction=True) as pipe:
+                try:
+                    goal_key = self.runtime._tenant_key(
+                        self.tenant_id, f"agent:goal:{self.goal_id}"
+                    )
+                    await pipe.watch(goal_key, key, index)
+                    current = json.loads(await pipe.get(goal_key) or "null")
+                    if current:
+                        if current.get("parent_goal_id"):
+                            await pipe.watch(
+                                self.runtime._tenant_key(
+                                    self.tenant_id, f"agent:goal:{current['parent_goal_id']}"
+                                )
+                            )
+                        if current.get("agent_id"):
+                            await pipe.watch(
+                                self.runtime._tenant_key(
+                                    self.tenant_id, f"agents:record:{current['agent_id']}"
+                                )
+                            )
+                        await guard_goal_skills(self.runtime, current, client=pipe, watch=True)
+                    await self._check_owner()
+                    if await pipe.exists(key):
+                        raise ToolReconciliationRequired(
+                            "This action was already attempted; "
+                            "inspect the external result before retrying"
+                        )
+                    if await pipe.type(index) not in {"none", "set"}:
+                        raise ToolReconciliationRequired("Tool receipt index unavailable")
+                    if await pipe.scard(index) >= 256:
+                        raise ToolReconciliationRequired("Tool receipt capacity exceeded")
+                    pipe.multi()
+                    pipe.set(key, started)
+                    pipe.sadd(index, key)
+                    await pipe.execute()
+                    break
+                except WatchError:
+                    continue
         result = await self.invoke(name, arguments)
         # Receipts contain no raw arguments or unscanned tool content.
         await self.runtime._client.set(

@@ -1,8 +1,9 @@
-# Plan v2 與 Workflow YAML（M4 第一段）
+# Plan v2、Workflow YAML 與明確執行（M4 進行中）
 
-目前交付是**規劃、不可變編譯產物與純決策函式**，不是 DAG 執行引擎。
+已接上規劃、不可變編譯產物、明確 admission 與 Redis 持久化 controller。
 保存、編譯及切換 `mode=execute` 都不建立 Goal、不呼叫模型、不保留 token 額度。
-明確 execute admission、持久化 DAG controller、核准恢復／取消及故障驗證仍在 M4 待辦。
+只有明確的 `POST .../execute` 才建立執行工作。Docker 多副本／程序故障 E2E 與最終 review
+仍在 M4 待辦；本機 Redis／實際 LangGraph 路徑測試不取代整合驗收。
 
 ## 啟用與界線
 
@@ -10,6 +11,7 @@
 
 ```dotenv
 WORKFLOW_ENABLED=true
+WORKFLOW_EXECUTION_ENABLED=true
 WORKFLOW_MAX_NODES=32
 WORKFLOW_MAX_EDGES=64
 WORKFLOW_MAX_PARALLELISM=4
@@ -18,7 +20,11 @@ WORKFLOW_MAX_PARALLELISM=4
 程式硬上限是 128 節點／256 邊／16 平行；部署預設仍為 32／64／4，
 平行度也不超過租戶 `TENANT_MAX_CONCURRENT_RUNS`。
 每個 Worker 的所有節點預算總和不超過該 Agent policy，所有節點共享 root 預算。
-純 readiness 決策限制同 Agent 同時一個執行節點；**跨 Goal 併發鎖仍待 controller 實作**。
+純 readiness 與 Redis 跨 Goal Agent lease 都限制同 Agent 同時一個執行節點。
+租戶 execution slot 額滿時持久化等待，不把正常競爭誤判為節點失敗。
+兩個 flag 獨立且預設關閉；execution gate 關閉只拒絕新 admission，既有任務仍受管理與結算。
+目前尚未驗收新舊服務混跑；啟用前須將 Gateway／worker／scheduler 全部升級並保持安全設定一致。
+協定／命名空間隔離與設定漂移防護仍在 M4 待補，不可視為已可直接滾動上線的版本。
 不可循環、遞迴派工或使用快照未核可的 Agent。Chief 只可當無工具權限的 synthesis 節點。
 
 ## API
@@ -31,6 +37,28 @@ WORKFLOW_MAX_PARALLELISM=4
    `{"expected_version": 1, "yaml": "完整 YAML 文字"}`。
 4. `GET /v1/planning-sessions/{session_id}/compiled?revision=1` 取得編譯產物，
    `execution_started` 與 `execution_authority` 均為 false。
+5. 沿用 `POST .../mode` 的 expected_version、`mode: execute` 與當前 plan_revision 接受計畫，
+   從回應取得新的 version 與 accepted_hash。
+6. `POST /v1/planning-sessions/{session_id}/execute` body：
+
+   ```json
+   {"expected_version": 3, "accepted_hash": "回應中的完整64字元hash", "idempotency_key": "run-20261027-1"}
+   ```
+
+   hash 必須逐字使用，不是這段示意文字。回傳 root Goal（初始 queued），由 worker／scheduler
+   執行 controller；不在 HTTP request 中跑模型。相同 key＋hash 重送回同一 Goal，
+   即使第一次回應遺失、expected_version 已舊，也不重複入列或保留額度。
+   同 key 換 hash 拒絕；同 accepted Plan 換 key 也不能繞過 active_goal_id 重複執行。
+   要另跑一輪，先結束舊 Goal、回 plan mode，再明確接受與提交新一輪。
+
+   root 已標 cancelled 但 controller 尚未完成子任務取消／收據彙整／quota 結算時，
+   回 plan mode 仍回 409，須等 `workflow.phase=finished` 與 reservation reconciled。
+
+admission 在同一 Redis CAS 內重查 session／accepted artifact、現行 Agent／Skill／route 快照、
+圖限制與 ACL，並原子建立 root、owner／conversation、receipt、團隊 quota、queue 及 session active reference。
+入場前重跑 ATR，涵蓋計畫、persona 與 Skill／資源，掃描後的 hash 綁定到 CAS；換版需重試。
+預算只保留在 root，子 Goal 不重複扣款；UTC 跨日及 provider 回報較小用量會校正兩日。
+每節點及團隊總上限仍受 server policy 約束，不因核准、恢復或重送而增加。
 
 保存使用版本 CAS；非法圖、schema 或超限不新增 revision。
 native 編譯產物連同輸入、Agent／Skill 固定版本及快照一起納入 revision hash；讀取重驗完整性。
@@ -80,13 +108,26 @@ edges:
 僅可引用祖先節點；不接受 Python、JavaScript、模板程式或 remote schema。
 `all_success`／`any_success` 都等全部前置節點終態後判斷；條件 false 為 skipped。
 缺少 required input 是明確失敗；可選 input 能設 default。
-必要節點失敗的純決策會停止新派工並列出應取消節點。
-waiting_approval 保留依賴阻塞但釋放執行平行容量；實際核准與 receipt 安全性待執行層整合驗證。
+必要節點失敗停止新派工，controller 持久化 cancelling，fence／取消進行中節點，再彙整終態及用量。
+waiting_approval 保留依賴阻塞，但釋放租戶與 Agent execution slot；獨立分支仍可執行。
+沿用每次工具＋參數的核准及 Redis checkpoint；已取消 root 的舊核准不能再把子 Goal 入列。
+root pause 逐步暫停其活躍節點；resume 只恢復由該 root 暫停的節點，不擅自恢復原已個別暫停的節點。
+controller／worker 重開後重讀權威狀態；節點 ID 固定，建立節點與 queue intent 同一 transaction。
+損毀 artifact 會 fail closed 並隔離為 quarantined，不以壞 graph 派工，也不阻擋其他健康 root；
+它需要人工檢查，不可直接當成一般可恢復的 pause 或在原 session 重新接受執行。
+
+寫入 intent receipt 與 Goal／parent authority 以 CAS 綁定；未知 checkpoint 結果不可自動重播。
+root 的 `workflow.receipt_reconciliation` 保存收據數量與 `review_required` 參照。
+`GET /v1/goals/{goal_id}/receipts?limit=50&after=...` 在當前 Goal ACL 下分頁讀取
+action ID、tool、started／completed 與是否需要複核，不返回原始參數。
+root 只保存節點狀態及子 Goal 參照，不複製各節點完整輸出；讀取輸出仍須通過子 Goal ACL。
+這不代表外部副作用被回滾；需要操作人員查明外部狀態，不能刪 receipt 後假裝安全重試。
 
 ## 安全與驗證
 
 - YAML 僅 UTF-8 64 KiB，拒絕重複鍵、alias、自訂 tag、過深巢狀與未知欄位。
 - schema 每個 8 KiB，結構化輸出 16 KiB；拒絕重複 JSON 輸出鍵、非法 UTF-8、NaN 等。
+  只有 schema 成功驗證的短 JSON 能豁免一般文字答案長度；不略過工具來源／grounding 檢查。
 - schema 檢查在可終止子程序，不在 API event loop 跑任意 regex；有 CPU／wall deadline，
   Linux 限記憶體；父程序有 timeout、kill／reap，並限制同時四個驗證程序。
 - 僅允許本地 fragment `$ref`，禁止 schema ID 與動態引用；registry 也拒絕外部取用。

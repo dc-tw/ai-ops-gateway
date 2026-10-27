@@ -565,6 +565,13 @@ class PlanningStore:
                             raise PlanningConflict(
                                 "End the active Goal before returning to plan mode"
                             )
+                        if goal.get("workflow") and (
+                            goal["workflow"].get("phase") != "finished"
+                            or not (goal.get("token_reservation") or {}).get("reconciled")
+                        ):
+                            raise PlanningConflict(
+                                "Wait for Workflow cancellation and accounting to finish"
+                            )
                     if session["mode"] == mode:
                         # Even a no-op must validate its watched snapshot before
                         # returning it as the current accepted session state.
@@ -579,6 +586,8 @@ class PlanningStore:
                         updated_at=datetime.now(UTC).isoformat(),
                         updated_by=subject,
                     )
+                    if mode == "plan":
+                        session["active_goal_id"] = None
                     pipe.multi()
                     pipe.set(key, _json(session))
                     self._record_event(pipe, session, "planning.mode_changed", subject)
