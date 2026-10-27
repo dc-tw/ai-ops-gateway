@@ -90,12 +90,14 @@ def _error(exc: ValueError) -> HTTPException:
     return HTTPException(status_code=status, detail=str(exc))
 
 
-async def _check_content(request: Request, tenant: str, body: dict[str, Any]) -> None:
+async def _check_content(
+    request: Request, tenant: str, body: dict[str, Any], *, imported=False
+) -> None:
     """Admin authors remain subject to content checks; this is not authorization."""
     settings = request.app.state.settings
     if body.get("schema_version", 1) == 2 and not settings.skill_v2_enabled:
         raise HTTPException(status_code=409, detail="Skill v2 management is disabled")
-    if body.get("provenance") is not None:
+    if body.get("provenance") is not None and not imported:
         raise HTTPException(
             status_code=422, detail="Provenance requires the package import workflow"
         )
@@ -115,6 +117,7 @@ async def _check_content(request: Request, tenant: str, body: dict[str, Any]) ->
             scan.to_event(),
             context_id=f"skill-definition:{body['name']}",
             model="skill-definition",
+            emit_internal_events=not imported,
         )
     if scan.blocked:
         reject_incomplete_scan(scan)
@@ -258,7 +261,8 @@ async def rollback_skill(skill_id: str, payload: SkillRollback, request: Request
     if value is None:
         raise HTTPException(status_code=404, detail="Skill revision not found")
     body = content_fields(value)
-    await _check_content(request, principal.tenant_id, body)
+    # Provenance comes from an immutable stored revision, never the request.
+    await _check_content(request, principal.tenant_id, body, imported=True)
     try:
         return await store.publish(
             principal.tenant_id,

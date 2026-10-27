@@ -34,12 +34,15 @@ def draft(objective="Prepare a source-based report"):
     }
 
 
-def test_openapi_does_not_advertise_forecasts_execution_bridge_or_skill_import():
+def test_openapi_advertises_package_review_but_not_forecasts_or_execution_bridge():
     document = create_app(settings=Settings(_env_file=None)).openapi()
     paths = document["paths"]
     assert "/v1/planning-sessions/{session_id}/mode" in paths
     assert "/v1/agents/{agent_id}/goals" in paths
     assert "/v1/skills/{skill_id}/export" in paths
+    assert "/v1/skill-imports/upload" in paths
+    assert "/v1/skill-imports/github" in paths
+    assert "/v1/skill-imports/{import_id}/confirm" in paths
     for path in paths:
         segments = path.strip("/").split("/")
         assert "forecasts" not in segments

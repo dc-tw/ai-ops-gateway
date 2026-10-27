@@ -382,6 +382,7 @@ class SkillStore:
         *,
         enabled: bool = True,
         builtin_version: int | None = None,
+        import_confirmation: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         # Runtime snapshot validation is imported by ATR spawn workers too.
         # Load HTTP-backed ACL management only on the creation path.
@@ -399,6 +400,33 @@ class SkillStore:
             async with self.client.pipeline(transaction=True) as pipe:
                 try:
                     await pipe.watch(key, name_key)
+                    candidate = None
+                    if import_confirmation:
+                        candidate_key, expected_hash = import_confirmation
+                        await pipe.watch(candidate_key)
+                        raw_candidate = await pipe.get(candidate_key)
+                        if not raw_candidate:
+                            raise SkillNotFound("Import preview expired or unavailable")
+                        candidate = json.loads(raw_candidate)
+                        if (
+                            type(candidate.get("schema_version")) is not int
+                            or candidate["schema_version"] != 1
+                            or candidate.get("executes_code") is not False
+                            or candidate.get("tenant_id") != tenant
+                            or candidate.get("content_sha256") != expected_hash
+                            or snapshot_content_hash(candidate["content"]) != expected_hash
+                            or snapshot_content_hash(body) != expected_hash
+                        ):
+                            raise SkillConflict("Import preview does not match confirmation")
+                        if candidate.get("status") == "published":
+                            saved = await pipe.get(
+                                self.record_key(tenant, candidate["published_skill_id"])
+                            )
+                            if not saved:
+                                raise SkillConflict("Published import is unavailable")
+                            return json.loads(saved)
+                        if candidate.get("status") != "previewed":
+                            raise SkillConflict("Import preview is not ready for confirmation")
                     existing_id = await pipe.get(name_key)
                     if existing_id:
                         existing = await self.get(tenant, existing_id)
@@ -420,7 +448,11 @@ class SkillStore:
                         "revision": 1,
                         "revocation_epoch": 0,
                         "content_sha256": snapshot_content_hash(body),
-                        "origin": "builtin" if builtin_version is not None else "custom",
+                        "origin": "package"
+                        if candidate
+                        else "builtin"
+                        if builtin_version is not None
+                        else "custom",
                         "builtin_version": builtin_version,
                         "created_at": now,
                         "updated_at": now,
@@ -432,6 +464,16 @@ class SkillStore:
                     if await pipe.exists(revision_key):
                         raise SkillConflict("Skill revision already exists")
                     await guard_owner(pipe, tenant, "skill", skill_id, subject)
+                    destinations = {
+                        self._index_key(tenant): "set",
+                        self.runtime._tenant_key(tenant, "audit"): "stream",
+                    }
+                    await pipe.watch(*destinations)
+                    for destination, expected in destinations.items():
+                        if await pipe.type(destination) not in {"none", expected}:
+                            raise RuntimeError("Skill publication storage unavailable")
+                    if candidate:
+                        record["import_id"] = candidate["import_id"]
                     pipe.multi()
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
                     queue_owner(pipe, tenant, "skill", skill_id, subject)
@@ -448,6 +490,20 @@ class SkillStore:
                         "skill.install" if builtin_version is not None else "skill.create",
                         subject,
                     )
+                    if candidate:
+                        pipe.set(
+                            candidate_key,
+                            json.dumps(
+                                candidate
+                                | {
+                                    "status": "published",
+                                    "published_skill_id": skill_id,
+                                    "confirmed_by": subject,
+                                },
+                                ensure_ascii=True,
+                            ),
+                            ex=86_400,
+                        )
                     await pipe.execute()
                     return record
                 except WatchError:

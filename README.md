@@ -266,7 +266,8 @@ rollback 與 `SKILL.md` 文字匯出。Skill 是可重用的指令流程，不�
 [內建 Skill 清單](docs/skills-catalog.md)。
 
 新增的 opt-in v2 模式／唯讀資源、獨立規劃綁定與確定性自動選擇，見
-[Skill v2 指南](docs/skills-v2.md)。完整外部套件匯入與 forecast estimator 尚未完成。
+[Skill v2 指南](docs/skills-v2.md)。另提供[唯讀套件匯入](docs/skill-package-import.md)；
+forecast estimator 尚未完成。
 
 ## PostgreSQL 歷史儲存
 

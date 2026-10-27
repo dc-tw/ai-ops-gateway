@@ -1,7 +1,7 @@
 # Skill v2、規劃綁定與確定性選擇
 
-這是 M3 的模式／資源／選擇部分。套件隔離預覽、固定 GitHub commit 匯入與確認發布仍待接續，
-不是已完成的 package manager。`plan-forecast` estimator 屬 M5，這裡只提供安全的規劃綁定。
+這是 M3 的模式／資源／選擇部分。上傳 ZIP、固定 GitHub commit 的隔離預覽與確認發布見
+[唯讀套件匯入](skill-package-import.md)。`plan-forecast` estimator 屬 M5，這裡只提供安全的規劃綁定。
 
 ## 相容性及開關
 

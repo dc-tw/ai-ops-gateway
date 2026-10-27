@@ -22,6 +22,7 @@ from app.goals import router as goals_router
 from app.history import router as history_router
 from app.llm.client import ModelRouter
 from app.planning import router as planning_router
+from app.skill_imports import router as skill_imports_router
 from app.skills import router as skills_router
 from app.tools.browser import BrowserScraper, BrowserSessionManager
 from app.tools.registry import (
@@ -124,6 +125,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(agents_router)
     app.include_router(access_router)
     app.include_router(skills_router)
+    app.include_router(skill_imports_router)
     app.include_router(planning_router)
     app.include_router(history_router)
 

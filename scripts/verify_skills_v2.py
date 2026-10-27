@@ -1,7 +1,10 @@
 """Synthetic real HTTP/worker checks; no real model inference or external tools."""
 
 import asyncio
+import base64
+import io
 import json
+import zipfile
 
 import httpx
 
@@ -88,8 +91,10 @@ async def main():
             )
             before = await runtime._client.xlen("agent:goal:queue")
             metrics_before = (await client.get("/metrics")).text
+
             def model_metrics(text):
                 return [line for line in text.splitlines() if line.startswith("ai_gateway_model_")]
+
             session = await call("POST", f"/v1/agents/{aid}/planning-sessions", {}, "bob")
             sid = session["session_id"]
             assert (
@@ -147,6 +152,63 @@ async def main():
             )
             await call(
                 "POST", f"/v1/agents/{aid}/goals", {"objective": "review evidence"}, "bob", 409
+            )
+            package = io.BytesIO()
+            with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "SKILL.md",
+                    "---\nname: imported-resource-review\n"
+                    "description: Read-only import verification\nallowed-tools: Bash(git:*)\n---\n"
+                    "Use supplied evidence only.\n",
+                )
+                archive.writestr("references/evidence.md", "READONLY-RESOURCE-CANARY")
+            preview = await call(
+                "POST",
+                "/v1/skill-imports/upload",
+                {"archive_base64": base64.b64encode(package.getvalue()).decode()},
+            )
+            assert preview["status"] == "previewed" and not preview["executes_code"]
+            path = f"/v1/skill-imports/{preview['import_id']}/confirm"
+            confirmation = {"expected_content_sha256": preview["content_sha256"]}
+            imported = await call("POST", path, confirmation)
+            repeated = await call("POST", path, confirmation)
+            assert imported["skill_id"] == repeated["skill_id"]
+            assert imported["required_tools"] == [] and imported["origin"] == "package"
+            assert imported["provenance"]["source"] == "upload"
+            await call(
+                "PUT",
+                f"/v1/agents/{aid}",
+                config
+                | {
+                    "expected_version": 1,
+                    "skill_selection_rules": [
+                        {
+                            "skill_id": imported["skill_id"],
+                            "revision": 1,
+                            "field": "objective",
+                            "values": ["evidence"],
+                            "priority": 10,
+                        }
+                    ],
+                },
+            )
+            goal = await call(
+                "POST",
+                f"/v1/agents/{aid}/goals",
+                {
+                    "objective": "review evidence",
+                    "steps": [{"query": "Use imported evidence only."}],
+                },
+                "bob",
+            )
+            for _ in range(240):
+                goal = await call("GET", f"/v1/goals/{goal['goal_id']}", user="bob")
+                if goal["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                await asyncio.sleep(0.25)
+            assert goal["status"] == "completed", goal.get("error_type")
+            assert (
+                goal["agent_config"]["skill_snapshots"][0]["provenance"] == imported["provenance"]
             )
     finally:
         await runtime.close()

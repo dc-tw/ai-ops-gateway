@@ -1,7 +1,7 @@
 # Skill 管理操作指南
 
 本頁以相容的 v1 操作為主；新增的 opt-in v2 模式／唯讀資源、planning_skills 與確定性
-自動選擇見 [Skill v2 指南](skills-v2.md)。套件匯入尚未完成。
+自動選擇見 [Skill v2 指南](skills-v2.md)，唯讀 ZIP／GitHub 匯入見[套件指南](skill-package-import.md)。
 
 Skill 是 tenant 管理者保存、可指定內容版本的 instruction pack。Agent 綁定明確的 Skill revision，
 建立 Goal 時取得獨立快照；Skill 不會新增工具、執行腳本或替 Agent 授權。
@@ -306,7 +306,8 @@ curl --fail-with-body "$SKILLS_BASE_URL/v1/skills/$SKILLS_CUSTOM_ID/export?revis
 
 此輸出參考 [Agent Skills 規格](https://agentskills.io/specification) 的基本
 `SKILL.md` metadata 加 Markdown instructions 結構，**不宣稱完整相容**。
-目前不支援完整 package 匯入、目錄管理或 `scripts/`／資源執行；v2 可明確保存 `references/` 等唯讀文字，
+目前提供唯讀 ZIP／固定 GitHub commit 的隔離匯入，不支援任意目錄管理或 `scripts/`／資源執行；
+v2 可明確保存 `references/` 等唯讀文字，
 也不會把匯出 metadata 的工具名稱解讀成授權。若要將檔案放入其他產品，仍須依其格式、目錄與
 權限規則另行驗證。
 

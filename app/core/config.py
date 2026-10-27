@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     resource_acl_enabled: bool = False
     skill_v2_enabled: bool = False
     skill_auto_selection_enabled: bool = False
+    skill_package_import_enabled: bool = False
     log_level: str = "INFO"
     otel_service_name: str = "ai-ops-gateway"
     otel_exporter_otlp_endpoint: str = ""
