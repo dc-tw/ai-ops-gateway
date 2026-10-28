@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import re
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -28,6 +30,24 @@ from app.core.redis_runtime import RedisRuntime
 
 GROUP = "postgres-history-v1"
 logger = logging.getLogger(__name__)
+_STREAM_ID = re.compile(r"^(0|[1-9][0-9]*)-(0|[1-9][0-9]*)$")
+
+
+def poison_marker(stream: str, event_id: str) -> str:
+    return f"{stream}:invalid:{event_id}"
+
+
+def poison_errors(stream: str) -> str:
+    return f"{stream}:errors"
+
+
+def poison_tenant(payload: object) -> str | None:
+    """Attribute a raw envelope without accepting it as a valid projection."""
+    try:
+        decoded = json.loads(payload) if isinstance(payload, str) else payload
+        return tenant_from_key(decoded.get("key")) if isinstance(decoded, dict) else None
+    except (ValueError, TypeError, RecursionError):
+        return None
 
 
 async def ensure_group(client, stream):
@@ -65,10 +85,10 @@ async def project_batch(runtime, store, *, consumer="projector", lease_ms=5_000,
         except (ValueError, KeyError, TypeError):
             # Keep the original pending (not ACKed) and record metadata only.
             # Other valid records can advance; cutover still fails until repaired.
-            marker = f"{stream}:invalid:{event_id}"
+            marker = poison_marker(stream, event_id)
             if await client.set(marker, "1", nx=True):
                 await client.xadd(
-                    f"{stream}:errors",
+                    poison_errors(stream),
                     {"event_id": event_id, "error": "invalid_envelope"},
                 )
             counts["failed"] += 1
@@ -80,6 +100,157 @@ async def project_batch(runtime, store, *, consumer="projector", lease_ms=5_000,
         await client.xack(stream, GROUP, event_id)
         counts["applied" if changed else "duplicates"] += 1
     return counts
+
+
+async def diagnose_poison(
+    runtime,
+    source_id: str,
+    *,
+    after: str = "0-0",
+    limit: int = 100,
+    tenant_id: str | None = None,
+):
+    """Return bounded poison metadata without source payloads or credentials."""
+    _position(after)
+    if type(limit) is not int or not 1 <= limit <= 200:
+        raise ValueError("Invalid poison diagnostic limit")
+    client, stream = runtime._client, outbox_key(source_id)
+    await ensure_group(client, stream)
+    prefix = poison_marker(stream, "")
+    event_ids = []
+    async for key in client.scan_iter(match=prefix + "*", count=100):
+        event_id = key.removeprefix(prefix)
+        try:
+            if _position(event_id) > _position(after):
+                event_ids.append(event_id)
+        except (ValueError, AttributeError):
+            continue
+    result = []
+    for event_id in sorted(event_ids, key=_position):
+        pending = await client.xpending_range(
+            stream, GROUP, min=event_id, max=event_id, count=1
+        )
+        rows = await client.xrange(stream, min=event_id, max=event_id, count=1)
+        fields = rows[0][1] if rows and rows[0][0] == event_id else {}
+        payload = fields.get("payload") if isinstance(fields, dict) else None
+        if tenant_id is not None and poison_tenant(payload) != tenant_id:
+            continue
+        digest = hashlib.sha256(
+            (payload if isinstance(payload, str) else json.dumps(fields, sort_keys=True)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        detail = pending[0] if pending else {}
+        result.append(
+            {
+                "event_id": event_id,
+                "error": "invalid_envelope",
+                "pending": bool(pending),
+                "consumer": detail.get("consumer"),
+                "delivery_count": detail.get("times_delivered"),
+                "idle_ms": detail.get("time_since_delivered"),
+                "payload_sha256": digest,
+            }
+        )
+        if len(result) == limit:
+            break
+    return {
+        "records": result,
+        "next_after": result[-1]["event_id"] if len(result) == limit else None,
+    }
+
+
+async def repair_poison(
+    runtime,
+    store,
+    event_id: str,
+    expected_payload_sha256: str,
+    replacement: dict,
+    subject: str,
+    tenant_id: str | None = None,
+):
+    """Apply a corrected envelope under the original identity, then explicitly ACK."""
+    _position(event_id)
+    if not isinstance(expected_payload_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_payload_sha256
+    ):
+        raise ValueError("Invalid poison payload hash")
+    client, stream = runtime._client, outbox_key(store.source_id)
+    marker = poison_marker(stream, event_id)
+    if not await client.exists(marker):
+        raise ValueError("Poison entry is not registered")
+    await ensure_group(client, stream)
+    pending = await client.xpending_range(stream, GROUP, min=event_id, max=event_id, count=1)
+    rows = await client.xrange(stream, min=event_id, max=event_id, count=1)
+    if not pending or not rows or rows[0][0] != event_id:
+        raise ValueError("Poison entry is not pending")
+    fields = rows[0][1]
+    payload = fields.get("payload") if isinstance(fields, dict) else None
+    original_tenant = poison_tenant(payload)
+    if original_tenant is None:
+        raise ValueError("Poison entry cannot be safely attributed to a tenant")
+    if tenant_id is not None and original_tenant != tenant_id:
+        raise ValueError("Poison entry is outside the authorized tenant")
+    hash_input = payload if isinstance(payload, str) else json.dumps(fields, sort_keys=True)
+    current_hash = hashlib.sha256(
+        hash_input.encode("utf-8")
+    ).hexdigest()
+    if current_hash != expected_payload_sha256:
+        raise ValueError("Poison entry changed; diagnose it again")
+    tenant = tenant_from_key(replacement.get("key")) if isinstance(replacement, dict) else None
+    if tenant is None or tenant != original_tenant:
+        raise ValueError("Corrected envelope must preserve the original tenant")
+    if not isinstance(subject, str) or not subject.strip() or len(subject) > 256:
+        raise ValueError("Invalid poison repair subject")
+    replacement_json = json.dumps(
+        replacement, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    replacement_hash = hashlib.sha256(replacement_json.encode("utf-8")).hexdigest()
+    changed = await store.apply(event_id, replacement)
+    now = datetime.now(UTC).isoformat()
+    audit = json.dumps(
+        {
+            "action": "postgres.poison_repaired",
+            "subject": subject,
+            "event_id": event_id,
+            "original_payload_sha256": current_hash,
+            "replacement_sha256": replacement_hash,
+            "time": now,
+        },
+        ensure_ascii=True,
+    )
+    repaired = await client.eval(
+        """
+if redis.call('EXISTS',KEYS[2]) == 0 then return 0 end
+local acked = redis.call('XACK',KEYS[1],ARGV[1],ARGV[2])
+if acked ~= 1 then return -1 end
+redis.call('DEL',KEYS[2])
+redis.call('XADD',KEYS[3],'*','event_id',ARGV[2],'error','repaired',
+  'payload_sha256',ARGV[3],'replacement_sha256',ARGV[4])
+redis.call('XADD',KEYS[4],'*','payload',ARGV[5])
+return 1
+""",
+        4,
+        stream,
+        marker,
+        poison_errors(stream),
+        runtime._tenant_key(tenant, "audit"),
+        GROUP,
+        event_id,
+        current_hash,
+        replacement_hash,
+        audit,
+    )
+    if repaired != 1:
+        raise RuntimeError("Poison repair could not acknowledge the original pending entry")
+    return {
+        "event_id": event_id,
+        "status": "repaired",
+        "payload_sha256": current_hash,
+        "replacement_sha256": replacement_hash,
+        "projection_changed": changed,
+        "acknowledged_after_projection": True,
+    }
 
 
 async def drain(runtime, store, *, deadline_seconds=60):
@@ -102,7 +273,12 @@ async def drain(runtime, store, *, deadline_seconds=60):
 
 
 def _position(cursor):
-    return tuple(int(part) for part in cursor.split("-"))
+    if not isinstance(cursor, str) or len(cursor) > 41 or not _STREAM_ID.fullmatch(cursor):
+        raise ValueError("Invalid Redis stream identity")
+    value = tuple(int(part) for part in cursor.split("-"))
+    if any(part > 2**64 - 1 for part in value):
+        raise ValueError("Invalid Redis stream identity")
+    return value
 
 
 @asynccontextmanager
@@ -197,8 +373,16 @@ async def backfill(runtime, store):
             "report_id": uuid4().hex,
             "status": "backfilled",
             "snapshots": 0,
-            "coverage": "retained Redis resources only; prior TTL/trim history is unrecoverable",
+            "reindexed_records": 0,
+            "reindexed_events": 0,
+            "coverage": (
+                "all existing PostgreSQL search projections plus retained Redis resources; "
+                "prior source data absent from both stores is unrecoverable"
+            ),
         }
+        reindexed = await store.reindex_search_documents(check=check)
+        report["reindexed_records"] = reindexed["records"]
+        report["reindexed_events"] = reindexed["events"]
         # New real source positions, not fabricated IDs. Competing projectors may
         # process these; order fencing and identity ledgers make replay harmless.
         async for envelope in snapshots(runtime):

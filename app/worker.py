@@ -365,9 +365,16 @@ async def execute_goal(
                     observe_agent_event(event, model=goal["model"])
                     if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
                         await record_scan_event(event)
+                    archived_event = {
+                        "type": "agent_event",
+                        "step_index": index,
+                        "event": event,
+                    }
+                    if event.get("type") == "completed" and event.get("evidence_validated") is True:
+                        archived_event["history_search_approved"] = True
                     await runtime.append_goal_event(
                         goal_id,
-                        {"type": "agent_event", "step_index": index, "event": event},
+                        archived_event,
                         tenant_id,
                     )
                     if event.get("type") == "completed":
@@ -438,7 +445,15 @@ async def execute_goal(
                 ttl_seconds=conversation_ttl_seconds,
                 tenant_id=tenant_id,
             )
-            await save({"type": "goal_step", "status": "completed", "index": index, "step": step})
+            await save(
+                {
+                    "type": "goal_step",
+                    "status": "completed",
+                    "index": index,
+                    "step": step,
+                    "history_search_approved": goal.get("history_search_approved") is True,
+                }
+            )
 
         if goal.get("workflow_node"):
             from app.core.workflow_plan import node_output

@@ -29,6 +29,9 @@ EventKind = Literal["run", "goal", "planning", "automation", "audit", "conversat
 
 RECORD_KINDS = frozenset(RecordKind.__args__)
 EVENT_KINDS = frozenset(EventKind.__args__)
+_RELATION_KINDS = frozenset(
+    {"agent", "skill", "planning_session", "goal", "run", "automation", "conversation", "finding"}
+)
 
 # Persisted resource identifiers are bounded slugs/UUIDs. Conversation IDs also
 # allow ':', so their entire body must be retained rather than split by position.
@@ -130,16 +133,148 @@ _SEARCH_FIELDS = (
     "severity",
     "review_status",
     "event_type",
+    "type",
     "location",
     "tool",
     "action_id",
+    "action",
+    "subject",
+    "node_id",
 )
 
 
+def _bounded_text(values: list[str]) -> str:
+    return " ".join(value[:2_048] for value in values if value.strip())[:32_768]
+
+
+def _metadata_text(data: dict[str, Any]) -> list[str]:
+    return [data[name] for name in _SEARCH_FIELDS if isinstance(data.get(name), str)]
+
+
+def _goal_body(data: dict[str, Any]) -> list[str]:
+    """Return only content that passed the live input/output safety boundary."""
+    if data.get("history_search_approved") is not True:
+        return []
+    values = [data.get("objective", "")]
+    for step in data.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        values.append(step.get("query", ""))
+        if step.get("status") == "completed":
+            values.append(step.get("answer", ""))
+    return [value for value in values if isinstance(value, str)]
+
+
+def _provenance_text(data: dict[str, Any]) -> list[str]:
+    provenance = data.get("provenance")
+    if not isinstance(provenance, dict):
+        return []
+    # Provenance is operator-approved package identity, never package content.
+    return [
+        value
+        for name in ("source", "repository", "commit", "package_sha256")
+        if isinstance((value := provenance.get(name)), str)
+    ]
+
+
 def search_text(kind: str, data: Any) -> str:
-    """Index bounded metadata only; private prompts and raw content stay out."""
+    """Index safe metadata plus explicitly approved, bounded record content."""
     if kind not in RECORD_KINDS or not isinstance(data, dict):
         return ""
     safe = sanitize_record(kind, data)
-    values = [safe[name] for name in _SEARCH_FIELDS if isinstance(safe.get(name), str)]
-    return " ".join(value[:512] for value in values)[:8_192]
+    values = _metadata_text(safe)
+    if kind == "goal":
+        values.extend(_goal_body(safe))
+    if kind in {"skill", "skill_revision"}:
+        values.extend(_provenance_text(safe))
+    return _bounded_text(values)
+
+
+def event_search_text(kind: str, data: Any) -> str:
+    """Index safe event summaries without raw ATR input, prompts or tool payloads."""
+    if kind not in EVENT_KINDS or not isinstance(data, dict):
+        return ""
+    values = _metadata_text(data)
+    if kind == "goal":
+        event_type = data.get("type")
+        if event_type == "goal_completed" and isinstance(data.get("goal"), dict):
+            values.extend(_goal_body(data["goal"]))
+        elif event_type == "goal_step" and data.get("history_search_approved") is True:
+            step = data.get("step")
+            if isinstance(step, dict):
+                values.extend(
+                    value
+                    for name in ("query", "answer")
+                    if isinstance((value := step.get(name)), str)
+                )
+        elif event_type == "agent_event" and data.get("history_search_approved") is True:
+            event = data.get("event")
+            if isinstance(event, dict) and event.get("type") == "completed":
+                if isinstance(event.get("answer"), str):
+                    values.append(event["answer"])
+                report = event.get("evidence_report")
+                if isinstance(report, dict):
+                    for source in report.get("evidence_sources", []):
+                        if not isinstance(source, dict):
+                            continue
+                        values.extend(
+                            value
+                            for name in ("url", "content_sha256")
+                            if isinstance((value := source.get(name)), str)
+                        )
+    return _bounded_text(values)
+
+
+def relation_refs(
+    document_type: str, kind: str, resource_id: str, data: Any
+) -> list[dict[str, str]]:
+    """Extract bounded declared relationships; authorization is intentionally external."""
+    if not isinstance(data, dict) or document_type not in {"record", "event"}:
+        return []
+    candidates: list[tuple[str, str, str]] = []
+
+    def add(field: str, target_kind: str, relation: str, source: dict[str, Any] = data):
+        value = source.get(field)
+        if isinstance(value, str) and re.fullmatch(_ID, value):
+            candidates.append((target_kind, value, relation))
+
+    for field, target_kind, relation in (
+        ("goal_id", "goal", "goal"),
+        ("parent_goal_id", "goal", "parent_goal"),
+        ("root_goal_id", "goal", "root_goal"),
+        ("agent_id", "agent", "agent"),
+        ("automation_id", "automation", "automation"),
+        ("session_id", "planning_session", "planning_session"),
+        ("finding_id", "finding", "finding"),
+    ):
+        add(field, target_kind, relation)
+    nested_goal = data.get("goal")
+    if isinstance(nested_goal, dict):
+        for field, target_kind, relation in (
+            ("goal_id", "goal", "goal"),
+            ("parent_goal_id", "goal", "parent_goal"),
+            ("root_goal_id", "goal", "root_goal"),
+            ("agent_id", "agent", "agent"),
+            ("automation_id", "automation", "automation"),
+        ):
+            add(field, target_kind, relation, nested_goal)
+    if document_type == "record" and kind == "goal":
+        candidates.append(("conversation", resource_id, "conversation"))
+    if document_type == "record" and kind == "skill_revision":
+        candidates.append(("skill", resource_id.split(":", 1)[0], "skill"))
+    if document_type == "record" and kind == "planning_revision":
+        candidates.append(
+            ("planning_session", resource_id.split(":", 1)[0], "planning_session")
+        )
+    unique = []
+    seen = set()
+    for target_kind, target_id, relation in candidates:
+        identity = (target_kind, target_id, relation)
+        if target_kind in _RELATION_KINDS and identity not in seen:
+            unique.append(
+                {"kind": target_kind, "resource_id": target_id, "relation": relation}
+            )
+            seen.add(identity)
+        if len(unique) == 32:
+            break
+    return unique

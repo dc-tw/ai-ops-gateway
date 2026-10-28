@@ -17,6 +17,7 @@ from app.access import router as access_router
 from app.agents import router as agents_router
 from app.core.config import Settings
 from app.core.goal_execution import GoalExecutionStore
+from app.core.postgres_schema import SCHEMA_VERSION
 from app.core.redis_runtime import RedisRuntime
 from app.core.resource_access import (
     AccessStore,
@@ -383,7 +384,7 @@ async def test_history_fresh_filter_and_corrupt_authority_fail_closed(env):
     "path,method",
     [
         ("/v1/history/records", "list_records"),
-        ("/v1/history/search?q=proof", "search"),
+        ("/v1/history/search?q=proof", "search_documents"),
         ("/v1/history/events", "events"),
         ("/v1/history/records/goal/one", "get_record"),
     ],
@@ -402,7 +403,7 @@ async def test_history_rechecks_acl_after_archive_query(env, path, method):
     )
 
     async def verified():
-        return {"status": "verified"}
+        return {"status": "verified", "schema_version": SCHEMA_VERSION}
 
     async def query(*args, **kwargs):
         if method != "get_record":
@@ -435,7 +436,7 @@ async def test_history_authority_outage_is_503_not_pg_fallback(env, monkeypatch,
     env.app.state.settings.postgres_history_mode = "postgres"
 
     async def verified():
-        return {"status": "verified"}
+        return {"status": "verified", "schema_version": SCHEMA_VERSION}
 
     async def broken(*args, **kwargs):
         raise ConnectionError("PRIVATE-REDIS-LOCATION")

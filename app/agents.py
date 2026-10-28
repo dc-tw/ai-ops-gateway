@@ -533,6 +533,7 @@ async def create_agent_goal(
         request.app.state.threat_detector,
         {**goal, "automation_id": goal.get("automation_id")},
     )
+    goal["history_search_approved"] = True
     try:
         return await GoalExecutionStore(runtime).submit_manual(goal)
     except PermissionError as exc:

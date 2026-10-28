@@ -7,6 +7,7 @@ scoped to that tenant so unrelated tests' retained Redis data is never copied.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -367,6 +368,94 @@ async def test_poison_is_pending_metadata_only_allows_progress_but_refuses_cutov
     assert await pending(env) == 1
 
 
+async def test_poison_diagnosis_and_repair_reprojects_before_ack_with_safe_audit(projection):
+    env = projection
+    private = "PRIVATE_POISON_REPAIR_CANARY"
+    raw_payload = json.dumps(
+        {
+            "schema_version": 999,
+            "key": env.key("agent:goal:invalid-goal"),
+            "secret": private,
+        }
+    )
+    poison = await env.raw.xadd(env.stream, {"payload": raw_payload})
+    assert (await worker.project_batch(env.runtime, env.store))["failed"] == 1
+    assert await pending(env) == 1
+
+    foreign_payload = json.dumps(
+        {"schema_version": 999, "key": "tenant:foreign:agent:goal:invalid"}
+    )
+    foreign_poison = await env.raw.xadd(env.stream, {"payload": foreign_payload})
+    assert (await worker.project_batch(env.runtime, env.store))["failed"] == 1
+    assert await pending(env) == 2
+
+    diagnosis = await worker.diagnose_poison(
+        env.runtime, env.source, tenant_id=env.tenant
+    )
+    assert len(diagnosis["records"]) == 1
+    item = diagnosis["records"][0]
+    assert item["event_id"] == poison and item["pending"] is True
+    assert item["payload_sha256"] == hashlib.sha256(raw_payload.encode()).hexdigest()
+    assert private not in json.dumps(diagnosis)
+    foreign_diagnosis = await worker.diagnose_poison(
+        env.runtime, env.source, tenant_id="foreign"
+    )
+    assert [row["event_id"] for row in foreign_diagnosis["records"]] == [foreign_poison]
+
+    replacement = {
+        "schema_version": 1,
+        "command": "SET",
+        "key": env.key("agent:goal:repaired-goal"),
+        "value": json.dumps(
+            {
+                "tenant_id": env.tenant,
+                "goal_id": "repaired-goal",
+                "status": "completed",
+            }
+        ),
+    }
+    with pytest.raises(ValueError, match="changed"):
+        await worker.repair_poison(
+            env.writer, env.store, poison, "0" * 64, replacement, "admin"
+        )
+    with pytest.raises(ValueError, match="preserve"):
+        await worker.repair_poison(
+            env.writer,
+            env.store,
+            poison,
+            item["payload_sha256"],
+            replacement | {"key": "tenant:foreign:agent:goal:repaired-goal"},
+            "admin",
+            tenant_id=env.tenant,
+        )
+    assert await pending(env) == 2
+    repaired = await worker.repair_poison(
+        env.writer,
+        env.store,
+        poison,
+        item["payload_sha256"],
+        replacement,
+        "admin",
+        tenant_id=env.tenant,
+    )
+    assert repaired["status"] == "repaired"
+    assert repaired["acknowledged_after_projection"] is True
+    assert await pending(env) == 1
+    assert await env.raw.get(worker.poison_marker(env.stream, poison)) is None
+    assert (await env.store.get_record(env.tenant, "goal", "repaired-goal"))["data"][
+        "status"
+    ] == "completed"
+    error_rows = await env.raw.xrange(worker.poison_errors(env.stream))
+    assert error_rows[-1][1]["error"] == "repaired"
+    assert private not in json.dumps(error_rows)
+    await env.raw.xack(env.stream, worker.GROUP, foreign_poison)
+    await env.raw.delete(worker.poison_marker(env.stream, foreign_poison))
+    assert await pending(env) == 0
+    await worker.drain(env.runtime, env.store)
+    audits = await env.store.events(env.tenant, "audit")
+    assert any(row["data"].get("action") == "postgres.poison_repaired" for row in audits)
+
+
 async def legacy_sources(env):
     goal = {"tenant_id": env.tenant, "goal_id": "goal-one", "status": "completed"}
     await env.raw.set(env.key("agent:goal:goal-one"), json.dumps(goal))
@@ -425,7 +514,10 @@ async def test_delete_and_purge_fences_survive_repeated_backfill_and_reconcile(p
     await env.writer.delete_conversation("thread-one", env.tenant)
     await worker.drain(env.runtime, env.store, deadline_seconds=2)
     cutoff = (await env.store.status(env.tenant))["latest_cursor"]
-    purged = await env.store.purge(env.tenant, "goal", cutoff)
+    preview = await env.store.preview_purge(env.tenant, "goal", cutoff)
+    purged = await env.store.purge(
+        env.tenant, "goal", cutoff, preview["preview_sha256"], "admin"
+    )
     assert purged["records"] == 1 and purged["events"] == 1
     # Simulate an older message cache restored after explicit deletion. Neither
     # this legacy data nor the still-retained Goal may be resurrected by backfill.

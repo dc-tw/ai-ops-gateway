@@ -11,10 +11,12 @@ from app.core.config import Settings
 from app.core.durable_types import (
     classify_key,
     conversation_id_from_key,
+    event_search_text,
     sanitize_record,
     search_text,
     tenant_from_key,
 )
+from app.core.postgres_schema import SCHEMA_VERSION
 from app.history import router
 
 
@@ -114,10 +116,75 @@ def test_receipt_and_search_allowlists_exclude_private_arguments_and_prompts():
     assert sanitize_record("tool_receipt", "PRIVATE") == {}
 
 
+def test_controlled_goal_body_and_provenance_are_searchable_only_after_approval():
+    goal = {
+        "status": "completed",
+        "objective": "分析部署失敗",
+        "steps": [
+            {
+                "status": "completed",
+                "query": "找出根因",
+                "answer": "根因是設定漂移",
+                "tool_result": "PRIVATE_TOOL_RESULT",
+            }
+        ],
+    }
+    assert "部署失敗" not in search_text("goal", goal)
+    indexed = search_text("goal", goal | {"history_search_approved": True})
+    assert all(value in indexed for value in ("部署失敗", "找出根因", "設定漂移"))
+    assert "PRIVATE_TOOL_RESULT" not in indexed
+
+    skill = {
+        "name": "safe-review",
+        "instructions": "PRIVATE_INSTRUCTIONS",
+        "provenance": {
+            "source": "github",
+            "repository": "dc-tw/agent-threat-rules",
+            "commit": "a" * 40,
+            "package_sha256": "b" * 64,
+            "raw_archive": "PRIVATE_ARCHIVE",
+        },
+    }
+    indexed = search_text("skill", skill)
+    assert "dc-tw/agent-threat-rules" in indexed
+    assert "PRIVATE_INSTRUCTIONS" not in indexed and "PRIVATE_ARCHIVE" not in indexed
+
+
+def test_event_search_indexes_safe_audit_and_evidence_without_raw_attack_or_tool_content():
+    audit = {
+        "action": "goal.threat_detection",
+        "status": "blocked",
+        "subject": "operator",
+        "event": {"user_input": "RAW_ATTACK", "tool_response": "PRIVATE_TOOL"},
+    }
+    indexed = event_search_text("audit", audit)
+    assert all(value in indexed for value in ("goal.threat_detection", "blocked", "operator"))
+    assert "RAW_ATTACK" not in indexed and "PRIVATE_TOOL" not in indexed
+
+    evidence = {
+        "type": "agent_event",
+        "history_search_approved": True,
+        "event": {
+            "type": "completed",
+            "answer": "已驗證的結論",
+            "evidence_validated": True,
+            "tool_result": "PRIVATE_TOOL",
+            "evidence_report": {
+                "evidence_sources": [
+                    {"url": "https://example.com/proof", "content_sha256": "sha256:abc"}
+                ]
+            },
+        },
+    }
+    indexed = event_search_text("goal", evidence)
+    assert all(value in indexed for value in ("已驗證的結論", "example.com/proof", "sha256:abc"))
+    assert "PRIVATE_TOOL" not in indexed
+
+
 class HistoryStore:
     def __init__(self):
         self.calls = []
-        self.migration = {"status": "verified"}
+        self.migration = {"status": "verified", "schema_version": SCHEMA_VERSION}
         self.failure = None
 
     def call(self, name, *args, **kwargs):
@@ -160,13 +227,40 @@ class HistoryStore:
         self.call("search", tenant, query, **kwargs)
         return [self.record(tenant)]
 
+    async def search_documents(self, tenant, query, **kwargs):
+        self.call("search_documents", tenant, query, **kwargs)
+        row = self.record(tenant) | {"document_type": "record", "summary": "completed"}
+        if kwargs.get("include_relations"):
+            row["_relation_candidates"] = [
+                {"kind": "conversation", "resource_id": "goal-1", "relation": "conversation"}
+            ]
+        return [row]
+
     async def status(self, tenant):
         self.call("status", tenant)
         return {"records": 1, "events": 1, "source_cursor": "101-2"}
 
+    async def preview_purge(self, tenant, **kwargs):
+        self.call("preview_purge", tenant, **kwargs)
+        return {
+            "records": 1,
+            "events": 0,
+            "source_cursor": kwargs["before_cursor"],
+            "preview_sha256": "a" * 64,
+            "dry_run": True,
+            "executed": False,
+        }
+
     async def purge(self, tenant, **kwargs):
         self.call("purge", tenant, **kwargs)
-        return {"records": 1, "events": 0, "source_cursor": kwargs["before_cursor"]}
+        return {
+            "records": 1,
+            "events": 0,
+            "source_cursor": kwargs["before_cursor"],
+            "preview_sha256": kwargs["expected_preview_sha256"],
+            "dry_run": False,
+            "executed": True,
+        }
 
 
 @pytest.fixture
@@ -181,6 +275,7 @@ async def history_environment():
     app = FastAPI()
     app.state.settings = SimpleNamespace(**configured)
     app.state.postgres = HistoryStore()
+    app.state.redis = SimpleNamespace(_client=object())
     app.include_router(router)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -232,10 +327,36 @@ async def test_events_and_literal_search_text_are_scoped_parameters(history_envi
     searched = await env.client.get("/v1/history/search", params={"q": query, "kind": "goal"})
     assert searched.status_code == 200
     assert env.store.calls[-1] == (
-        "search",
+        "search_documents",
         ("acme", query),
-        {"kind": "goal", "after": "", "limit": 50},
+        {
+            "kind": "goal",
+            "scope": "all",
+            "after": "",
+            "limit": 50,
+            "include_relations": False,
+        },
     )
+
+    expanded = await env.client.get(
+        "/v1/history/search",
+        params={
+            "q": "completed",
+            "include_summary": "true",
+            "expand": "relations",
+        },
+    )
+    assert expanded.status_code == 200
+    payload = expanded.json()
+    assert payload["summary"] == {
+        "returned": 1,
+        "by_document_type": {"record": 1, "event": 0},
+        "by_kind": {"goal": 1},
+        "acl_rechecked": True,
+    }
+    assert payload["results"][0]["relations"] == [
+        {"kind": "conversation", "resource_id": "goal-1", "relation": "conversation"}
+    ]
 
 
 @pytest.mark.parametrize("role", ["viewer", "operator"])
@@ -267,13 +388,108 @@ async def test_status_and_purge_work_in_shadow_but_do_not_enable_reads(history_e
     )
     assert purged.status_code == 200
     assert env.store.calls[-1] == (
-        "purge",
+        "preview_purge",
         ("other",),
         {"kind": "conversation", "before_cursor": "100-0"},
     )
+    assert purged.json()["purge"]["dry_run"] is True
+
+    executed = await env.client.post(
+        "/v1/history/purge",
+        json={
+            "kind": "conversation",
+            "before_cursor": "100-0",
+            "execute": True,
+            "expected_preview_sha256": "a" * 64,
+        },
+        headers={"x-api-key": "admin"},
+    )
+    assert executed.status_code == 200 and executed.json()["purge"]["executed"] is True
+    assert env.store.calls[-1] == (
+        "purge",
+        ("acme",),
+        {
+            "kind": "conversation",
+            "before_cursor": "100-0",
+            "expected_preview_sha256": "a" * 64,
+            "subject": "admin",
+        },
+    )
 
 
-@pytest.mark.parametrize("report", [None, {}, {"status": "prepared"}, {"status": "failed"}])
+async def test_poison_diagnosis_and_repair_are_admin_only_and_never_echo_payload(
+    history_environment, monkeypatch
+):
+    from app import postgres_worker
+
+    env = history_environment
+    calls = []
+
+    async def diagnose(runtime, source_id, **kwargs):
+        calls.append(("diagnose", runtime, source_id, kwargs))
+        return {
+            "records": [
+                {
+                    "event_id": "10-1",
+                    "error": "invalid_envelope",
+                    "pending": True,
+                    "payload_sha256": "b" * 64,
+                }
+            ],
+            "next_after": None,
+        }
+
+    async def repair(runtime, store, event_id, expected, replacement, subject, **kwargs):
+        calls.append(
+            ("repair", runtime, store, event_id, expected, replacement, subject, kwargs)
+        )
+        return {
+            "event_id": event_id,
+            "status": "repaired",
+            "payload_sha256": expected,
+            "replacement_sha256": "c" * 64,
+            "acknowledged_after_projection": True,
+        }
+
+    monkeypatch.setattr(postgres_worker, "diagnose_poison", diagnose)
+    monkeypatch.setattr(postgres_worker, "repair_poison", repair)
+    assert (await env.client.get("/v1/history/poison")).status_code == 403
+    diagnosed = await env.client.get(
+        "/v1/history/poison?after=0-0&limit=10", headers={"x-api-key": "admin"}
+    )
+    assert diagnosed.status_code == 200
+    assert diagnosed.json()["records"][0]["payload_sha256"] == "b" * 64
+    replacement = {
+        "schema_version": 1,
+        "command": "SET",
+        "key": "tenant:acme:agent:goal:goal-1",
+        "value": "PRIVATE_CORRECTED_ENVELOPE",
+    }
+    repaired = await env.client.post(
+        "/v1/history/poison/10-1/repair",
+        headers={"x-api-key": "admin"},
+        json={
+            "expected_payload_sha256": "b" * 64,
+            "replacement_envelope": replacement,
+        },
+    )
+    assert repaired.status_code == 200
+    assert "PRIVATE_CORRECTED_ENVELOPE" not in repaired.text
+    assert calls[-1][0] == "repair" and calls[-1][-2] == "admin"
+    assert calls[-1][-1] == {"tenant_id": "acme"}
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        None,
+        {},
+        {"status": "prepared", "schema_version": SCHEMA_VERSION},
+        {"status": "failed", "schema_version": SCHEMA_VERSION},
+        {"status": "verified"},
+        {"status": "verified", "schema_version": SCHEMA_VERSION - 1},
+    ],
+)
 async def test_unverified_migration_cannot_enable_history_reads(history_environment, report):
     env = history_environment
     env.store.migration = report
@@ -322,6 +538,13 @@ async def test_invalid_queries_fail_without_reflecting_input(history_environment
         {"kind": "goal", "before_cursor": 100},
         {"kind": "goal", "before_cursor": "PRIVATE_DSN"},
         {"kind": "credentials", "before_cursor": "100-0"},
+        {"kind": "goal", "before_cursor": "100-0", "execute": True},
+        {
+            "kind": "goal",
+            "before_cursor": "100-0",
+            "execute": False,
+            "expected_preview_sha256": "a" * 64,
+        },
     ],
 )
 async def test_purge_body_is_strict_and_does_not_echo_private_data(history_environment, body):

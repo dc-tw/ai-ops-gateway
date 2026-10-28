@@ -294,6 +294,7 @@ class WorkflowExecutionStore:
                         "token_budget": budget,
                         "created_at": now(),
                         "updated_at": now(),
+                        "history_search_approved": True,
                         "token_reservation": {
                             "day": day,
                             "reserved": budget,
@@ -436,6 +437,7 @@ class WorkflowExecutionStore:
             "step_deadline_seconds": workflow["compiled"]["step_deadline_seconds"],
             "created_at": now(),
             "updated_at": now(),
+            "history_search_approved": True,
             "approval_timeout_seconds": policy.get("approval_timeout_seconds", 86400),
             "workflow_node": {
                 "root_id": root["goal_id"],

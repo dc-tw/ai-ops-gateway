@@ -1,6 +1,6 @@
 # PostgreSQL 歷史儲存與操作指南
 
-更新日期：2026-10-27。架構決策見 [ADR-002](architecture/adr-002-postgres-history.md)。
+更新日期：2026-10-28。架構決策見 [ADR-002](architecture/adr-002-postgres-history.md)。
 
 本版增加可選的 PostgreSQL 長期歷史、查詢與中繼資料搜尋，不把 PostgreSQL 當作第二套 Agent
 執行引擎，也不取代 Redis 的即時執行權威。預設 `POSTGRES_DSN` 為空，原有部署不會自動遷移。
@@ -13,7 +13,7 @@
 | approval、Skill revocation epoch、額度、lease、queue、checkpoint | Redis | 不從歷史重建這些執行權限；checkpoint 不納入本版歸檔 |
 | 已歸檔的 record、event、conversation message 查詢 | PostgreSQL；切換後由 `/v1/history` 提供 | 長期保存、分頁、依 tenant 查詢 |
 | SSE 即時傳遞與既有 replay API | Redis | 歷史 events API 是獨立查詢，不改寫既有 SSE 合約 |
-| 歷史搜尋 | PostgreSQL | 白名單中繼資料索引；不是全文提示詞或語意搜尋 |
+| 歷史搜尋 | PostgreSQL | 白名單中繼資料、明確核可的 Goal／Evidence 正文與 provenance；不是任意提示詞或語意搜尋 |
 
 歸檔白名單包括 Agent、Skill 與其 revision、planning session 與其 revision、Goal、run、ATR
 finding、automation、tool receipt、conversation，以及 run／Goal／planning／automation／audit
@@ -21,9 +21,11 @@ finding、automation、tool receipt、conversation，以及 run／Goal／plannin
 planning revision 有各自不可變的資源識別。conversation 的 message 以事件保存，summary／memory
 cache 不另行歸檔。tool receipt 只保存 `status`、`tool`、`action_id`，不保存工具參數。
 
-「搜尋只索引中繼資料」不等於「資料庫沒有敏感內容」：Skill 內容、persona、計畫內容與對話
-message 等原有持久化內容仍可能進入歸檔。history viewer 能讀取自己 tenant 的歷史，尚無細分到
-個別資源 owner 的 ACL。正式環境必須管理資料輸入、tenant membership、資料庫與備份存取權。
+「受控搜尋」不等於「資料庫沒有敏感內容」：Skill 內容、persona、計畫內容與對話 message 等
+原有持久化內容仍可能進入歸檔。啟用 `RESOURCE_ACL_ENABLED` 時，查詢先依 Redis 當前 ACL 限縮，
+回傳結果、摘要與每個關聯又重查一次；撤權不等待 projector。ACL authority 不可用時回 503，
+不退回 tenant-wide PostgreSQL 結果。未啟用 ACL 時沿用 tenant-wide viewer 行為。正式環境仍須
+管理資料輸入、tenant membership、資料庫與備份存取權。
 
 ## 寫入、投影與一致性
 
@@ -89,8 +91,10 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up --detach 
 ## 既有資料遷移與 read cutover
 
 migration 是明確的操作，不由 HTTP request 自動建立表。`migrate` 使用 transaction advisory lock
-序列化 schema 變更，檢查版本、SQL checksum 與必要資料表；未知版本、checksum 不符或缺表都
-拒絕啟動，不會自動 drop、修表或倒退 migration。
+序列化 append-only、逐版 checksum migration，檢查版本、checksum 及必要 table／index；未知版本、
+非連續版本、checksum 不符或缺少關聯都拒絕啟動，不會自動 drop、修表或倒退 migration。schema v2
+加入 event 搜尋、trigram 與 retention ledger。verified report 綁定當前 schema version；升級後舊
+report 不可沿用，必須重新 backfill／reconcile 才能 read cutover。
 
 正式環境按以下順序執行：
 
@@ -100,7 +104,8 @@ migration 是明確的操作，不由 HTTP request 自動建立表。`migrate` �
    source ID 與 `shadow` mode。確認舊 replica、一次性管理程式與 raw writer 都已停止；maintenance
    fence 無法攔住未使用 adapter 的舊程式。
 4. 啟動 projector，觀察 backlog、pending／errors、Redis 記憶體與磁碟空間。
-5. 執行 `backfill`，再執行 `reconcile`；必須得到最新 `status=verified`。
+5. 執行 `backfill`；它先分批重建所有既有 PostgreSQL record／event 的安全搜尋投影，再補入 Redis
+   仍保留的來源資料。接著執行 `reconcile`；必須得到目前 schema version 的最新 `status=verified`。
 6. 將 Gateway 的 `POSTGRES_HISTORY_MODE` 改為 `postgres` 並 rollout。確認 history、tenant
    隔離及故障行為，再讓讀取端採用新的 history API。
 
@@ -120,8 +125,9 @@ python -m app.postgres_worker compact
 lease 暫停參與 capture 的領域寫入，再排空／比對穩定邊界；HTTP writer 可能暫時收到 503，應排
 維護窗口。lease 遺失、未處理 pending 或資料分歧會拒絕驗證／cutover。projector 可在維護時繼續。
 
-backfill **只補得回 Redis 目前仍保存的資料**。過去已 TTL 到期、trim、刪除或容量淘汰且未被
-outbox 捕捉的內容無法復原。reconcile 比對保留中的來源子集，允許 PostgreSQL 已保存但 Redis
+backfill 可從既有 PostgreSQL payload 重建安全搜尋文字，但 **source backfill 只補得回 Redis 目前
+仍保存的資料**。過去已 TTL 到期、trim、刪除或容量淘汰，且 PostgreSQL／outbox 都沒有的內容
+無法復原。reconcile 比對保留中的來源子集，允許 PostgreSQL 已保存但 Redis
 已到期的額外歷史；不是證明過去所有事件都完整存在。刻意 purge 的資源會記入 excluded，不能
 把這個數字當成自動復原需求。
 
@@ -139,12 +145,15 @@ group pending 與錯誤 stream，不能只看最大 cursor 判斷遷移完成。
 | `GET /v1/history/records` | viewer | record 分頁；可選 `kind`、`after`、`limit` |
 | `GET /v1/history/records/{kind}/{resource_id}` | viewer | 單筆歷史快照；revision ID 可包含 `:` |
 | `GET /v1/history/events` | viewer | event 分頁；可選 `kind`、`resource_id`、`after`、`limit` |
-| `GET /v1/history/search?q=...` | viewer | record 中繼資料搜尋；可選 `kind`、`after`、`limit` |
+| `GET /v1/history/search?q=...` | viewer | record／event 受控搜尋；可選 `kind`、`scope`、`after`、`limit`、`include_summary`、`expand=relations` |
 | `GET /v1/history/status` | admin | tenant 計數、schema、來源游標、migration 狀態 |
-| `POST /v1/history/purge` | admin | 指定 kind／來源游標的歸檔保留政策操作，見下節 |
+| `POST /v1/history/purge` | admin | 先 dry-run、再帶 preview hash 執行 archive-only 清理，見下節 |
+| `GET /v1/history/poison` | admin | 列出 pending poison 的安全診斷，不回傳原 payload |
+| `POST /v1/history/poison/{event_id}/repair` | admin | 驗證原 payload hash，以替代 envelope 投影成功後才 ACK |
 
-reads 除 status 外，需 `POSTGRES_HISTORY_MODE=postgres` 且最新 migration report 為 `verified`，
-否則回 409。DSN 未啟用或資料庫不可用回 503。status／purge 可供 shadow 階段管理，但仍須認證。
+reads 除 status 外，需 `POSTGRES_HISTORY_MODE=postgres`，且最新 migration report 同時為 `verified`
+並符合目前 schema version，否則回 409。DSN 未啟用或資料庫不可用回 503。status／purge／poison
+可供 shadow 階段管理，但仍須認證。
 回應標示 `history_only=true`、`consistency=eventual`、`execution_authority=false`，不能把歷史
 Goal 狀態拿去批准工具操作。新資料可能尚未投影，不應把暫時查不到解讀為執行未發生。
 
@@ -168,19 +177,29 @@ curl --fail-with-body --silent --show-error --get \
   "${GATEWAY_HISTORY_URL}/v1/history/search"
 ```
 
-搜尋只使用白名單欄位，例如名稱、狀態、role、rule ID、severity、tool 與資源 ID，單一索引文字
-有長度界線；不索引 persona、Skill 指令、計畫 context、對話正文或原始工具內容。實作採用
-`to_tsvector('simple', ...)`／`plainto_tsquery` 的 GIN 索引，另以字面子字串查找補充中文命中。
-這不是中文語意斷詞、向量檢索，也不是 audit／conversation 正文全文搜尋；`%`／`_` 不是搜尋
-萬用字元。PostgreSQL 的 parser／dictionary 與索引概念見[官方 FTS 文件](https://www.postgresql.org/docs/17/textsearch.html)。
+搜尋一律使用投影出的安全文字，不對 raw JSON 任意全文索引：白名單中繼資料包括名稱、狀態、
+role、rule ID、severity、tool、audit action／subject 與資源 ID；Skill package 只索引 source、
+repository、固定 commit 與 package hash。Goal objective／step 與完成證據只在 live safety boundary
+明確寫入 `history_search_approved=true` 後索引，舊資料不推定為已核可。persona、Skill instructions、
+plan context、conversation 正文、原始 ATR 攻擊輸入、工具參數／輸出與 hidden reasoning 不索引。
+
+實作採用 `to_tsvector('simple', ...)`／`plainto_tsquery` GIN、`pg_trgm` 及不區分大小寫的 literal
+substring 補充中文命中。trigram 是相似搜尋，結果不保證 exact match 或相關度排序；`%`／`_` 不
+是使用者萬用字元。這不是中文語意斷詞、向量／embedding，也不是任意 audit／conversation 正文
+搜尋。PostgreSQL 的 parser／dictionary 與索引概念見[官方 FTS 文件](https://www.postgresql.org/docs/17/textsearch.html)。
 
 ## 保留政策、刪除與 compact
 
-`POST /v1/history/purge` body 為 `{"kind":"conversation","before_cursor":"<來源毫秒-序號>"}`。
-此操作不可由 history API 還原，執行前必須確認 tenant、kind、已驗證的來源邊界、法規／保留政策
-與備份。它只刪除指定來源位置以前的 PostgreSQL 歸檔 payload，**不刪除仍在運作的 Redis 資料，
-不取消 Goal，也不撤銷 approval／Skill**。若需要完整移除活躍資料，須使用對應的 live 資源操作
-並另行規劃系統各層的資料治理。
+預設不自動刪除。第一次呼叫 `POST /v1/history/purge` 只接受
+`{"kind":"conversation","before_cursor":"<來源毫秒-序號>"}`，回傳 `dry_run=true`、筆數、資源數
+與綁定精確目標集合的 `preview_sha256`，不修改資料。操作員審查後才以同一 tenant／kind／cutoff
+加上 `"execute":true,"expected_preview_sha256":"..."` 執行；目標集合已變更時回 409，需重新預覽。
+單次最多 100,000 個 resource，超過時拒絕，須選較早 cutoff 分批。執行與 retention ledger 寫入
+位於同一 PostgreSQL transaction，記錄 operator 與計數而不複製 payload。
+
+執行後不可由 history API 還原；事前必須確認已驗證來源邊界、法規／保留政策與備份。它只刪除
+指定來源位置以前的 PostgreSQL 歸檔 payload，**不刪除仍在運作的 Redis 資料，不取消 Goal，也不
+撤銷 approval／Skill**。完整移除活躍資料須使用對應 live 操作並另行治理各持久化層。
 
 截止游標須來自同 tenant 的 `GET /v1/history/status` 中 `status.latest_cursor`，或經確認的更早
 來源位置；沒有已投影資料、或 cutoff 超過該 tenant 已投影最大位置時會拒絕，不能填未來時間戳。
@@ -217,9 +236,15 @@ purge 保存 resource tombstone 與 kind-wide purge fence；即使資源只有 e
 
 projector 失敗時只記安全診斷，不把 DSN、SQL／私人 payload 放進公開 HTTP 錯誤或操作日誌。
 排錯先看連線／schema 狀態、group pending、`<outbox>:errors` 的 event ID 與 migration report。
-不要把原 payload 貼到公開 Issue。修復 poison entry 前先備份，確認來源與錯誤原因，於受控環境
-修正來源／envelope 再重新投影；目前沒有自動跳過／dead-letter ACK 的管理工具，切勿為了讓
-reconcile 變綠而盲目 ACK 或刪除。
+`GET /v1/history/poison` 只回可由 raw envelope key 安全歸屬於目前 principal tenant 的 event ID、
+consumer、delivery／idle 與 payload SHA-256；無法歸屬的 malformed entry 不透過 tenant HTTP API
+顯示或修復，須在受控 Redis／CLI 維運環境處理。原 payload 不可貼到公開 Issue。
+
+修復時先備份並確認原因，再提交原 payload 的預期 SHA-256 與完整替代 envelope；原始與替代 key
+必須屬於 principal 的同一 tenant，不能用修復搬移租戶。服務先用原
+event ID 將替代內容冪等寫入 PostgreSQL，成功後才以原子 Lua 驗證 pending、ACK、移除 marker，
+並寫入安全 audit；任一步驟失敗都保留可重試狀態。沒有 skip／drop API，拒絕為了讓 reconcile
+變綠而盲目 ACK 或刪除。修復替代的是 archive projection，不會重做原 live 業務副作用。
 
 PostgreSQL 中斷期間 outbox 不會自動丟棄，須監控 Redis 空間、磁碟與 backlog；容量耗盡會影響
 執行寫入。本機 Redis 使用 AOF，但本方案不保證 PostgreSQL 即時零 RPO：尚未投影資料仍依賴
@@ -248,7 +273,8 @@ sh scripts/test_postgres_stack.sh
 
 [測試腳本](../scripts/test_postgres_stack.sh)使用獨立 Compose project、image、volume 與 loopback
 port，跑 authenticated HTTP、兩個 projector、真實 PostgreSQL stop／recover、backfill／reconcile、
-read cutover、tenant／RBAC／搜尋與資料隔離，再停止該測試 stack 的 writers，執行真實
+schema-bound cutover、record／event 受控搜尋、關聯 ACL 重查、兩階段 retention、poison 修復、
+tenant／RBAC 與資料隔離，再停止該測試 stack 的 writers，執行真實
 `pg_dump`／`pg_restore` 並比對各 `gateway_` 表的筆數與內容摘要。Redis 留在 stack 中，這不是
 「從 PostgreSQL 重建執行權限」測試。預設結束會刪除**這個專用測試 project 的 volume**；
 `KEEP_STACK=1` 才保留排錯環境。可用 `POSTGRES_TEST_PROJECT`／`POSTGRES_TEST_PORT` 避開衝突；

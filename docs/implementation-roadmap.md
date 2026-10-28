@@ -10,7 +10,7 @@
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 核心交付完成／本機及 Docker 故障驗證通過；跨階段封版仍屬 M9 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心交付完成／本機及 Docker 驗證通過；真實模型校正屬 M9 |
-| M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 待實作 |
+| M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 核心交付完成／真實 Redis＋PG 與完整 Docker 生命週期驗證通過；production 治理屬 M9 |
 | M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 待實作 |
 | M8 | ACP v1 stdio client adapter、session／串流／取消／逐次核准 | 待實作 |
 | M9 | 全量回歸、隔離 staging／故障／PITR／壓測及封版證據 | 待實作 |
@@ -58,8 +58,14 @@
   32 節點大型繁中 Skill 投影，以及 Postgres 對帳均通過。核心交付完成，
   不代表 M5–M9、M2 剩餘治理或正式環境驗收已完成。
 - M5：[共享模型版本、逐呼叫遙測與 plan-forecast](releases/2026-10-27-m5-forecast.md)。
-  890 tests、零 skip（含新增 scheduler fixture）；真實 HTTP／Redis／worker synthetic provider
-  Docker E2E 通過。未把 mock profile 當成真實模型效能；M6–M9 與 M2 剩餘治理仍待完成。
+  最終 891 tests、零 skip；真實 HTTP／Redis／worker synthetic provider
+  Docker E2E 通過。未把 mock profile 當成真實模型效能；後續進度見 M6 紀錄。
+- M6：[受控歷史搜尋與生命週期](releases/2026-10-28-m6-history-lifecycle.md)。schema v2、
+  record／event 受控 FTS＋literal／trigram、當前 ACL 二次檢查、兩階段 retention ledger／tombstone、
+  poison 診斷與 repaired resend 已完成。全套 903 tests 通過；真實 Redis 8.2＋PostgreSQL 17
+  核心 store／projection 專項 73 tests 通過；完整 Docker 測試涵蓋雙 projector、PG／Redis 故障、
+  backfill／reconcile、cutover、pg_dump／restore。
+  M7–M9 與 M2 剩餘治理仍待完成。
 
 ## 後續階段的固定實作契約
 

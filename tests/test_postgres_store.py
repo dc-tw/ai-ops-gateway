@@ -13,7 +13,7 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 
-from app.core.postgres_schema import SCHEMA_CHECKSUM, SCHEMA_VERSION
+from app.core.postgres_schema import MIGRATION_1_SQL, MIGRATION_CHECKSUMS, SCHEMA_VERSION
 from app.core.postgres_store import (
     PostgresConflict,
     PostgresEnvelopeError,
@@ -104,13 +104,77 @@ async def test_migration_is_explicit_checksummed_and_concurrent(database):
                 "SELECT version,checksum FROM gateway_schema_migrations"
             )
         ).fetchall()
-        assert rows == [{"version": SCHEMA_VERSION, "checksum": SCHEMA_CHECKSUM}]
+        assert rows == [
+            {"version": version, "checksum": MIGRATION_CHECKSUMS[version]}
+            for version in range(1, SCHEMA_VERSION + 1)
+        ]
         await stores[0].open()  # An open pool is safe to reuse.
     finally:
         await asyncio.gather(*[value.close() for value in stores])
 
 
-@pytest.mark.parametrize("change", ["unknown-version", "checksum", "missing-table"])
+async def test_existing_v1_schema_requires_and_accepts_explicit_v2_upgrade(database):
+    await database.connection.execute(
+        "CREATE TABLE gateway_schema_migrations ("
+        "version integer PRIMARY KEY, checksum text NOT NULL, "
+        "applied_at timestamptz NOT NULL DEFAULT clock_timestamp())"
+    )
+    await database.connection.execute(MIGRATION_1_SQL)
+    await database.connection.execute(
+        "INSERT INTO gateway_schema_migrations(version,checksum) VALUES (1,%s)",
+        (MIGRATION_CHECKSUMS[1],),
+    )
+    await database.connection.execute(
+        "INSERT INTO gateway_records "
+        "(source_id,tenant_id,kind,resource_id,data,search_text,source_ms,source_seq) "
+        "VALUES ('gateway','acme','goal','legacy-goal',%s::jsonb,'legacy',1,0)",
+        (
+            json.dumps(
+                {
+                    "goal_id": "legacy-goal",
+                    "status": "completed",
+                    "objective": "既有核可正文",
+                    "history_search_approved": True,
+                }
+            ),
+        ),
+    )
+    await database.connection.execute(
+        "INSERT INTO gateway_events "
+        "(source_id,tenant_id,kind,resource_id,event_id,data,source_ms,source_seq) "
+        "VALUES ('gateway','acme','audit','audit','1-0',%s::jsonb,1,0)",
+        (json.dumps({"action": "legacy.safe.audit", "status": "completed"}),),
+    )
+    value = PostgresStore(database.dsn)
+    with pytest.raises(PostgresSchemaError, match="requires migration"):
+        await value.open()
+    await value.open(migrate=True)
+    reindexed = await value.reindex_search_documents(batch_size=1)
+    assert reindexed == {"records": 1, "events": 1}
+    assert len(await value.search_documents("acme", "既有核可正文", scope="records")) == 1
+    assert len(await value.search_documents("acme", "legacy.safe.audit", scope="events")) == 1
+    await value.close()
+    versions = await (
+        await database.connection.execute(
+            "SELECT version,checksum FROM gateway_schema_migrations ORDER BY version"
+        )
+    ).fetchall()
+    assert versions == [
+        {"version": version, "checksum": MIGRATION_CHECKSUMS[version]}
+        for version in range(1, SCHEMA_VERSION + 1)
+    ]
+    columns = await (
+        await database.connection.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name='gateway_events'"
+        )
+    ).fetchall()
+    assert {row["column_name"] for row in columns} >= {"search_text", "search_vector"}
+
+
+@pytest.mark.parametrize(
+    "change", ["unknown-version", "checksum", "missing-table", "missing-index"]
+)
 async def test_migration_refuses_unknown_or_corrupt_schema(database, change):
     value = PostgresStore(database.dsn)
     await value.open(migrate=True)
@@ -121,8 +185,10 @@ async def test_migration_refuses_unknown_or_corrupt_schema(database, change):
         )
     elif change == "checksum":
         await database.connection.execute("UPDATE gateway_schema_migrations SET checksum='changed'")
-    else:
+    elif change == "missing-table":
         await database.connection.execute("DROP TABLE gateway_records")
+    else:
+        await database.connection.execute("DROP INDEX gateway_events_search_trigram")
     for migrate in (False, True):
         with pytest.raises(PostgresSchemaError):
             await value.open(migrate=migrate)
@@ -158,6 +224,70 @@ async def test_resource_acl_is_applied_before_pagination_and_search_limit(store)
     assert [row["resource_id"] for row in rows] == ["b-visible"]
     assert await store.list_records("acme", authorized_resources=[]) == []
     assert await store.search("acme", "proof", authorized_resources=[]) == []
+
+
+async def test_document_search_covers_approved_goal_evidence_and_safe_audit_metadata(store):
+    approved = record(
+        resource="approved",
+        objective="分析部署失敗",
+        history_search_approved=True,
+        steps=[
+            {
+                "status": "completed",
+                "query": "找出根因",
+                "answer": "根因是設定漂移",
+                "tool_result": "PRIVATE_TOOL_RESULT",
+            }
+        ],
+    )
+    await store.apply("1-0", approved)
+    await store.apply(
+        "2-0",
+        record(resource="unapproved", objective="UNAPPROVED_ATTACK_TEXT"),
+    )
+    evidence = event(
+        event_id="20-0",
+        type="agent_event",
+        history_search_approved=True,
+        event={
+            "type": "completed",
+            "answer": "已驗證的證據結論",
+            "evidence_validated": True,
+            "tool_result": "PRIVATE_EVENT_TOOL_RESULT",
+            "evidence_report": {
+                "evidence_sources": [
+                    {"url": "https://example.com/evidence", "content_sha256": "sha256:abc"}
+                ]
+            },
+        },
+    )
+    await store.apply("3-0", evidence)
+    audit = event(event_id="30-0", action="goal.threat_detection", status="blocked")
+    audit["key"] = "tenant:acme:audit"
+    audit["value"]["payload"] = json.dumps(
+        {
+            "action": "goal.threat_detection",
+            "status": "blocked",
+            "subject": "operator",
+            "event": {"user_input": "RAW_ATTACK_PAYLOAD"},
+        }
+    )
+    await store.apply("4-0", audit)
+
+    records = await store.search_documents("acme", "設定漂移", scope="records")
+    assert [(row["document_type"], row["resource_id"]) for row in records] == [
+        ("record", "approved")
+    ]
+    evidence_rows = await store.search_documents("acme", "example.com/evidence", scope="events")
+    assert len(evidence_rows) == 1 and evidence_rows[0]["document_type"] == "event"
+    assert "PRIVATE_EVENT_TOOL_RESULT" not in evidence_rows[0]["summary"]
+    audit_rows = await store.search_documents("acme", "goal.threat_detection", kind="audit")
+    assert len(audit_rows) == 1 and audit_rows[0]["kind"] == "audit"
+    assert await store.search_documents("acme", "UNAPPROVED_ATTACK_TEXT") == []
+    assert await store.search_documents("acme", "RAW_ATTACK_PAYLOAD") == []
+    assert await store.search_documents(
+        "acme", "設定漂移", authorized_resources=["goal:foreign"]
+    ) == []
 
 
 @pytest.mark.parametrize(
@@ -301,12 +431,25 @@ async def test_purge_retains_deduplication_and_backfill_fences_while_allowing_ne
     await store.apply("10-0", old)
     await store.apply("20-0", record(resource="goal-new", name="Newer history"))
     await store.apply("11-0", event())
-    result = await store.purge("acme", "goal", "15-0")
-    assert result["records"] == result["events"] == 1
+    event_only = event(event_id="12-1")
+    event_only["key"] = "tenant:acme:agent:goal:events:event-only"
+    await store.apply("12-0", event_only)
+    preview = await store.preview_purge("acme", "goal", "15-0")
+    assert preview["dry_run"] is True and preview["executed"] is False
+    assert preview["records"] == 1 and preview["events"] == 2
+    assert preview["target_resources"] == 2
+    assert await store.get_record("acme", "goal", "goal-one") is not None
+    result = await store.purge(
+        "acme", "goal", "15-0", preview["preview_sha256"], "admin"
+    )
+    assert result["records"] == 1 and result["events"] == 2
+    assert result["executed"] is True
+    assert (await store.status("acme"))["retention_operations"] == 1
     assert await store.get_record("acme", "goal", "goal-one") is None
     assert await store.get_record("acme", "goal", "goal-new") is not None
     assert await store.events("acme", "goal") == []
     assert await store.is_suppressed("acme", "goal", "goal-one")
+    assert await store.is_suppressed("acme", "goal", "event-only")
     assert await store.apply("10-0", old) is False
     await store.apply("14-0", record(name="Late prior record"))
     await store.apply("30-0", record(name="Backfilled prior record") | {"backfill": True})
@@ -317,6 +460,21 @@ async def test_purge_retains_deduplication_and_backfill_fences_while_allowing_ne
         "name"
     ] == "New live generation"
     assert await store.events("acme", "goal") == []
+
+
+async def test_purge_execution_rejects_a_preview_whose_target_set_changed(store):
+    await store.apply("10-0", record())
+    await store.apply("20-0", record(resource="newer-than-cutoff"))
+    preview = await store.preview_purge("acme", "goal", "15-0")
+    late = event(event_id="11-1")
+    late["key"] = "tenant:acme:agent:goal:events:late-event-only"
+    await store.apply("11-0", late)
+    with pytest.raises(PostgresConflict, match="preview changed"):
+        await store.purge(
+            "acme", "goal", "15-0", preview["preview_sha256"], "admin"
+        )
+    assert await store.get_record("acme", "goal", "goal-one") is not None
+    assert await store.events("acme", "goal", "late-event-only")
 
 
 async def test_fts_and_literal_chinese_search_only_index_safe_metadata(store):
@@ -455,8 +613,13 @@ async def test_migration_reports_remain_source_scoped_and_status_does_not_dump_r
     }
     assert await store.latest_migration() is None
     await store.save_migration(report)
-    assert await store.latest_migration() == report
-    assert "PRIVATE-REPORT" not in json.dumps(await store.status("acme"))
+    saved = await store.latest_migration()
+    assert saved == report | {"schema_version": SCHEMA_VERSION}
+    status = await store.status("acme")
+    assert status["migration"]["schema_version"] == SCHEMA_VERSION
+    assert "PRIVATE-REPORT" not in json.dumps(status)
+    with pytest.raises(ValueError, match="schema"):
+        await store.save_migration(report | {"schema_version": SCHEMA_VERSION - 1})
     other = PostgresStore(database.dsn, source_id="other-report-source")
     await other.open()
     try:
@@ -520,7 +683,7 @@ def test_pool_logs_redact_all_connection_context_and_filter_is_installed_once():
 async def test_future_purge_cutoff_is_rejected_without_suppressing_new_work(store, tenant):
     await store.apply("10-0", record())
     with pytest.raises(PostgresInvalidCursor, match="observed tenant history"):
-        await store.purge(tenant, "goal", "18446744073709551615-0")
+        await store.preview_purge(tenant, "goal", "18446744073709551615-0")
     assert not await store.is_suppressed(tenant, "goal", "future-goal")
     await store.apply("11-0", record(tenant=tenant, resource="future-goal"))
     assert await store.get_record(tenant, "goal", "future-goal") is not None

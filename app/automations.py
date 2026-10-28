@@ -343,6 +343,7 @@ async def dispatch(
             summary, ensure_ascii=False
         )
     await validate_goal_input(runtime, settings, model_router, detector, goal)
+    goal["history_search_approved"] = True
     result = await store.submit(
         job["tenant_id"],
         job["automation_id"],

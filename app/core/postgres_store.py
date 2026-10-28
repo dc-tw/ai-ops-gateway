@@ -19,15 +19,23 @@ from app.core.durable_types import (
     RECORD_KINDS,
     classify_key,
     conversation_id_from_key,
+    event_search_text,
+    relation_refs,
     sanitize_record,
     search_text,
     tenant_from_key,
 )
-from app.core.postgres_schema import SCHEMA_CHECKSUM, SCHEMA_SQL, SCHEMA_VERSION, TABLE_NAMES
+from app.core.postgres_schema import (
+    MIGRATION_CHECKSUMS,
+    MIGRATIONS,
+    SCHEMA_RELATIONS,
+    SCHEMA_VERSION,
+)
 from app.core.security import TENANT_PATTERN
 
 _MAX_JSON_BYTES = 2 * 1_024 * 1_024
 _MAX_ENVELOPE_BYTES = 8 * 1_024 * 1_024
+_MAX_RETENTION_RESOURCES = 100_000
 _CURSOR = re.compile(r"^(0|[1-9][0-9]*)-(0|[1-9][0-9]*)$")
 
 
@@ -168,6 +176,34 @@ def _page_after(value: str) -> tuple[str, str]:
         raise PostgresInvalidCursor("Invalid archive page cursor") from None
 
 
+def _document_cursor(document_type: str, kind: str, resource_id: str, document_id: str) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps([document_type, kind, resource_id, document_id]).encode()
+    ).decode()
+
+
+def _document_after(value: str) -> tuple[str, str, str, str]:
+    if value == "":
+        return "", "", "", ""
+    try:
+        if not isinstance(value, str) or len(value) > 512:
+            raise ValueError
+        decoded = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) != 4
+            or not all(isinstance(part, str) for part in decoded)
+            or decoded[0] not in {"record", "event"}
+            or decoded[1] not in RECORD_KINDS | EVENT_KINDS
+            or not decoded[2]
+            or any(len(part) > 256 or "\x00" in part for part in decoded)
+        ):
+            raise ValueError
+        return tuple(decoded)
+    except (ValueError, TypeError, UnicodeError):
+        raise PostgresInvalidCursor("Invalid archive document cursor") from None
+
+
 class PostgresStore:
     def __init__(self, dsn: str, source_id: str = "gateway") -> None:
         if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", source_id):
@@ -225,22 +261,27 @@ class PostgresStore:
                         "SELECT version, checksum FROM gateway_schema_migrations ORDER BY version"
                     )
                 ).fetchall()
-                if any(
-                    row["version"] != SCHEMA_VERSION or row["checksum"] != SCHEMA_CHECKSUM
-                    for row in versions
+                applied = [row["version"] for row in versions]
+                if (
+                    applied != list(range(1, len(applied) + 1))
+                    or any(
+                        row["version"] not in MIGRATIONS
+                        or row["checksum"] != MIGRATION_CHECKSUMS[row["version"]]
+                        for row in versions
+                    )
                 ):
                     raise PostgresSchemaError("Archive schema version or checksum is unsupported")
-                if not versions:
-                    if not migrate:
-                        raise PostgresSchemaError("Archive schema requires migration")
-                    await connection.execute(SCHEMA_SQL)
+                if len(versions) < SCHEMA_VERSION and not migrate:
+                    raise PostgresSchemaError("Archive schema requires migration")
+                for version in range(len(versions) + 1, SCHEMA_VERSION + 1):
+                    await connection.execute(MIGRATIONS[version])
                     await connection.execute(
                         "INSERT INTO gateway_schema_migrations(version, checksum) VALUES (%s, %s)",
-                        (SCHEMA_VERSION, SCHEMA_CHECKSUM),
+                        (version, MIGRATION_CHECKSUMS[version]),
                     )
-                for table in TABLE_NAMES:
+                for relation in SCHEMA_RELATIONS:
                     row = await (
-                        await connection.execute("SELECT to_regclass(%s) AS name", (table,))
+                        await connection.execute("SELECT to_regclass(%s) AS name", (relation,))
                     ).fetchone()
                     if row["name"] is None:
                         raise PostgresSchemaError("Archive schema is incomplete")
@@ -314,6 +355,7 @@ class PostgresStore:
 
     async def _event(self, connection, tenant, kind, resource, event_id, data, position):
         digest = hashlib.sha256(_canonical(data).encode("utf-8")).hexdigest()
+        indexed = event_search_text(kind, data)
         scope = (self.source_id, tenant, kind, resource, event_id)
         inserted = await (
             await connection.execute(
@@ -333,12 +375,17 @@ class PostgresStore:
             ).fetchone()
             if prior["payload_hash"] != digest:
                 raise PostgresConflict("Archive event identity conflicts with prior content")
+            await connection.execute(
+                "UPDATE gateway_events SET search_text=%s WHERE source_id=%s AND tenant_id=%s "
+                "AND kind=%s AND resource_id=%s AND event_id=%s AND search_text<>%s",
+                (indexed, *scope, indexed),
+            )
             return False
         await connection.execute(
             "INSERT INTO gateway_events "
-            "(source_id,tenant_id,kind,resource_id,event_id,data,source_ms,source_seq) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            (*scope, Jsonb(data), *position),
+            "(source_id,tenant_id,kind,resource_id,event_id,data,search_text,source_ms,source_seq) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (*scope, Jsonb(data), indexed, *position),
         )
         return True
 
@@ -541,6 +588,168 @@ class PostgresStore:
         _canonical(query)
         return await self._records(tenant, kind, after, limit, query, authorized_resources)
 
+    async def search_documents(
+        self,
+        tenant: str,
+        query: str,
+        kind: str = "",
+        after: str = "",
+        limit: int = 50,
+        scope: str = "all",
+        authorized_resources=None,
+        include_relations: bool = False,
+    ):
+        """Search safe record/event projections; never return raw event payloads."""
+        self._tenant(tenant)
+        self._limit(limit)
+        if not isinstance(query, str) or not query.strip() or len(query) > 512:
+            raise ValueError("Invalid archive search query")
+        if kind and kind not in RECORD_KINDS | EVENT_KINDS:
+            raise ValueError("Unsupported archive search kind")
+        if scope not in {"all", "records", "events"}:
+            raise ValueError("Unsupported archive search scope")
+        if type(include_relations) is not bool:
+            raise ValueError("Invalid archive relation option")
+        _canonical(query)
+        last = _document_after(after)
+        branches = []
+        params: list[Any] = []
+        if scope in {"all", "records"}:
+            branches.append(
+                "SELECT 'record'::text AS document_type,kind,resource_id,''::text AS document_id,"
+                "data,search_text,search_vector,source_ms,source_seq,archived_at "
+                "FROM gateway_records WHERE source_id=%s AND tenant_id=%s"
+            )
+            params.extend([self.source_id, tenant])
+        if scope in {"all", "events"}:
+            branches.append(
+                "SELECT 'event'::text AS document_type,kind,resource_id,event_id AS document_id,"
+                "data,search_text,search_vector,source_ms,source_seq,archived_at "
+                "FROM gateway_events WHERE source_id=%s AND tenant_id=%s"
+            )
+            params.extend([self.source_id, tenant])
+        sql = "SELECT * FROM (" + " UNION ALL ".join(branches) + ") AS documents WHERE "
+        sql += "(document_type,kind,resource_id,document_id)>(%s,%s,%s,%s)"
+        params.extend(last)
+        if authorized_resources is not None:
+            sql += """ AND ((CASE
+                WHEN document_type='record' AND kind='skill_revision' THEN 'skill'
+                WHEN document_type='record' AND kind='planning_revision' THEN 'planning_session'
+                WHEN document_type='record' AND kind='tool_receipt' THEN 'goal'
+                WHEN document_type='event' AND kind='planning' THEN 'planning_session'
+                ELSE kind END) || ':' || (CASE
+                WHEN document_type='record' AND kind IN
+                    ('skill_revision','planning_revision','tool_receipt')
+                THEN split_part(resource_id,':',1) ELSE resource_id END)) = ANY(%s::text[])"""
+            params.append(authorized_resources)
+        if kind:
+            sql += " AND kind=%s"
+            params.append(kind)
+        sql += (
+            " AND (search_vector @@ plainto_tsquery('simple', %s) "
+            "OR search_text %% %s OR strpos(lower(search_text),lower(%s))>0)"
+        )
+        params.extend([query, query, query])
+        sql += " ORDER BY document_type,kind,resource_id,document_id LIMIT %s"
+        params.append(limit)
+        async with self._pool().connection() as connection:
+            rows = await (await connection.execute(sql, params)).fetchall()
+        return [
+            {
+                "cursor": _document_cursor(
+                    row["document_type"], row["kind"], row["resource_id"], row["document_id"]
+                ),
+                "document_type": row["document_type"],
+                "kind": row["kind"],
+                "resource_id": row["resource_id"],
+                **({"event_id": row["document_id"]} if row["document_type"] == "event" else {}),
+                "summary": row["search_text"][:512],
+                **(
+                    {
+                        "_relation_candidates": relation_refs(
+                            row["document_type"],
+                            row["kind"],
+                            row["resource_id"],
+                            row["data"],
+                        )
+                    }
+                    if include_relations
+                    else {}
+                ),
+                "source_cursor": _source_cursor(row),
+                "archived_at": row["archived_at"].isoformat(),
+            }
+            for row in rows
+        ]
+
+    async def reindex_search_documents(self, *, batch_size: int = 500, check=None) -> dict:
+        """Rebuild safe projections for archived rows that predate the active schema."""
+        if type(batch_size) is not int or not 1 <= batch_size <= 2_000:
+            raise ValueError("Invalid archive reindex batch size")
+        counts = {"records": 0, "events": 0}
+        last_record = ("", "", "")
+        while True:
+            async with self._pool().connection() as connection, connection.transaction():
+                rows = await (
+                    await connection.execute(
+                        "SELECT tenant_id,kind,resource_id,data,source_ms,source_seq "
+                        "FROM gateway_records WHERE source_id=%s AND "
+                        "(tenant_id,kind,resource_id)>(%s,%s,%s) "
+                        "ORDER BY tenant_id,kind,resource_id LIMIT %s",
+                        (self.source_id, *last_record, batch_size),
+                    )
+                ).fetchall()
+                for row in rows:
+                    await connection.execute(
+                        "UPDATE gateway_records SET search_text=%s WHERE source_id=%s "
+                        "AND tenant_id=%s AND kind=%s AND resource_id=%s "
+                        "AND source_ms=%s AND source_seq=%s",
+                        (
+                            search_text(row["kind"], row["data"]),
+                            self.source_id,
+                            row["tenant_id"],
+                            row["kind"],
+                            row["resource_id"],
+                            row["source_ms"],
+                            row["source_seq"],
+                        ),
+                    )
+            if not rows:
+                break
+            counts["records"] += len(rows)
+            last = rows[-1]
+            last_record = (last["tenant_id"], last["kind"], last["resource_id"])
+            if check is not None:
+                await check()
+
+        last_event = 0
+        while True:
+            async with self._pool().connection() as connection, connection.transaction():
+                rows = await (
+                    await connection.execute(
+                        "SELECT cursor,kind,data FROM gateway_events WHERE source_id=%s "
+                        "AND cursor>%s ORDER BY cursor LIMIT %s",
+                        (self.source_id, last_event, batch_size),
+                    )
+                ).fetchall()
+                for row in rows:
+                    await connection.execute(
+                        "UPDATE gateway_events SET search_text=%s WHERE source_id=%s "
+                        "AND cursor=%s",
+                        (
+                            event_search_text(row["kind"], row["data"]),
+                            self.source_id,
+                            row["cursor"],
+                        ),
+                    )
+            if not rows:
+                break
+            counts["events"] += len(rows)
+            last_event = rows[-1]["cursor"]
+            if check is not None:
+                await check()
+        return counts
+
     async def _records(self, tenant, kind, after, limit, query=None, authorized_resources=None):
         self._tenant(tenant)
         self._limit(limit)
@@ -620,44 +829,123 @@ class PostgresStore:
             for row in rows
         ]
 
-    async def purge(self, tenant: str, kind: str, before_cursor: str) -> dict:
+    async def _purge_plan(self, connection, tenant: str, kind: str, before_cursor: str):
         self._tenant(tenant)
         if kind not in RECORD_KINDS | EVENT_KINDS:
             raise ValueError("Unsupported archive purge kind")
         position = _position(before_cursor)
-        async with self._pool().connection() as connection, connection.transaction():
-            await self._lock(connection, tenant)
-            latest = await (
-                await connection.execute(
-                    "SELECT source_ms,source_seq FROM gateway_applied_operations "
-                    "WHERE source_id=%s AND tenant_id=%s "
-                    "ORDER BY source_ms DESC,source_seq DESC LIMIT 1",
-                    (self.source_id, tenant),
-                )
-            ).fetchone()
-            if latest is None or position > (int(latest["source_ms"]), int(latest["source_seq"])):
-                raise PostgresInvalidCursor("Purge cutoff exceeds observed tenant history")
-            event_count = await (
-                await connection.execute(
-                    "SELECT count(*) AS count FROM gateway_events WHERE source_id=%s "
-                    "AND tenant_id=%s AND kind=%s AND (source_ms,source_seq)<=(%s,%s)",
-                    (self.source_id, tenant, kind, *position),
-                )
-            ).fetchone()
-            rows = await (
-                await connection.execute(
-                    "SELECT resource_id FROM gateway_records WHERE source_id=%s AND tenant_id=%s "
-                    "AND kind=%s AND (source_ms,source_seq)<=(%s,%s)",
-                    (self.source_id, tenant, kind, *position),
-                )
-            ).fetchall()
-            for row in rows:
-                await self._delete(connection, tenant, kind, row["resource_id"], position, "purged")
+        latest = await (
             await connection.execute(
-                "DELETE FROM gateway_events WHERE source_id=%s AND tenant_id=%s AND kind=%s "
-                "AND (source_ms,source_seq)<=(%s,%s)",
+                "SELECT source_ms,source_seq FROM gateway_applied_operations "
+                "WHERE source_id=%s AND tenant_id=%s "
+                "ORDER BY source_ms DESC,source_seq DESC LIMIT 1",
+                (self.source_id, tenant),
+            )
+        ).fetchone()
+        if latest is None or position > (int(latest["source_ms"]), int(latest["source_seq"])):
+            raise PostgresInvalidCursor("Purge cutoff exceeds observed tenant history")
+        record_count = await (
+            await connection.execute(
+                "SELECT count(*) AS count FROM gateway_records WHERE source_id=%s "
+                "AND tenant_id=%s AND kind=%s AND (source_ms,source_seq)<=(%s,%s)",
                 (self.source_id, tenant, kind, *position),
             )
+        ).fetchone()
+        event_count = await (
+            await connection.execute(
+                "SELECT count(*) AS count FROM gateway_events WHERE source_id=%s "
+                "AND tenant_id=%s AND kind=%s AND (source_ms,source_seq)<=(%s,%s)",
+                (self.source_id, tenant, kind, *position),
+            )
+        ).fetchone()
+        target_count = await (
+            await connection.execute(
+                "SELECT count(*) AS count FROM ("
+                "SELECT resource_id FROM gateway_records WHERE source_id=%s AND tenant_id=%s "
+                "AND kind=%s AND (source_ms,source_seq)<=(%s,%s) UNION "
+                "SELECT resource_id FROM gateway_events WHERE source_id=%s AND tenant_id=%s "
+                "AND kind=%s AND (source_ms,source_seq)<=(%s,%s)) AS targets",
+                (
+                    self.source_id,
+                    tenant,
+                    kind,
+                    *position,
+                    self.source_id,
+                    tenant,
+                    kind,
+                    *position,
+                ),
+            )
+        ).fetchone()
+        if int(target_count["count"]) > _MAX_RETENTION_RESOURCES:
+            raise PostgresConflict("Retention operation exceeds the bounded resource limit")
+        rows = await (
+            await connection.execute(
+                "SELECT resource_id FROM ("
+                "SELECT resource_id FROM gateway_records WHERE source_id=%s AND tenant_id=%s "
+                "AND kind=%s AND (source_ms,source_seq)<=(%s,%s) UNION "
+                "SELECT resource_id FROM gateway_events WHERE source_id=%s AND tenant_id=%s "
+                "AND kind=%s AND (source_ms,source_seq)<=(%s,%s)) AS targets ORDER BY resource_id",
+                (
+                    self.source_id,
+                    tenant,
+                    kind,
+                    *position,
+                    self.source_id,
+                    tenant,
+                    kind,
+                    *position,
+                ),
+            )
+        ).fetchall()
+        resources = [row["resource_id"] for row in rows]
+        body = {
+            "schema_version": 1,
+            "source_id": self.source_id,
+            "tenant_id": tenant,
+            "kind": kind,
+            "before_cursor": before_cursor,
+            "records": record_count["count"],
+            "events": event_count["count"],
+            "target_resources": int(target_count["count"]),
+            "archive_only": True,
+        }
+        digest = hashlib.sha256(
+            _canonical(body | {"resource_ids": resources}).encode("utf-8")
+        ).hexdigest()
+        return body | {"preview_sha256": digest}, resources, position
+
+    async def preview_purge(self, tenant: str, kind: str, before_cursor: str) -> dict:
+        async with self._pool().connection() as connection, connection.transaction():
+            await self._lock(connection, tenant)
+            plan, _resources, _position_value = await self._purge_plan(
+                connection, tenant, kind, before_cursor
+            )
+            return plan | {"dry_run": True, "executed": False}
+
+    async def purge(
+        self,
+        tenant: str,
+        kind: str,
+        before_cursor: str,
+        expected_preview_sha256: str,
+        subject: str,
+    ) -> dict:
+        if not isinstance(expected_preview_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_preview_sha256
+        ):
+            raise ValueError("A valid purge preview hash is required")
+        if not isinstance(subject, str) or not subject.strip() or len(subject) > 256:
+            raise ValueError("A valid purge operator is required")
+        async with self._pool().connection() as connection, connection.transaction():
+            await self._lock(connection, tenant)
+            plan, resources, position = await self._purge_plan(
+                connection, tenant, kind, before_cursor
+            )
+            if plan["preview_sha256"] != expected_preview_sha256:
+                raise PostgresConflict("Purge preview changed; run dry-run again")
+            for resource_id in resources:
+                await self._delete(connection, tenant, kind, resource_id, position, "purged")
             await connection.execute(
                 "INSERT INTO gateway_purge_fences AS saved "
                 "(source_id,tenant_id,kind,source_ms,source_seq) VALUES (%s,%s,%s,%s,%s) "
@@ -666,12 +954,23 @@ class PostgresStore:
                 "WHERE (saved.source_ms,saved.source_seq)<(EXCLUDED.source_ms,EXCLUDED.source_seq)",
                 (self.source_id, tenant, kind, *position),
             )
-        return {
-            "kind": kind,
-            "before_cursor": before_cursor,
-            "records": len(rows),
-            "events": event_count["count"],
-        }
+            await connection.execute(
+                "INSERT INTO gateway_retention_operations "
+                "(source_id,tenant_id,kind,before_cursor,preview_sha256,records,events,"
+                "target_resources,executed_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    self.source_id,
+                    tenant,
+                    kind,
+                    before_cursor,
+                    plan["preview_sha256"],
+                    plan["records"],
+                    plan["events"],
+                    plan["target_resources"],
+                    subject,
+                ),
+            )
+        return plan | {"dry_run": False, "executed": True}
 
     async def status(self, tenant: str | None = None) -> dict:
         if tenant is not None:
@@ -685,6 +984,7 @@ class PostgresStore:
                 ("events", "gateway_events"),
                 ("applied_operations", "gateway_applied_operations"),
                 ("tombstones", "gateway_tombstones"),
+                ("retention_operations", "gateway_retention_operations"),
             ):
                 row = await (
                     await connection.execute(
@@ -701,7 +1001,8 @@ class PostgresStore:
             ).fetchone()
             migration = await (
                 await connection.execute(
-                    "SELECT report_id,saved_at,report->>'status' AS status "
+                    "SELECT report_id,saved_at,report->>'status' AS status,"
+                    "report->>'schema_version' AS schema_version "
                     "FROM gateway_migration_reports WHERE source_id=%s "
                     "ORDER BY report_id DESC LIMIT 1",
                     (self.source_id,),
@@ -716,6 +1017,9 @@ class PostgresStore:
                 "report_id": migration["report_id"],
                 "saved_at": migration["saved_at"].isoformat(),
                 "status": migration["status"],
+                "schema_version": int(migration["schema_version"])
+                if migration["schema_version"] is not None
+                else None,
             }
             if migration
             else None,
@@ -727,6 +1031,9 @@ class PostgresStore:
             or report.get("source_id", self.source_id) != self.source_id
         ):
             raise ValueError("Invalid migration report")
+        if "schema_version" in report and report["schema_version"] != SCHEMA_VERSION:
+            raise ValueError("Migration report schema does not match the active schema")
+        report = report | {"schema_version": SCHEMA_VERSION}
         _canonical(report)
         async with self._pool().connection() as connection:
             await connection.execute(
