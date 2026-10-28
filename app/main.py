@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -12,7 +14,9 @@ from app.access import router as access_router
 from app.agents import router as agents_router
 from app.api.routes import router
 from app.api.security_routes import router as security_router
+from app.auth import router as auth_router
 from app.automations import router as automations_router
+from app.collaboration import router as collaboration_router
 from app.core.checkpoint_bootstrap import open_checkpointer
 from app.core.config import Settings, get_settings
 from app.core.observability import install_observability
@@ -22,6 +26,7 @@ from app.goals import router as goals_router
 from app.history import router as history_router
 from app.llm.client import ModelRouter
 from app.model_registry import router as model_registry_router
+from app.notifications import router as notifications_router
 from app.planning import router as planning_router
 from app.skill_imports import router as skill_imports_router
 from app.skills import router as skills_router
@@ -120,6 +125,8 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         lifespan=lifespan,
     )
     app.include_router(router)
+    app.include_router(auth_router)
+    app.include_router(collaboration_router)
     app.include_router(security_router)
     app.include_router(goals_router)
     app.include_router(automations_router)
@@ -130,6 +137,10 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(planning_router)
     app.include_router(history_router)
     app.include_router(model_registry_router)
+    app.include_router(notifications_router)
+    console = Path(__file__).resolve().parent.parent / "ui" / "dist"
+    if console.is_dir():
+        app.mount("/console", StaticFiles(directory=console, html=True), name="console")
 
     @app.middleware("http")
     async def durable_execution_boundary(request: Request, call_next):

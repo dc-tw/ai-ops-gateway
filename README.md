@@ -63,6 +63,8 @@ flowchart LR
   與 dead-letter stream。
 - **安全與治理**：支援多租戶 API key、OIDC/JWKS JWT、RBAC、rate/concurrency/token quota、
   PII redaction、模型 allow-list、內容政策、checkpoint-backed human approval、取消與 deadline。
+- **繁中管理台與協作**：`/console/` 提供 OIDC code＋PKCE／server-side session 管理台、YAML 與
+  唯讀 DAG、planning SSE、opt-in human presence、Agent heartbeat，以及 HMAC outbound 通知。
 - **Agent Threat Rules (ATR)**：載入 `pyatr` 規則，自動掃描 user/Goal input、tool call、
   Playwright/MCP response、Goal planner 與 model output。預設為 detection-only；可依 severity
   開啟 blocking。事件與 audit 不包含原文或命中的 regex，避免安全遙測二次洩密。
@@ -86,6 +88,9 @@ event envelope、Agent identity、tamper-evident audit 與 per-conversation sing
 
 完整待辦與分階段交付見[實作追蹤](docs/implementation-roadmap.md)；
 本次安全行為變更見[M1 完整掃描／journal 紀錄](docs/releases/2026-10-27-m1-safety.md)。
+
+管理台登入、CSRF、presence／heartbeat 與通知維運見
+[繁中管理台、協作與通知](docs/console-collaboration.md)。
 
 Gateway 規劃 session、不可變計畫／設定快照與不自動執行的模式切換，見
 [規劃模式操作指南](docs/plan-mode.md)。時間／token 預測與接受計畫後的執行銜接仍未實作。

@@ -119,6 +119,54 @@ class PlanningStore:
     def _index_key(self, tenant: str) -> str:
         return self.runtime._tenant_key(tenant, "planning:sessions")
 
+    async def events(
+        self,
+        tenant: str,
+        session_id: str,
+        last_id: str,
+        *,
+        block_ms: int = 10_000,
+        limit: int = 100,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Read reconnectable planning events without exposing stored plan content."""
+        if not re.fullmatch(r"\d+-\d+", last_id):
+            raise ValueError("Invalid planning event cursor")
+        if type(block_ms) is not int or not 0 <= block_ms <= 60_000:
+            raise ValueError("Invalid planning event block time")
+        if type(limit) is not int or not 1 <= limit <= 1_000:
+            raise ValueError("Invalid planning event limit")
+        rows = await self.client.xread(
+            {self.events_key(tenant, session_id): last_id}, count=limit, block=block_ms
+        )
+        result: list[tuple[str, dict[str, Any]]] = []
+        for _, records in rows:
+            for event_id, fields in records:
+                event = _decode(fields.get("payload"))
+                # These are the only fields allowed across the SSE boundary.
+                safe = {
+                    name: event[name]
+                    for name in (
+                        "type",
+                        "session_id",
+                        "agent_id",
+                        "version",
+                        "mode",
+                        "plan_revision",
+                        "plan_sha256",
+                        "snapshot_sha256",
+                        "accepted_revision",
+                        "accepted_hash",
+                        "forecast_sha256",
+                        "status",
+                        "time",
+                    )
+                    if name in event
+                }
+                if safe.get("session_id") != session_id:
+                    raise PlanningIntegrityError("Planning event identity is invalid")
+                result.append((event_id, safe))
+        return result
+
     @staticmethod
     def _snapshot(value: Any, tenant: str, agent_id: str) -> dict[str, Any]:
         snapshot = _object(value, MAX_SNAPSHOT_BYTES)

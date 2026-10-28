@@ -11,11 +11,12 @@
 - `read` 允許讀取，`operate` 也允許操作，但不能提升全域角色。例如 viewer 即使獲得
   operate，也不能建立 Goal；Agent／Skill 設定管理仍要求原有 admin 角色。
 - 只有 owner（至少 operator）或 admin 可修改分享。分享接受完整 subject 與
-  `actor_type: human | agent`，兩種身分不互通。Agent 憑證尚未提供，不能只靠欄位自稱 Agent。
+  `actor_type: human | agent`，兩種身分不互通。Agent API key 由服務端設定 typed identity；不能靠
+  request 欄位自稱 Agent，且 Agent identity 不能進行人工核准。
 - 缺少 ACL 的舊資料先限 admin；不根據舊 `created_by`、webhook、prompt 自動認領。
 - ACL 保護現有 Agent、Skill／文字匯出、計畫 session／revision、Goal、run SSE、automation、
-  conversation 與 Postgres 歷史查詢。Findings 仍維持既有 admin 入口；歷史 finding 可由 admin
-  明確分享。不存在的前端、presence 或新增匯出功能不在本次交付內。
+  conversation、planning SSE、presence 與 Postgres 歷史查詢。Findings 仍維持既有 admin 入口；
+  歷史 finding 可由 admin 明確分享。Presence 每次讀寫仍查目前 ACL，不是另一條分享管道。
 - Skill／plan revision 與 tool receipt 使用根資源權限。授予 Agent／計畫的讀取權，會讀到該
   資源本來包含的設定／快照；不會隱去嵌入內容，分享前應先檢查。
 - 分享 automation／Chief Goal 不自動分享新產生的 Goal。新 Goal／子 Goal 與其 conversation

@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictInt, model_validator
 from redis.exceptions import RedisError
@@ -214,6 +214,11 @@ async def _session(store: PlanningStore, tenant: str, session_id: str) -> dict:
     if value is None:
         raise PlanningNotFound("Planning session not found")
     return value
+
+
+def _sse(event: str, data: dict[str, Any], event_id: str) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event_id}\nevent: {event}\ndata: {payload}\n\n"
 
 
 async def _scan_plan(request: Request, tenant: str, session_id: str, plan: dict) -> dict:
@@ -660,3 +665,55 @@ async def change_mode(
         return await _view(request, principal.tenant_id, saved)
     except ValueError as exc:
         raise _error(exc) from exc
+
+
+@router.get("/planning-sessions/{session_id}/events")
+async def planning_events(
+    request: Request, session_id: str = Path(pattern=ID_PATTERN)
+) -> StreamingResponse:
+    """Replay safe planning references and follow new events with current ACL checks."""
+    principal = await authorize(request, "viewer")
+    store = _store(request)
+    try:
+        await _session(store, principal.tenant_id, session_id)
+    except ValueError as exc:
+        raise _error(exc) from exc
+    last_id = request.headers.get("last-event-id", "0-0")
+    if not re.fullmatch(r"\d+-\d+", last_id):
+        raise HTTPException(status_code=422, detail="Invalid Last-Event-ID")
+    heartbeat_ms = min(
+        60_000, max(1_000, int(request.app.state.settings.sse_heartbeat_seconds * 1_000))
+    )
+
+    async def stream():
+        from app.core.resource_access import stream_access
+
+        nonlocal last_id
+        while not await request.is_disconnected():
+            try:
+                records = await store.events(
+                    principal.tenant_id, session_id, last_id, block_ms=heartbeat_ms
+                )
+            except (RedisError, ValueError):
+                return
+            if not records:
+                if not await stream_access(
+                    request, principal, "planning_session", session_id
+                ):
+                    return
+                yield ": heartbeat\n\n"
+                continue
+            for event_id, event in records:
+                if not await stream_access(
+                    request, principal, "planning_session", session_id
+                ):
+                    return
+                last_id = event_id
+                yield _sse(str(event.get("type", "planning.message")), event, event_id)
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )

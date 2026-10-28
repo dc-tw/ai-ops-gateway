@@ -106,6 +106,35 @@ services:
     cpus: 1
     networks: [backend]
 
+  notifier:
+    image: ai-ops-gateway:local
+    pull_policy: never
+    command: ["python", "-m", "app.notifier"]
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('redis', 6379), 3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    networks: [backend]
+
   browser:
     image: ai-ops-browser:local
     build:

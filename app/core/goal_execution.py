@@ -289,6 +289,16 @@ class GoalExecutionStore:
                                     "payload": json.dumps(internal, ensure_ascii=False),
                                 },
                             )
+                    from app.core.outbound_notifications import (
+                        queue_transition,
+                        transition_event,
+                    )
+
+                    queue_transition(
+                        pipe,
+                        tenant,
+                        transition_event(tenant, goal_id, prior_status, mutation.goal),
+                    )
                     await pipe.execute()
                     return mutation.result
                 except WatchError:

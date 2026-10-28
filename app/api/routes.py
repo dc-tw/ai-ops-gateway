@@ -663,6 +663,8 @@ async def decide_agent_approval(
     request_id: str, payload: ApprovalDecision, request: Request
 ) -> dict[str, object]:
     principal = await authorize(request, "operator")
+    if principal.actor_type != "human":
+        raise HTTPException(status_code=403, detail="Human identity required for approval")
     runtime = request.app.state.redis
     if runtime is None or request.app.state.checkpointer is None:
         raise HTTPException(status_code=503, detail="Approval requires Redis checkpointing")

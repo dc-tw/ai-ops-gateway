@@ -36,12 +36,28 @@ def redact_pii(text: str) -> str:
     return text
 
 
-def _validate_principal(subject: str, tenant_id: str, role: str, method: str) -> Principal:
+def _validate_principal(
+    subject: str,
+    tenant_id: str,
+    role: str,
+    method: str,
+    actor_type: str = "human",
+) -> Principal:
+    if not subject or len(subject) > 256 or not subject.strip():
+        raise HTTPException(status_code=401, detail="Invalid subject claim")
     if not TENANT_PATTERN.fullmatch(tenant_id):
         raise HTTPException(status_code=401, detail="Invalid tenant claim")
     if role not in ROLE_LEVEL:
         raise HTTPException(status_code=403, detail="Invalid role claim")
-    return Principal(subject=subject, tenant_id=tenant_id, role=role, auth_method=method)
+    if actor_type not in {"human", "agent"}:
+        raise HTTPException(status_code=401, detail="Invalid actor type")
+    return Principal(
+        subject=subject,
+        tenant_id=tenant_id,
+        role=role,
+        auth_method=method,
+        actor_type=actor_type,
+    )
 
 
 async def authenticate(request: Request) -> Principal:
@@ -57,6 +73,7 @@ async def authenticate(request: Request) -> Principal:
                     str(record.get("tenant_id", "default")),
                     str(record.get("role", "operator")),
                     "api_key",
+                    str(record.get("actor_type", "human")),
                 )
         if settings.api_key and api_key == settings.api_key:
             return Principal("legacy-api-key", "default", "admin", "api_key")
@@ -93,6 +110,17 @@ async def authenticate(request: Request) -> Principal:
             "oidc",
         )
 
+    session_id = request.cookies.get("gateway_session", "")
+    if session_id:
+        from app.core.browser_auth import browser_store
+
+        resolved = await browser_store(request).get(session_id)
+        if resolved is not None:
+            principal, csrf_sha256 = resolved
+            request.state.browser_session_id = session_id
+            request.state.browser_csrf_sha256 = csrf_sha256
+            return principal
+
     if settings.app_env == "development" and not (
         settings.api_key or settings.api_keys_json or settings.oidc_jwks_url
     ):
@@ -102,6 +130,15 @@ async def authenticate(request: Request) -> Principal:
 
 async def authorize(request: Request, minimum_role: str = "viewer") -> Principal:
     principal = await authenticate(request)
+    if principal.auth_method in {"browser_oidc", "browser_development"} and request.method not in {
+        "GET",
+        "HEAD",
+        "OPTIONS",
+    }:
+        from app.core.browser_auth import csrf_valid
+
+        if not csrf_valid(request):
+            raise HTTPException(status_code=403, detail="Valid CSRF token required")
     if ROLE_LEVEL[principal.role] < ROLE_LEVEL[minimum_role]:
         raise HTTPException(status_code=403, detail=f"{minimum_role} role required")
     from app.core.resource_access import authorize_resource_route

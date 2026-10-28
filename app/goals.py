@@ -375,6 +375,8 @@ async def decide_goal_approval(
     goal_id: str, payload: GoalApprovalDecision, request: Request
 ) -> dict[str, Any]:
     principal = await authorize(request, "operator")
+    if principal.actor_type != "human":
+        raise HTTPException(status_code=403, detail="Human identity required for approval")
     runtime = _require_redis(request)
     store = GoalExecutionStore(runtime)
     try:

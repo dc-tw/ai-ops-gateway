@@ -1,3 +1,11 @@
+FROM node:20.20.2-bookworm-slim AS console
+
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY ui ./
+RUN npm run build
+
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -31,6 +39,7 @@ RUN if [ "${INSTALL_BROWSER}" = "true" ]; then \
 
 # Keep application changes out of the expensive dependency/browser layers.
 COPY app ./app
+COPY --from=console /ui/dist ./ui/dist
 RUN chown -R gateway:gateway /app /ms-playwright
 
 USER gateway

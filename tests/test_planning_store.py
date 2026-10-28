@@ -23,6 +23,56 @@ from app.core.planning_store import (
 from app.core.redis_runtime import RedisRuntime
 
 
+async def test_planning_event_reader_keeps_only_safe_references_and_validates_cursor():
+    class Client:
+        async def xread(self, streams, count, block):
+            assert streams == {"tenant:acme:planning:events:session-one": "4-0"}
+            assert count == 100 and block == 1
+            return [
+                (
+                    next(iter(streams)),
+                    [
+                        (
+                            "5-0",
+                            {
+                                "payload": json.dumps(
+                                    {
+                                        "type": "plan.revised",
+                                        "session_id": "session-one",
+                                        "plan_revision": 2,
+                                        "plan_sha256": "a" * 64,
+                                        "subject": "private-user",
+                                        "objective": "PRIVATE-DRAFT",
+                                    }
+                                )
+                            },
+                        )
+                    ],
+                )
+            ]
+
+    runtime = SimpleNamespace(
+        _client=Client(), _tenant_key=lambda tenant, suffix: f"tenant:{tenant}:{suffix}"
+    )
+    rows = await PlanningStore(runtime).events(
+        "acme", "session-one", "4-0", block_ms=1
+    )
+    assert rows == [
+        (
+            "5-0",
+            {
+                "type": "plan.revised",
+                "session_id": "session-one",
+                "plan_revision": 2,
+                "plan_sha256": "a" * 64,
+            },
+        )
+    ]
+    assert "PRIVATE" not in json.dumps(rows)
+    with pytest.raises(ValueError, match="cursor"):
+        await PlanningStore(runtime).events("acme", "session-one", "latest")
+
+
 def configuration(tenant, *, version=1):
     value = {
         "schema_version": 1,

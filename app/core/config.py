@@ -2,7 +2,7 @@ import re
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -17,6 +17,18 @@ class Settings(BaseSettings):
     oidc_audience: str = ""
     oidc_tenant_claim: str = "tenant_id"
     oidc_role_claim: str = "role"
+    oidc_authorization_url: str = ""
+    oidc_token_url: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = Field(default="", repr=False)
+    oidc_redirect_uri: str = ""
+    oidc_scopes: str = "openid profile"
+    ui_session_ttl_seconds: int = Field(default=28_800, ge=300, le=86_400)
+    ui_login_state_ttl_seconds: int = Field(default=300, ge=60, le=900)
+    browser_dev_login_enabled: bool = False
+    collaboration_refresh_seconds: int = Field(default=20, ge=5, le=300)
+    human_presence_ttl_seconds: int = Field(default=60, ge=15, le=600)
+    agent_heartbeat_ttl_seconds: int = Field(default=60, ge=15, le=600)
     resource_acl_enabled: bool = False
     skill_v2_enabled: bool = False
     skill_auto_selection_enabled: bool = False
@@ -82,6 +94,11 @@ class Settings(BaseSettings):
     automation_default_token_budget: int = Field(default=20_000, ge=256, le=10_000_000)
     automation_default_approval_timeout_seconds: int = Field(default=86_400, ge=60, le=2_592_000)
     automation_webhook_secrets_json: str = ""
+    notification_webhooks_json: str = Field(default="", repr=False)
+    notification_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    notification_retry_seconds: int = Field(default=5, ge=1, le=300)
+    notification_max_attempts: int = Field(default=5, ge=1, le=20)
+    gateway_public_url: str = ""
     tenant_requests_per_minute: int = Field(default=60, ge=1)
     tenant_max_concurrent_runs: int = Field(default=4, ge=1)
     request_token_budget: int = Field(default=16_000, ge=256)
@@ -113,6 +130,13 @@ class Settings(BaseSettings):
             return [item.strip().lower() for item in value.split(",") if item.strip()]
         return value
 
+    @field_validator("notification_allowed_hosts", mode="before")
+    @classmethod
+    def split_notification_hosts(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip().lower() for item in value.split(",") if item.strip()]
+        return value
+
     @field_validator("content_blocked_patterns", mode="before")
     @classmethod
     def split_blocked_patterns(cls, value: object) -> object:
@@ -136,6 +160,41 @@ class Settings(BaseSettings):
             except re.error as exc:
                 raise ValueError(f"Invalid content policy regex: {pattern}") from exc
         return value
+
+    @model_validator(mode="after")
+    def validate_browser_auth(self):
+        if self.browser_dev_login_enabled and self.app_env != "development":
+            raise ValueError("Browser development login is forbidden outside development")
+        browser_values = (
+            self.oidc_authorization_url,
+            self.oidc_token_url,
+            self.oidc_client_id,
+            self.oidc_redirect_uri,
+        )
+        if any(browser_values):
+            if not all(browser_values) or not self.oidc_jwks_url or not self.oidc_issuer:
+                raise ValueError(
+                    "Browser OIDC requires complete endpoints, client, JWKS, and issuer"
+                )
+            urls = (
+                self.oidc_authorization_url,
+                self.oidc_token_url,
+                self.oidc_redirect_uri,
+                self.oidc_jwks_url,
+            )
+            if self.app_env == "production" and any(not url.startswith("https://") for url in urls):
+                raise ValueError("Production browser OIDC URLs must use HTTPS")
+        if self.collaboration_refresh_seconds >= min(
+            self.human_presence_ttl_seconds, self.agent_heartbeat_ttl_seconds
+        ):
+            raise ValueError("Collaboration refresh must be shorter than presence TTLs")
+        if (
+            self.app_env == "production"
+            and self.gateway_public_url
+            and not self.gateway_public_url.startswith("https://")
+        ):
+            raise ValueError("Production public Gateway URL must use HTTPS")
+        return self
 
 
 @lru_cache

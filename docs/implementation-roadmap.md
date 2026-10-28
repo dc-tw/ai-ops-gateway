@@ -11,7 +11,7 @@
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 核心交付完成／本機及 Docker 故障驗證通過；跨階段封版仍屬 M9 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心交付完成／本機及 Docker 驗證通過；真實模型校正屬 M9 |
 | M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 核心交付完成／真實 Redis＋PG 與完整 Docker 生命週期驗證通過；production 治理屬 M9 |
-| M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 待實作 |
+| M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 核心交付完成／本機、真實 Redis 與 Docker image 驗證通過；正式 IdP／外部收件端屬 M9 |
 | M8 | ACP v1 stdio client adapter、session／串流／取消／逐次核准 | 待實作 |
 | M9 | 全量回歸、隔離 staging／故障／PITR／壓測及封版證據 | 待實作 |
 
@@ -66,6 +66,11 @@
   核心 store／projection 專項 73 tests 通過；完整 Docker 測試涵蓋雙 projector、PG／Redis 故障、
   backfill／reconcile、cutover、pg_dump／restore。
   M7–M9 與 M2 剩餘治理仍待完成。
+- M7：[繁中管理台、協作與通知](releases/2026-10-28-m7-console-collaboration.md)。OIDC code＋PKCE、
+  Redis server-side session／CSRF、planning SSE、opt-in presence、Agent heartbeat 與 HMAC notification
+  outbox 已完成。真實 Redis＋PostgreSQL 全套 915 tests 零 skip，production frontend image build、
+  Playwright login／切頁／logout 與 HTTP smoke 通過；正式 IdP、外部 webhook 與多副本 staging
+  屬 M9。M8、M9 與 M2 剩餘治理仍待完成。
 
 ## 後續階段的固定實作契約
 
