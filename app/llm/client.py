@@ -183,6 +183,10 @@ class ModelRouter:
                     ),
                 }
 
+    @property
+    def publication_enabled(self) -> bool:
+        return self._settings.model_publication_enabled
+
     def _selection(self, model: str | None) -> str:
         selection = (model or self._settings.llm_model).strip()
         if not selection or len(selection) > 200:

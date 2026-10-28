@@ -144,10 +144,10 @@ Chief fork／join；沒有循環、任意依賴圖、模型自動起草或遞迴
 - 模型路由只保存 alias、configured model、安全指紋與版本未知聲明，不回傳內部 URL／API key。
   含 URL userinfo、query 或 fragment 的 inference endpoint 無法建立規劃識別，會拒絕；既有
   inference endpoint 行為不因此改變。
-- 指紋只能辨識目前服務 process 的 endpoint／model／生成設定，不能證明遠端模型權重、部署或
-  tokenizer 版本。尚無跨 process 的中央模型設定 epoch／原子熱更新，P3 執行銜接前仍須補齊。
-- 既有 Skill v1 canonical hash 不變；此處保存的是**未來執行設定**，不會在 plan mode 注入 Skill
-  或呼叫模型。`planning_skills`、Skill v2 模式 gate 與 `plan-forecast` 未啟用。
+- 可選 M5 model publication 以 Redis CAS 跨副本固定 route／部署 disclosure；未發布時仍只辨識
+  local endpoint／model／生成設定，不能證明遠端模型權重。詳見 [plan-forecast](plan-forecast.md)。
+- 既有 Skill v1 canonical hash 不變；M3 的 `planning_skills`／Skill v2 gate 與 M5 的
+  `plan-forecast` 均為明確 opt-in。Forecast 不注入執行 Skill、不呼叫模型。
 - 切 execute 不是人工核准或執行許可，也不略過未來執行時的 ATR、工具政策與逐次寫入核准。
 
 完整後續設計見 [plan-forecast](designs/plan-forecast/design.md)。

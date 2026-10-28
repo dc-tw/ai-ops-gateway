@@ -106,6 +106,53 @@ def _safe_route(router: Any, model: str) -> dict[str, Any]:
     return result
 
 
+async def _published_route(
+    runtime: Any,
+    router: Any,
+    tenant: str,
+    model: str,
+    client: Any,
+    watch: bool,
+) -> dict[str, Any]:
+    result = _safe_route(router, model)
+    # A server-side publication is optional for existing planning sessions, but
+    # when present it is part of the watched snapshot and therefore consistent
+    # across replicas.  Absence never turns an alias into a known model version.
+    from app.core.model_registry import ModelRegistry
+
+    publication = None
+    if getattr(router, "publication_enabled", False):
+        publication = await ModelRegistry(runtime).get(
+            tenant, result["alias"], client=client, watch=watch
+        )
+    if publication is not None:
+        if (
+            publication["route_fingerprint"] != result["route_fingerprint"]
+            or publication["resolved_model"] != result["resolved_model"]
+        ):
+            raise PlanningSnapshotInvalid(_UNAVAILABLE)
+        result["publication"] = {
+            field: publication[field]
+            for field in (
+                "revision",
+                "publication_sha256",
+                "actual_model_version",
+                "deployment_id",
+                "tokenizer_version",
+                "runtime_version",
+            )
+        }
+        result["version_disclosure"] = {
+            "actual_model_version": publication["actual_model_version"] or "unknown",
+            "identity_scope": "administrator_published_provider_disclosure",
+            "limitation": (
+                "Published identity is operator-supplied; the Gateway does not probe or attest "
+                "weights, tokenizer, deployment, or runtime."
+            ),
+        }
+    return result
+
+
 async def _snapshot_agent(
     runtime: Any, router: Any, tenant: str, agent: _StoredAgent, client: Any, watch: bool
 ) -> dict[str, Any]:
@@ -115,7 +162,9 @@ async def _snapshot_agent(
     if not agent.planning_skills:
         value.pop("planning_skills", None)  # Existing v1 planning fingerprints stay unchanged.
     value["persona_sha256"] = hashlib.sha256(agent.persona.encode("utf-8")).hexdigest()
-    value["model_route"] = _safe_route(router, agent.model)
+    value["model_route"] = await _published_route(
+        runtime, router, tenant, agent.model, client, watch
+    )
     value["skill_snapshots"] = await resolve_skill_bindings(
         runtime,
         tenant,

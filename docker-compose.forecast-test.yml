@@ -1,0 +1,16 @@
+# Disposable M5 validation overlay; no provider probes or paid routes.
+services:
+  gateway:
+    environment:
+      WORKFLOW_ENABLED: "true"
+      MODEL_PUBLICATION_ENABLED: "true"
+      MODEL_TELEMETRY_ENABLED: "true"
+      PLAN_FORECAST_ENABLED: "true"
+      FORECAST_CALIBRATION_MIN_SAMPLES: "5"
+      PII_REDACTION: "false"
+
+  worker:
+    environment:
+      MODEL_PUBLICATION_ENABLED: "true"
+      MODEL_TELEMETRY_ENABLED: "true"
+      PII_REDACTION: "false"

@@ -21,6 +21,7 @@ from app.core.threat_detection import ThreatDetector
 from app.goals import router as goals_router
 from app.history import router as history_router
 from app.llm.client import ModelRouter
+from app.model_registry import router as model_registry_router
 from app.planning import router as planning_router
 from app.skill_imports import router as skill_imports_router
 from app.skills import router as skills_router
@@ -128,6 +129,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(skill_imports_router)
     app.include_router(planning_router)
     app.include_router(history_router)
+    app.include_router(model_registry_router)
 
     @app.middleware("http")
     async def durable_execution_boundary(request: Request, call_next):

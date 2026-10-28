@@ -48,6 +48,57 @@ async def test_budget_tracks_planning_and_resumes_without_resetting():
     assert model.calls == 2
 
 
+async def test_budgeted_model_emits_safe_per_call_telemetry():
+    records = []
+
+    async def collect(record):
+        records.append(record)
+
+    budgeted = BudgetedModel(
+        MeteredModel(),
+        1_000,
+        on_call=collect,
+        model_route={
+            "alias": "stable",
+            "route_fingerprint": "sha256:" + "a" * 64,
+            "publication": {"revision": 2, "publication_sha256": "sha256:" + "b" * 64},
+        },
+    )
+    result = await budgeted.complete_result("system secret", "prompt secret")
+    assert result.usage["total_tokens"] == 12
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "completed"
+    assert record["actual_total_tokens"] == 12
+    assert record["provider_reported"] is True
+    assert record["publication_revision"] == 2
+    assert "system secret" not in str(record)
+    assert "prompt secret" not in str(record)
+
+
+async def test_closing_model_stream_records_interrupted_call_without_content():
+    records = []
+
+    class Streaming:
+        async def stream_result(self, system, prompt):
+            yield ModelResult("first secret chunk", {})
+            yield ModelResult("second secret chunk", {})
+
+    async def collect(record):
+        records.append(record)
+
+    stream = BudgetedModel(Streaming(), 1_000, on_call=collect).stream_result(
+        "system secret", "prompt secret"
+    )
+    assert (await anext(stream)).text == "first secret chunk"
+    await stream.aclose()
+
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["error_type"] == "GeneratorExit"
+    assert "secret" not in str(records[0])
+
+
 async def test_failed_model_call_retains_reservation():
     class Failing:
         async def complete(self, system, prompt):

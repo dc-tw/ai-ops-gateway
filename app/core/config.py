@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     workflow_max_nodes: int = Field(default=32, ge=1, le=128)
     workflow_max_edges: int = Field(default=64, ge=0, le=256)
     workflow_max_parallelism: int = Field(default=4, ge=1, le=16)
+    model_publication_enabled: bool = False
+    model_telemetry_enabled: bool = False
+    plan_forecast_enabled: bool = False
+    model_telemetry_max_records: int = Field(default=10_000, ge=100, le=100_000)
+    forecast_calibration_min_samples: int = Field(default=20, ge=5, le=10_000)
     log_level: str = "INFO"
     otel_service_name: str = "ai-ops-gateway"
     otel_exporter_otlp_endpoint: str = ""

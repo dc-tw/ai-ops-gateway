@@ -9,7 +9,7 @@
 | M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：owner／分享 ACL 已實作；其餘待實作 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 核心交付完成／本機及 Docker 故障驗證通過；跨階段封版仍屬 M9 |
-| M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 待實作 |
+| M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心交付完成／本機及 Docker 驗證通過；真實模型校正屬 M9 |
 | M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 待實作 |
 | M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 待實作 |
 | M8 | ACP v1 stdio client adapter、session／串流／取消／逐次核准 | 待實作 |
@@ -57,6 +57,9 @@
   886 tests、零 skip；固定 commit 可重建舊版，雙 worker 平行、SIGKILL／重送／ACL posture、
   32 節點大型繁中 Skill 投影，以及 Postgres 對帳均通過。核心交付完成，
   不代表 M5–M9、M2 剩餘治理或正式環境驗收已完成。
+- M5：[共享模型版本、逐呼叫遙測與 plan-forecast](releases/2026-10-27-m5-forecast.md)。
+  890 tests、零 skip（含新增 scheduler fixture）；真實 HTTP／Redis／worker synthetic provider
+  Docker E2E 通過。未把 mock profile 當成真實模型效能；M6–M9 與 M2 剩餘治理仍待完成。
 
 ## 後續階段的固定實作契約
 

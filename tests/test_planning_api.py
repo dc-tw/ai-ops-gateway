@@ -15,6 +15,7 @@ import pytest
 from app.agents import AgentStore
 from app.automations import AutomationPolicy
 from app.core.config import Settings
+from app.core.model_registry import ModelRegistry
 from app.core.redis_runtime import RedisRuntime
 from app.core.skill_store import SkillContent, SkillStore
 from app.core.threat_detection import ThreatScan
@@ -783,3 +784,162 @@ async def test_request_rate_and_redis_availability_are_enforced(environment):
     assert (
         await env.client.post(f"/v1/agents/{configured['agent_id']}/planning-sessions")
     ).status_code == 503
+
+
+async def test_forecast_is_plan_only_deduplicated_and_uses_explicit_calibration(environment):
+    env = environment
+    env.settings.skill_v2_enabled = True
+    env.settings.workflow_enabled = True
+    env.settings.model_publication_enabled = True
+    env.settings.plan_forecast_enabled = True
+    env.settings.forecast_calibration_min_samples = 5
+    skill = await SkillStore(env.runtime).create(
+        env.tenant,
+        SkillContent(
+            name="plan-forecast",
+            display_name="計畫預測",
+            description="依照固定計畫估算，不啟動模型。",
+            instructions="誠實呈現未知與校正不足。",
+            schema_version=2,
+            execution_modes=["plan"],
+        ).model_dump(),
+        "admin",
+    )
+    configured = await env.agent(planning_skills=[{"skill_id": skill["skill_id"], "revision": 1}])
+    publication_response = await env.client.post(
+        "/v1/models/publications",
+        headers={"x-api-key": "admin"},
+        json={
+            "alias": env.settings.llm_model,
+            "expected_revision": 0,
+            "actual_model_version": "weights-2026-10",
+            "deployment_id": "staging-a",
+            "tokenizer_version": "tokenizer-1",
+            "runtime_version": "runtime-1",
+        },
+    )
+    assert publication_response.status_code == 200, publication_response.text
+    publication = publication_response.json()
+    fresh = await session(env, configured)
+    native = {
+        "schema_version": 2,
+        "objective": "分析事件",
+        "nodes": [
+            {
+                "node_id": "review",
+                "agent_id": configured["agent_id"],
+                "query": "整理已提供的證據",
+            }
+        ],
+    }
+    saved_response = await env.client.post(
+        path(fresh) + "/plans",
+        json={"expected_version": fresh["version"], "plan": native},
+    )
+    assert saved_response.status_code == 200, saved_response.text
+    saved = saved_response.json()
+    endpoint = path(saved) + "/forecasts"
+    payload = {"expected_version": saved["version"], "plan_revision": 1}
+    first_response = await env.client.post(endpoint, json=payload)
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()
+    assert first["status"] == "insufficient_calibration"
+    assert first["provider_calls_started"] == 0
+    assert first["scenarios"]["base"]["model_only_makespan_seconds"] is None
+    repeated = (await env.client.post(endpoint, json=payload)).json()
+    assert repeated["forecast_sha256"] == first["forecast_sha256"]
+    assert repeated["deduplicated"] is True
+
+    registry = ModelRegistry(env.runtime)
+    first_telemetry = None
+    for index in range(5):
+        telemetry_record = {
+            "call_id": f"call-{index}",
+            "goal_id": "goal",
+            "node_id": "review",
+            "alias": env.settings.llm_model,
+            "route_fingerprint": publication["route_fingerprint"],
+            "publication_sha256": publication["publication_sha256"],
+            "publication_revision": 1,
+            "status": "completed",
+            "started_at": "2026-10-27T00:00:00+00:00",
+            "finished_at": "2026-10-27T00:00:01+00:00",
+            "duration_ms": 1000 + index * 100,
+            "input_bytes": 400,
+            "reserved_input_tokens": 656,
+            "output_token_cap": 256,
+            "actual_input_tokens": 100,
+            "actual_output_tokens": 20 + index,
+            "actual_total_tokens": 120 + index,
+            "provider_reported": True,
+            "error_type": None,
+        }
+        first_telemetry = first_telemetry or telemetry_record
+        await registry.append_telemetry(
+            env.tenant,
+            telemetry_record,
+            max_records=100,
+        )
+    assert (
+        await registry.append_telemetry(env.tenant, first_telemetry, max_records=100) == "duplicate"
+    )
+    calibrated_response = await env.client.post(
+        "/v1/models/calibrations",
+        headers={"x-api-key": "admin"},
+        json={
+            "alias": env.settings.llm_model,
+            "publication_revision": 1,
+            "expected_revision": 0,
+        },
+    )
+    assert calibrated_response.status_code == 200, calibrated_response.text
+    assert calibrated_response.json()["status"] == "calibrated"
+    assert calibrated_response.json()["provider_calls_started"] == 0
+    assert calibrated_response.json()["revision"] == 1
+    stale_calibration = await env.client.post(
+        "/v1/models/calibrations",
+        headers={"x-api-key": "admin"},
+        json={
+            "alias": env.settings.llm_model,
+            "publication_revision": 1,
+            "expected_revision": 0,
+        },
+    )
+    assert stale_calibration.status_code == 409
+
+    estimated_response = await env.client.post(endpoint, json=payload)
+    assert estimated_response.status_code == 200, estimated_response.text
+    estimated = estimated_response.json()
+    assert estimated["status"] == "estimated"
+    assert estimated["forecast_sha256"] != first["forecast_sha256"]
+    assert estimated["scenarios"]["low"]["model_only_makespan_seconds"] > 0
+    assert estimated["waits"]["queue"]["status"] == "unknown"
+    latest = await env.client.get(path(saved) + "/forecasts/latest")
+    assert latest.status_code == 200
+    assert latest.json()["forecast_sha256"] == estimated["forecast_sha256"]
+    forecast_key = env.runtime._tenant_key(
+        env.tenant, f"planning:forecast:{estimated['forecast_sha256']}"
+    )
+    original = await env.runtime._client.get(forecast_key)
+    corrupted = json.loads(original)
+    corrupted["created_by"] = "tampered"
+    await env.runtime._client.set(forecast_key, json.dumps(corrupted))
+    assert (await env.client.get(path(saved) + "/forecasts/latest")).status_code == 409
+    await env.runtime._client.set(forecast_key, original)
+
+    # A Redis writer can recompute the outer record hash. Dedup must still
+    # reject content that no longer matches the addressable forecast digest.
+    corrupted = json.loads(original)
+    corrupted["scenarios"]["base"]["token_estimate"] += 1
+    record_body = {key: value for key, value in corrupted.items() if key != "record_sha256"}
+    corrupted["record_sha256"] = digest(record_body)
+    await env.runtime._client.set(forecast_key, json.dumps(corrupted))
+    assert (await env.client.post(endpoint, json=payload)).status_code == 409
+    await env.runtime._client.set(forecast_key, original)
+
+    accepted = await env.client.post(
+        path(saved) + "/mode",
+        json={"expected_version": saved["version"], "mode": "execute", "plan_revision": 1},
+    )
+    assert accepted.status_code == 200
+    assert (await env.client.post(endpoint, json=payload)).status_code == 409

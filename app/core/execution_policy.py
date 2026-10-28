@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from redis.exceptions import WatchError
 
@@ -48,6 +51,8 @@ class BudgetedModel:
         max_output_tokens: int = 1_024,
         persona: str = "",
         skill_snapshots: list[dict[str, Any]] | None = None,
+        on_call: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        model_route: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.token_budget = token_budget
@@ -55,6 +60,8 @@ class BudgetedModel:
         self.on_usage = on_usage
         self.persona = persona
         self.skill_instructions = render_skill_instructions(skill_snapshots or [])
+        self.on_call = on_call
+        self.model_route = model_route or {}
         self.usage: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -70,6 +77,44 @@ class BudgetedModel:
     async def _publish(self) -> None:
         if self.on_usage:
             await self.on_usage(dict(self.usage))
+
+    async def _call_record(
+        self,
+        *,
+        call_id: str,
+        started_at: str,
+        started: float,
+        status: str,
+        input_bytes: int,
+        input_bound: int,
+        output_cap: int,
+        delta: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.on_call is None:
+            return
+        publication = self.model_route.get("publication") or {}
+        await self.on_call(
+            {
+                "call_id": call_id,
+                "alias": self.model_route.get("alias"),
+                "route_fingerprint": self.model_route.get("route_fingerprint"),
+                "publication_sha256": publication.get("publication_sha256"),
+                "publication_revision": publication.get("revision"),
+                "status": status,
+                "started_at": started_at,
+                "finished_at": datetime.now(UTC).isoformat(),
+                "duration_ms": round((time.monotonic() - started) * 1_000, 3),
+                "input_bytes": input_bytes,
+                "reserved_input_tokens": input_bound,
+                "output_token_cap": output_cap,
+                "actual_input_tokens": (delta or {}).get("input_tokens"),
+                "actual_output_tokens": (delta or {}).get("output_tokens"),
+                "actual_total_tokens": (delta or {}).get("total_tokens"),
+                "provider_reported": bool((delta or {}).get("provider_reported")),
+                "error_type": type(error).__name__ if error is not None else None,
+            }
+        )
 
     async def _begin(self, system: str, prompt: str) -> tuple[dict[str, Any], int, int]:
         before = dict(self.usage)
@@ -131,13 +176,37 @@ class BudgetedModel:
     async def complete_result(self, system: str, prompt: str) -> ModelResult:
         system = self._system_instructions(system)
         before, input_bound, cap = await self._begin(system, prompt)
-        if isinstance(self.model, OpenAICompatibleModel):
-            result = await self.model.complete_result(system, prompt, max_output_tokens=cap)
-        elif getattr(self.model, "complete_result", None):
-            result = await self.model.complete_result(system, prompt)
-        else:
-            result = ModelResult(await self.model.complete(system, prompt), {})
-        delta = await self._finish(before, input_bound, result.text, result.usage, cap)
+        call_id, started, started_at = str(uuid4()), time.monotonic(), datetime.now(UTC).isoformat()
+        try:
+            if isinstance(self.model, OpenAICompatibleModel):
+                result = await self.model.complete_result(system, prompt, max_output_tokens=cap)
+            elif getattr(self.model, "complete_result", None):
+                result = await self.model.complete_result(system, prompt)
+            else:
+                result = ModelResult(await self.model.complete(system, prompt), {})
+            delta = await self._finish(before, input_bound, result.text, result.usage, cap)
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._call_record(
+                call_id=call_id,
+                started_at=started_at,
+                started=started,
+                status="failed",
+                input_bytes=len((system + prompt).encode("utf-8")),
+                input_bound=input_bound,
+                output_cap=cap,
+                error=exc,
+            )
+            raise
+        await self._call_record(
+            call_id=call_id,
+            started_at=started_at,
+            started=started,
+            status="completed",
+            input_bytes=len((system + prompt).encode("utf-8")),
+            input_bound=input_bound,
+            output_cap=cap,
+            delta=delta,
+        )
         return ModelResult(result.text, delta)
 
     async def stream(self, system: str, prompt: str) -> AsyncIterator[str]:
@@ -148,6 +217,7 @@ class BudgetedModel:
     async def stream_result(self, system: str, prompt: str) -> AsyncIterator[ModelChunk]:
         system = self._system_instructions(system)
         before, input_bound, cap = await self._begin(system, prompt)
+        call_id, started, started_at = str(uuid4()), time.monotonic(), datetime.now(UTC).isoformat()
         if isinstance(self.model, OpenAICompatibleModel):
             iterator = self.model.stream_result(system, prompt, max_output_tokens=cap)
         elif getattr(self.model, "stream_result", None):
@@ -157,21 +227,44 @@ class BudgetedModel:
         text: list[str] = []
         reported: dict[str, Any] = {}
         try:
-            async for chunk in iterator:
-                content = str(getattr(chunk, "text", chunk))
-                metadata = getattr(chunk, "usage", None)
-                if isinstance(metadata, dict) and metadata.get("provider_reported"):
-                    reported = dict(metadata)
-                text.append(content)
-                # An adapter without a generation limit cannot stream beyond the
-                # reservation; successful provider calls are bounded at request time.
-                if not isinstance(self.model, OpenAICompatibleModel) and (
-                    len("".join(text).encode("utf-8")) > cap
-                ):
-                    raise TokenBudgetExceeded("Model output exceeded reserved token budget")
-                if content:
-                    yield ModelChunk(content, {})
-            delta = await self._finish(before, input_bound, "".join(text), reported, cap)
+            try:
+                async for chunk in iterator:
+                    content = str(getattr(chunk, "text", chunk))
+                    metadata = getattr(chunk, "usage", None)
+                    if isinstance(metadata, dict) and metadata.get("provider_reported"):
+                        reported = dict(metadata)
+                    text.append(content)
+                    # An adapter without a generation limit cannot stream beyond the
+                    # reservation; successful provider calls are bounded at request time.
+                    if not isinstance(self.model, OpenAICompatibleModel) and (
+                        len("".join(text).encode("utf-8")) > cap
+                    ):
+                        raise TokenBudgetExceeded("Model output exceeded reserved token budget")
+                    if content:
+                        yield ModelChunk(content, {})
+                delta = await self._finish(before, input_bound, "".join(text), reported, cap)
+            except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
+                await self._call_record(
+                    call_id=call_id,
+                    started_at=started_at,
+                    started=started,
+                    status="failed",
+                    input_bytes=len((system + prompt).encode("utf-8")),
+                    input_bound=input_bound,
+                    output_cap=cap,
+                    error=exc,
+                )
+                raise
+            await self._call_record(
+                call_id=call_id,
+                started_at=started_at,
+                started=started,
+                status="completed",
+                input_bytes=len((system + prompt).encode("utf-8")),
+                input_bound=input_bound,
+                output_cap=cap,
+                delta=delta,
+            )
             yield ModelChunk("", delta)
         finally:
             close = getattr(iterator, "aclose", None)

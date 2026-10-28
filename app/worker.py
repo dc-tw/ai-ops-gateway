@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 import socket
 import time
@@ -158,11 +159,17 @@ async def execute_goal(
 
     async def require_enabled_agent():
         if goal.get("workflow_node"):
-            from app.core.planning_snapshot import _safe_route
+            from app.core.planning_snapshot import _published_route
 
-            if _safe_route(router, goal["model"]) != goal.get("agent_config", {}).get(
-                "model_route"
-            ):
+            route = await _published_route(
+                runtime,
+                router,
+                tenant_id,
+                goal["model"],
+                runtime._client,
+                False,
+            )
+            if route != goal.get("agent_config", {}).get("model_route"):
                 raise PermissionError("Workflow model route differs from its accepted snapshot")
         if goal.get("agent_config"):
             from app.agents import AgentStore
@@ -475,6 +482,61 @@ async def execute_goal(
             current_acl=settings.resource_acl_enabled,
         )
         heartbeat = asyncio.create_task(keep_alive())
+        on_call = None
+        model_route = goal.get("agent_config", {}).get("model_route")
+        if settings.model_telemetry_enabled and model_route is None:
+            from app.core.planning_snapshot import _published_route
+
+            model_route = await _published_route(
+                runtime, router, tenant_id, goal["model"], runtime._client, False
+            )
+        if settings.model_telemetry_enabled:
+            from app.core.model_registry import ModelRegistry
+
+            registry = ModelRegistry(runtime)
+
+            async def record_model_call(record):
+                publication = (model_route or {}).get("publication") or {}
+                profile = (
+                    await registry.calibration(tenant_id, publication["publication_sha256"])
+                    if publication.get("publication_sha256")
+                    else None
+                )
+                if profile is not None:
+                    estimated_input = math.ceil(
+                        int(record["input_bytes"]) * profile["input_tokens_per_byte"]["base"]
+                    )
+                    estimated_output = int(profile["output_tokens_per_call"]["base"])
+                    estimated_total = estimated_input + estimated_output
+                    actual_input = record.get("actual_input_tokens")
+                    actual_output = record.get("actual_output_tokens")
+                    actual_total = record.get("actual_total_tokens")
+                    record = record | {
+                        "estimate_calibration_sha256": profile["calibration_sha256"],
+                        "estimated_input_tokens": estimated_input,
+                        "estimated_output_tokens": estimated_output,
+                        "estimated_total_tokens": estimated_total,
+                        "actual_minus_estimated_input_tokens": (
+                            actual_input - estimated_input if type(actual_input) is int else None
+                        ),
+                        "actual_minus_estimated_output_tokens": (
+                            actual_output - estimated_output if type(actual_output) is int else None
+                        ),
+                        "actual_minus_estimated_total_tokens": (
+                            actual_total - estimated_total if type(actual_total) is int else None
+                        ),
+                    }
+                await registry.append_telemetry(
+                    tenant_id,
+                    record
+                    | {
+                        "goal_id": goal_id,
+                        "node_id": (goal.get("workflow_node") or {}).get("node_id"),
+                    },
+                    max_records=settings.model_telemetry_max_records,
+                )
+
+            on_call = record_model_call
         model = BudgetedModel(
             router.get(goal["model"]),
             int(policy.get("token_budget", 20_000)),
@@ -483,6 +545,8 @@ async def execute_goal(
             max_output_tokens=settings.llm_max_output_tokens,
             persona=goal.get("agent_config", {}).get("persona", ""),
             skill_snapshots=goal.get("agent_config", {}).get("skill_snapshots", []),
+            on_call=on_call,
+            model_route=model_route,
         )
         executor = PolicyToolExecutor(
             tool_executor or _ScraperExecutor(scraper),

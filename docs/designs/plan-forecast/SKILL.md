@@ -2,7 +2,7 @@
 name: plan-forecast
 description: 僅在 Gateway 受信任的規劃模式中，依目前計畫、有效模型與校正資料，呈現執行時間及 token 用量情境。
 metadata:
-  gateway_status: design-only
+  gateway_status: implemented-server-handler
   gateway_execution_modes: plan
   gateway_agent_roles: chief,worker
   gateway_required_tools: none
@@ -10,9 +10,9 @@ metadata:
 
 # 計畫用量與時間預估
 
-這是 Gateway Skill 設計草案，尚未安裝或啟用 estimator。以上 metadata 是文件標記；
-M3 已提供 v2 execution_modes／planning_skills 的服務端閘門，但估算服務仍未實作。
-完整待實作契約見 [design.md](design.md)。不可直接當現有內建 Skill 匯入。
+這是 Gateway `plan-forecast` 的參考內容。M3 已提供 v2 execution_modes／planning_skills 閘門，
+M5 已提供服務端 deterministic estimator；必須由管理者建立此 plan-only Skill 並明確綁定，
+不會因為檔案存在或文字提及而自動安裝。操作見 [plan-forecast.md](../../plan-forecast.md)。
 
 ## 觸發條件
 

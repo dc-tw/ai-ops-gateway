@@ -34,7 +34,7 @@ def draft(objective="Prepare a source-based report"):
     }
 
 
-def test_openapi_advertises_opt_in_execution_but_not_forecasts_or_unsupported_aliases():
+def test_openapi_advertises_opt_in_execution_and_forecast_without_unsupported_aliases():
     settings = Settings(_env_file=None)
     assert settings.workflow_execution_enabled is False
     document = create_app(settings=settings).openapi()
@@ -48,7 +48,6 @@ def test_openapi_advertises_opt_in_execution_but_not_forecasts_or_unsupported_al
     assert "/v1/skill-imports/{import_id}/confirm" in paths
     for path in paths:
         segments = path.strip("/").split("/")
-        assert "forecasts" not in segments
         assert "forecast" not in segments
     for unsupported in (
         "/v1/planning-sessions/{session_id}/goals",

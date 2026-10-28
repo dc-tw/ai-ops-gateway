@@ -1,12 +1,12 @@
 # Gateway 規劃模式與 plan-forecast 設計
 
-日期：2026-10-26。狀態：**核心 plan mode／計畫快照已實作；forecast 其餘部分仍為設計提案**。
+日期：2026-10-26；2026-10-27 更新。狀態：**M5 核心已實作並驗證**。
 
 使用者已確認：這裡的 plan mode 指 Gateway Agent 的規劃模式，不是 Codex 的 `/plan`。
 已實作的 session／計畫版本／refresh／mode API 與限制見[操作指南](../../plan-mode.md)。
-現行 Goal／worker 執行與 Skill v1 hash 保持原狀；[Skill 草案](SKILL.md)、forecast API、
-planning Skill 綁定、中央模型設定 epoch 及固定計畫執行銜接仍待實作。
-本文保留完整目標設計，不能將全部提案當成目前可呼叫的 API。
+實際 API、環境變數與已驗證邊界以[操作指南](../../plan-forecast.md)為準。本文保留原始設計推導；
+其中「擬議」「待實作」段落是歷史文字，不可用來否定後續 M3–M5 已交付能力，也不可把仍屬
+M7／M9 的 SSE、UI、真實模型校正當成已完成。
 
 ## 1. 目標與非目標
 
@@ -43,7 +43,7 @@ Agent／Goal request 夾帶 mode。其餘缺口仍依後續階段處理。
 明確操作。prompt、tags、模型輸出或 body 中自行聲稱的 mode 都不能切換模式。
 
 ```text
-明確建立 plan session → 保存計畫 revision → 自動估算 → 修改計畫 → 重新估算
+明確建立 plan session → 保存計畫 revision → 明確要求估算 → 修改計畫 → 重新估算
                                       ↓
                             明確切換 execute（不啟動）
                                       ↓
@@ -52,8 +52,8 @@ Agent／Goal request 夾帶 mode。其餘缺口仍依後續階段處理。
 
 - 第一版接受使用者／呼叫端提交的結構化計畫，不因進入 plan mode 自動呼叫模型。
   後續若加入模型起草，須獨立授權、計費，限制為無工具的規劃呼叫，不得建立執行型 Goal。
-- 保存有效 PlanRevision 後，僅當此 Agent 明確綁定啟用的 `plan-forecast` 規劃 Skill 時自動估算。
-  同快照去重；短時間連續編輯合併至最新版本，不逐個執行已過時的估算。
+- 保存有效 PlanRevision 後，僅當此 Agent 明確綁定啟用的 `plan-forecast` 規劃 Skill，且 operator
+  明確呼叫 forecast API 時估算。同快照去重；latest pointer 合併至最新版本，不自動估算過時版本。
 - `execute` 模式、缺少模式、未知模式、舊 Agent／Goal API 均不觸發此 Skill。
   使用者在執行指令裡提到「plan-forecast」不構成觸發。
 - 切換 execute 只停止規劃，不自動入列；回到 plan 也不自動暫停／取消既有 Goal。
@@ -63,7 +63,7 @@ Agent／Goal request 夾帶 mode。其餘缺口仍依後續階段處理。
 - Forecast 運算前與發布前皆核對 mode／version；途中退出 plan 或計畫變更，回報
   `409 stale_snapshot`，不得發布為目前有效結果。歷史查閱不重觸發估算。
 
-### 擬議 API
+### API（M5 實際路徑以操作指南為準）
 
 tenant 取自 principal，沿用 RBAC；修改／估算／啟動至少 operator，查詢至少 viewer。
 管理 Agent、安裝 Skill、調整校正設定需要 admin。
@@ -74,9 +74,9 @@ tenant 取自 principal，沿用 RBAC；修改／估算／啟動至少 operator�
 | `GET /v1/planning-sessions/{session_id}` | 讀取模式、版本、計畫與最新結果參照，不重新估算。 |
 | `POST /v1/planning-sessions/{session_id}/plans` | body 含 `expected_version` 與完整計畫；只允許 plan，建立不可變 revision。 |
 | `POST /v1/planning-sessions/{session_id}/refresh` | 只允許 plan，body 含 `expected_version`；明確重新解析最新 Agent／模型／Skill／政策，建立新計畫 revision，不改歷史。 |
-| `POST /v1/planning-sessions/{session_id}/mode` | body 為 `mode`、`expected_version`；切到 execute 另指定接受的 plan revision，已綁定 forecast 時另指定 forecast ID，不啟動／取消 Goal。 |
+| `POST /v1/planning-sessions/{session_id}/mode` | body 為 `mode`、`expected_version`；切到 execute 指定接受的 plan revision，不啟動／取消 Goal。 |
 | `POST /v1/planning-sessions/{session_id}/forecasts` | body 為 `expected_version`、`plan_revision`；只允許 plan，重用相同指紋結果。 |
-| `GET /v1/planning-sessions/{session_id}/forecasts/{forecast_id}` | 讀取歷史，附 `current`／`stale`／`revoked` 適用性，不觸發 Skill。 |
+| `GET /v1/planning-sessions/{session_id}/forecasts/latest` | 讀取 latest immutable artifact，不重算；歷史列表尚未公開。 |
 | `POST /v1/planning-sessions/{session_id}/execute` | 只允許 execute；明確指定 session version／plan revision／已接受的 snapshot fingerprint 及 idempotency key。 |
 
 模式不符為 `409 mode_conflict`；版本或有效設定改變為 `409 stale_snapshot`；不合法計畫為 422；
@@ -87,15 +87,14 @@ session 的 `version` 僅在模式、目前計畫或固定設定變更時增加�
 避免結果一保存就使自己失效。SSE 擬新增 `plan.revised`、`forecast.ready`、`forecast.stale`、
 `planning.mode_changed`；事件只包含安全參照與狀態，不含原始指令或憑證。
 
-未綁定 `plan-forecast` 的 session 可只接受計畫快照，`accepted_forecast_id` 為 null，不必為了
-執行而安裝 Skill；已綁定者必須有對應的 forecast（可為缺校正狀態），不能以 null 繞過。
-兩者都需固定與驗證計畫／Agent／模型／政策內容；只有啟用 forecast 者另納入估算版本與結果。
+未綁定 `plan-forecast` 的 session 仍可接受並執行計畫，不必為了執行而安裝 Skill；forecast
+不是執行 admission 的同意或前置核准。兩者都固定並驗證計畫／Agent／模型／政策內容。
 
 ## 4. 不可變計畫與「目前模型」
 
 PlanRevision 保存 objective、明確工作項目、依賴、預定 Agent、驗證／重試假設與內容雜湊。
-第一版只支援 Worker 的線性步驟，或單層 Chief → 1–8 個 Worker → Chief 彙整；不接受循環、
-遞迴派工或任意跨 Worker 的依賴圖。尚未決定的分工可保存，但標為不完整，不假裝已知全隊用量。
+目前使用 M4 Plan v2 canonical DAG：最多依設定 32 nodes／64 edges、條件與跨 Worker dependency，
+拒絕循環與遞迴委派。舊線性／Chief 計畫透過明確 adapter 使用同一 compiler。
 
 估算輸入由服務端解析並固定，不接受呼叫端偽造 Agent／Skill 快照或模型速度：
 
@@ -143,7 +142,8 @@ delegation 的預算、ATR、核准及恢復機制；不得悄悄回到現行自
 確認缺口後提交；這個確認不會豁免任何硬性額度、工具政策、ATR 或逐次寫入核准。
 固定分工已完成時，不重複計入／呼叫 Chief 拆解。第一版不保留執行時自由拆解；分工不確定時
 先留在 plan 補齊，不能先啟動 Goal 再自動採用未被接受的新分工。
-這個 compiler／admission bridge 本身尚未實作，不影響既有 Goal 入口。
+M4 已實作固定 compiler／admission bridge；forecast 與 execution 讀取同一 compiled artifact，
+但 forecast 本身不等於 execute admission。
 
 啟動前重新檢查所有版本、Agent／Skill 啟停與政策；不一致則 409，回 plan 更新與重新估算。
 依賴的 Worker 在建立子 Goal 前仍需撤銷檢查，不能使用更新後的設定偷換已接受快照。
@@ -296,7 +296,9 @@ Skill 草案描述工作規則，真正的模式、資料與數值檢查都由�
 
 ## 9. 實作階段與驗收
 
-以下為完整實作順序；目前只完成 P1 的 session／快照核心子集，不宣稱整個 P1 已完成：
+以下是原始實作順序。P1、P3 已分別由 M3／M4 核心完成；P2 的共享發布、telemetry、明確校正、
+call manifest、情境計算與不可變 forecast 已由 M5 完成。Forecast SSE 延至 M7，真實模型
+held-out 校正與 staging 證據延至 M9：
 
 1. **P1：模式與快照。** PlanningSession／PlanRevision API、RBAC／CAS／大小限制、Skill v2 相容
    與 planning 綁定、端到端 plan-only gate；未校正結果先誠實回 null。
@@ -323,8 +325,8 @@ Skill 草案描述工作規則，真正的模式、資料與數值檢查都由�
 
 ## 10. 進度與後續討論
 
-設計初稿僅包含文件；後續已新增核心規劃 API 與測試，操作及實際交付邊界見
-[plan-mode.md](../../plan-mode.md)。Forecast 草案仍未啟用；本機 milestone 與最新驗證邊界見
-[封版彙總](../../releases/2026-10-26-skills-plan-mode.md)，沒有推送遠端。
+設計初稿後已完成 plan mode、Skill v2、Workflow admission 與 M5 forecast。操作及實際交付邊界見
+[plan-mode.md](../../plan-mode.md)、[plan-forecast.md](../../plan-forecast.md)與
+[M5 驗證紀錄](../../releases/2026-10-27-m5-forecast.md)。
 後續在 [Discussion log](../../architecture/discussion-log.md) 持續記錄校正資料、實作證據與設計變更；
 GitHub Discussions 啟用並取得主題網址後再連回，不把本機紀錄當成已發布的 Discussion。

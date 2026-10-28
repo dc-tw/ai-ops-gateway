@@ -15,6 +15,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictInt, model_validator
 from redis.exceptions import RedisError
 
+from app.core.plan_forecast import ForecastStore, build_forecast
 from app.core.planning_snapshot import (
     PlanningSnapshotInvalid,
     PlanningSnapshotNotFound,
@@ -121,6 +122,11 @@ class WorkflowExecute(PlanningInput):
     idempotency_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
+class ForecastCreate(PlanningInput):
+    expected_version: StrictInt = Field(ge=1)
+    plan_revision: StrictInt = Field(ge=1)
+
+
 def _validate_plan(request, snapshot, plan):
     if plan.get("schema_version") == 2:
         compile_workflow(plan, snapshot, check_schemas=False, **_workflow_limits(request))
@@ -142,6 +148,11 @@ def _workflow_limits(request):
 def _workflow_enabled(request):
     if not request.app.state.settings.workflow_enabled:
         raise HTTPException(status_code=409, detail="Workflow authoring is disabled")
+
+
+def _forecast_enabled(request):
+    if not request.app.state.settings.plan_forecast_enabled:
+        raise HTTPException(status_code=409, detail="Plan forecast is disabled")
 
 
 class PlanningRefresh(PlanningInput):
@@ -396,6 +407,84 @@ async def get_compiled_plan(
             "execution_started": False,
             "execution_authority": False,
         }
+    except ValueError as exc:
+        raise _error(exc) from exc
+
+
+@router.post("/planning-sessions/{session_id}/forecasts")
+async def create_forecast(
+    payload: ForecastCreate,
+    request: Request,
+    session_id: str = Path(pattern=ID_PATTERN),
+) -> dict[str, Any]:
+    principal = await authorize(request, "operator")
+    _forecast_enabled(request)
+    store = _store(request)
+    try:
+        session = await _session(store, principal.tenant_id, session_id)
+        if session["mode"] != "plan":
+            raise PlanningConflict("Forecast creation requires plan mode")
+        if session["version"] != payload.expected_version:
+            raise PlanningConflict("Planning session version conflict")
+        if session["plan_revision"] != payload.plan_revision:
+            raise PlanningConflict("Forecast requires the current Plan revision")
+        revision = await store.get_revision(principal.tenant_id, session_id, payload.plan_revision)
+        if revision is None or not revision["complete"]:
+            raise PlanningConflict("Forecast requires a complete Plan")
+        await guard_planning_snapshot(
+            store.runtime,
+            request.app.state.model_router,
+            principal.tenant_id,
+            revision["snapshot"],
+            client=store.client,
+            watch=False,
+        )
+        compiled = revision.get("compiled")
+        if compiled is None:
+            _workflow_enabled(request)
+            compiled = await asyncio.to_thread(
+                compile_workflow,
+                adapt_legacy_plan(revision["plan"], revision["snapshot"]),
+                revision["snapshot"],
+                **_workflow_limits(request),
+            )
+        artifact, sources = await build_forecast(
+            store.runtime,
+            principal.tenant_id,
+            session,
+            revision,
+            compiled,
+            history_tokens_cap=request.app.state.settings.conversation_context_max_tokens,
+            max_output_tokens=request.app.state.settings.llm_max_output_tokens,
+        )
+        return await ForecastStore(store).publish(
+            principal.tenant_id,
+            session_id,
+            payload.expected_version,
+            principal.subject,
+            artifact,
+            sources,
+            _builder(request, principal.tenant_id, session["agent_id"]),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise _error(exc) from exc
+
+
+@router.get("/planning-sessions/{session_id}/forecasts/latest")
+async def get_latest_forecast(
+    request: Request, session_id: str = Path(pattern=ID_PATTERN)
+) -> dict[str, Any]:
+    principal = await authorize(request, "viewer")
+    _forecast_enabled(request)
+    try:
+        store = _store(request)
+        await _session(store, principal.tenant_id, session_id)
+        value = await ForecastStore(store).get(principal.tenant_id, session_id)
+        if value is None:
+            raise PlanningNotFound("Forecast not found")
+        return value
     except ValueError as exc:
         raise _error(exc) from exc
 
