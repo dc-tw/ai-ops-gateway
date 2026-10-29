@@ -6,7 +6,7 @@
 | 階段 | 交付內容 | 狀態 |
 | --- | --- | --- |
 | M1 | ATR 完整掃描、超限拒絕、可終止隔離、規則健全性、安全決策 journal | 已實作／本機與 Docker 驗證完成 |
-| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：Agent 憑證、policy reference、owner／分享 ACL 已實作；其餘待實作 |
+| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：Agent 憑證、policy reference、owner／分享 ACL、conversation fencing 已實作；EventEnvelope 與 audit chain 待實作 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 已實作／本機、Docker 新舊版本及故障驗證完成 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心已實作／synthetic 校正通過；真實模型校正需環境 |
@@ -46,6 +46,9 @@
 - M2 第三段：[MCP／ATR policy reference](releases/2026-10-29-m2-policy-references.md)。human-admin
   immutable revisions、scope subset、server／ruleset fingerprint、Worker live guard 與 Redis-only
   revocation 已完成；conversation fencing、EventEnvelope 與 audit chain 仍待實作。
+- M2 第四段：[conversation single-flight／FIFO／fencing](releases/2026-10-29-m2-conversation-fencing.md)。
+  即時 conflict、背景 FIFO、approval logical ownership、terminal handoff 與跨 replica execution lease
+  已完成；EventEnvelope 與 audit chain 仍待實作。
 - M3 第一段：[v2／planning_skills／確定性選擇實作與驗證](releases/2026-10-27-m3-skill-v2-selection.md)。
   775 tests、真實 HTTP／worker／model-context Docker E2E；套件隔離匯入仍待接續。
 - M3 完整段落：[唯讀 package 匯入與驗證](releases/2026-10-27-m3-package-import.md)。

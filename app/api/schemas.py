@@ -31,6 +31,12 @@ class GoalStepRequest(BaseModel):
 
 
 class GoalCreateRequest(BaseModel):
+    conversation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
     objective: str = Field(min_length=1, max_length=8_000)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     steps: list[GoalStepRequest] = Field(default_factory=list, max_length=100)

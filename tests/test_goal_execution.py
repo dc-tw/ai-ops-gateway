@@ -16,6 +16,10 @@ import pytest_asyncio
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.core.config import Settings
+from app.core.conversation_execution import (
+    ConversationExecutionStore,
+    ConversationFencedExecutor,
+)
 from app.core.goal_execution import GoalExecutionStore
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatScan
@@ -76,6 +80,126 @@ async def test_expired_worker_is_fenced_from_writing_and_recovery_requeues(state
     assert not await store.save_owned(claimed, "dead")
     assert not await store.finish(claimed, "dead", {"type": "goal_completed"})
     assert (await runtime.get_goal(goal["goal_id"], tenant))["execution_owner"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_conversation_fifo_retains_logical_owner_across_approval(state):
+    runtime, store, tenant, template = state
+    conversation_id = "shared-" + uuid4().hex
+    first = {**template, "goal_id": str(uuid4()), "conversation_id": conversation_id}
+    second = {**template, "goal_id": str(uuid4()), "conversation_id": conversation_id}
+    await store.submit_manual(first)
+    await store.submit_manual(second)
+
+    active = await store.claim(first["goal_id"], tenant, "first-worker", 60_000)
+    assert active is not None and active["conversation_fence"] == 1
+    assert await store.claim(second["goal_id"], tenant, "second-worker", 60_000) is None
+    queued = await runtime.get_goal(second["goal_id"], tenant)
+    assert queued["status"] == "queued" and queued["execution_waiting_conversation"]
+
+    active.update(
+        status="waiting_approval",
+        pending_approval={
+            "approval_id": "conversation-approval",
+            "action_id": "exact-action",
+            "expires_at": time.time() + 60,
+        },
+    )
+    assert await store.finish(active, "first-worker", {"type": "goal_waiting_approval"})
+    assert await store.claim(second["goal_id"], tenant, "early-worker", 60_000) is None
+
+    await store.decide_approval(
+        tenant, first["goal_id"], "conversation-approval", True, "", "reviewer"
+    )
+    resumed = await store.claim(first["goal_id"], tenant, "resume-worker", 60_000)
+    assert resumed["conversation_fence"] == active["conversation_fence"]
+    resumed["status"] = "completed"
+    assert await store.finish(resumed, "resume-worker", {"type": "goal_completed"})
+
+    next_goal = await store.claim(second["goal_id"], tenant, "second-worker", 60_000)
+    assert next_goal is not None
+    assert next_goal["conversation_fence"] == active["conversation_fence"] + 1
+
+
+@pytest.mark.asyncio
+async def test_immediate_conversation_conflicts_with_background_fifo(state):
+    runtime, store, tenant, template = state
+    conversation_id = "mixed-" + uuid4().hex
+    immediate = ConversationExecutionStore(runtime)
+    claim = await immediate.acquire_immediate(tenant, conversation_id, "run:one")
+    assert claim is not None
+    assert await immediate.acquire_immediate(tenant, conversation_id, "run:two") is None
+    assert await immediate.transition(
+        tenant,
+        conversation_id,
+        claim.owner_id,
+        claim.fence,
+        claim.execution_fence,
+        "waiting_approval",
+    )
+    resumed = await asyncio.gather(
+        immediate.claim_execution(
+            tenant,
+            conversation_id,
+            claim.owner_id,
+            claim.fence,
+            60,
+            expected_phases={"waiting_approval"},
+        ),
+        immediate.claim_execution(
+            tenant,
+            conversation_id,
+            claim.owner_id,
+            claim.fence,
+            60,
+            expected_phases={"waiting_approval"},
+        ),
+    )
+    assert sum(value is not None for value in resumed) == 1
+    live_claim = next(value for value in resumed if value is not None)
+
+    queued = {**template, "goal_id": str(uuid4()), "conversation_id": conversation_id}
+    await store.submit_manual(queued)
+    assert await store.claim(queued["goal_id"], tenant, "worker", 60_000) is None
+
+    class Effect:
+        def specs(self):
+            return []
+
+        async def invoke(self, name, arguments):
+            return {"effect": True}
+
+    fenced = ConversationFencedExecutor(
+        Effect(), immediate, tenant, conversation_id, live_claim
+    )
+    stale_fenced = ConversationFencedExecutor(
+        Effect(), immediate, tenant, conversation_id, claim
+    )
+    with pytest.raises(PermissionError, match="ownership was revoked"):
+        await stale_fenced.invoke("write", {})
+    assert await fenced.invoke("write", {}) == {"effect": True}
+    assert await immediate.transition(
+        tenant,
+        conversation_id,
+        live_claim.owner_id,
+        live_claim.fence,
+        live_claim.execution_fence,
+        "completed",
+        release=True,
+    )
+    next_goal = await store.claim(queued["goal_id"], tenant, "worker", 60_000)
+    assert next_goal is not None
+    with pytest.raises(PermissionError, match="ownership was revoked"):
+        await fenced.invoke("write", {})
+    assert not await immediate.transition(
+        tenant,
+        conversation_id,
+        claim.owner_id,
+        claim.fence,
+        claim.execution_fence,
+        "completed",
+        release=True,
+    )
 
 
 @pytest.mark.asyncio

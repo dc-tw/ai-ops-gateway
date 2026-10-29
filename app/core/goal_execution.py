@@ -185,6 +185,87 @@ class GoalExecutionStore:
                         delete_slot = bool(
                             not owns_execution and holder and holder.get("goal_id") == goal_id
                         )
+                    conversation_register = False
+                    conversation_record = None
+                    conversation_counter = None
+                    conversation_delete = False
+                    conversation_remove = False
+                    conversation_pop = False
+                    conversation_next = None
+                    conversation_keys_value = None
+                    conversation_id = goal.get("conversation_id")
+                    if conversation_id:
+                        from app.core.conversation_execution import conversation_keys
+
+                        conversation_keys_value = conversation_keys(tenant, conversation_id)
+                        record_key, counter_key, queue_key, members_key = (
+                            conversation_keys_value
+                        )
+                        await pipe.watch(record_key, counter_key, queue_key, members_key)
+                        conversation_record = json.loads(
+                            await pipe.get(record_key) or "null"
+                        )
+                        queue_values = await pipe.lrange(queue_key, 0, 1)
+                        queue_head = queue_values[0] if queue_values else None
+                        queue_second = queue_values[1] if len(queue_values) > 1 else None
+                        registered = bool(await pipe.sismember(members_key, goal_id))
+                        if current is None and not registered:
+                            conversation_register = True
+                            queue_head = queue_head or goal_id
+                        owner_id = f"goal:{goal_id}"
+                        if goal.get("status") == "running":
+                            held_by_other = conversation_record and conversation_record.get(
+                                "owner_id"
+                            ) != owner_id
+                            if queue_head != goal_id or held_by_other:
+                                waiting = json.loads(raw) if raw else goal
+                                waiting.update(
+                                    status="queued",
+                                    execution_owner=None,
+                                    execution_lease_until=0,
+                                    execution_waiting_conversation=True,
+                                )
+                                mutation = GoalMutation(
+                                    waiting,
+                                    [
+                                        {
+                                            "type": "goal_status",
+                                            "status": "queued",
+                                            "reason": "conversation_wait",
+                                        }
+                                    ],
+                                    result=None,
+                                    release_slot=mutation.release_slot,
+                                )
+                                goal = waiting
+                            else:
+                                if conversation_record:
+                                    fence = int(conversation_record["fence"])
+                                else:
+                                    fence = int(await pipe.get(counter_key) or 0) + 1
+                                    conversation_counter = fence
+                                goal["conversation_fence"] = fence
+                                goal.pop("execution_waiting_conversation", None)
+                                conversation_record = {
+                                    "owner_id": owner_id,
+                                    "owner_kind": "background",
+                                    "fence": fence,
+                                    "phase": "running",
+                                }
+                        elif conversation_record and conversation_record.get(
+                            "owner_id"
+                        ) == owner_id:
+                            if goal.get("status") in TERMINAL:
+                                conversation_delete = True
+                                conversation_remove = True
+                                conversation_pop = queue_head == goal_id
+                                conversation_next = queue_second if conversation_pop else None
+                            else:
+                                conversation_record["phase"] = str(goal.get("status"))
+                        elif goal.get("status") in TERMINAL and registered:
+                            conversation_remove = True
+                            conversation_pop = queue_head == goal_id
+                            conversation_next = queue_second if conversation_pop else None
                     if admission_goal is not None:
                         await guard_goal_skills(
                             self.runtime, admission_goal, client=pipe, watch=True
@@ -202,6 +283,33 @@ class GoalExecutionStore:
                                 mutation.goal.get("created_by_type", "human"),
                             )
                     pipe.multi()
+                    if conversation_keys_value:
+                        record_key, counter_key, queue_key, members_key = (
+                            conversation_keys_value
+                        )
+                        if conversation_register:
+                            pipe.sadd(members_key, goal_id)
+                            pipe.rpush(queue_key, goal_id)
+                        if conversation_counter is not None:
+                            pipe.set(counter_key, conversation_counter)
+                        if conversation_delete:
+                            pipe.delete(record_key)
+                        elif conversation_record:
+                            pipe.set(
+                                record_key,
+                                json.dumps(conversation_record, separators=(",", ":")),
+                            )
+                        if conversation_remove:
+                            if conversation_pop:
+                                pipe.lpop(queue_key)
+                            else:
+                                pipe.lrem(queue_key, 0, goal_id)
+                            pipe.srem(members_key, goal_id)
+                        if conversation_next:
+                            pipe.xadd(
+                                goal_queue(conversation_next),
+                                {"goal_id": conversation_next, "tenant_id": tenant},
+                            )
                     if agent_slot:
                         if slot_value:
                             pipe.set(agent_slot, json.dumps(slot_value))

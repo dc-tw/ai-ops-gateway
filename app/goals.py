@@ -121,6 +121,7 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         )
     goal = {
         "goal_id": goal_id,
+        "conversation_id": payload.conversation_id,
         "objective": objective,
         "model": model_name,
         "max_retries": payload.max_retries,

@@ -131,6 +131,7 @@ async def execute_goal(
     if goal is None:
         return
     goal["tenant_id"] = tenant_id
+    conversation_id = str(goal.get("conversation_id") or goal_id)
     policy = goal.get("policy", {})
     started = time.monotonic()
     prior_runtime = float(goal.get("runtime_seconds", 0))
@@ -315,7 +316,7 @@ async def execute_goal(
 
             request_id = f"{goal_id}:{step['id']}"
             history = await runtime.get_conversation(
-                goal_id, conversation_max_turns * 2, tenant_id=tenant_id
+                conversation_id, conversation_max_turns * 2, tenant_id=tenant_id
             )
             graph = build_agent_graph(
                 model,
@@ -352,7 +353,7 @@ async def execute_goal(
                     step["query"],
                     step.get("target_url"),
                     goal["max_retries"],
-                    conversation_id=goal_id,
+                    conversation_id=conversation_id,
                     model=goal["model"],
                     conversation_history=history,
                     context_max_tokens=context_max_tokens,
@@ -444,7 +445,7 @@ async def execute_goal(
             goal.pop("approval_decision", None)
             goal["updated_at"] = _now()
             await runtime.append_conversation_turn(
-                goal_id,
+                conversation_id,
                 query=step["query"],
                 answer=step["answer"],
                 model=goal["model"],

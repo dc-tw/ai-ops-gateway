@@ -11,6 +11,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.types import Command
 
 from app.api.schemas import AgentRequest, ApprovalDecision
+from app.core.conversation_execution import (
+    ConversationExecutionStore,
+    ConversationFencedExecutor,
+)
 from app.core.observability import metrics, observe_agent_event
 from app.core.safety_journal import graph_journal
 from app.core.security import authorize, redact_pii
@@ -30,6 +34,63 @@ def _sse(event: str, data: dict[str, Any], event_id: str | int | None = None) ->
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     lines.extend(f"data: {line}" for line in payload.splitlines() or [""])
     return "\n".join(lines) + "\n\n"
+
+
+async def _run_conversation_claim(runtime, tenant: str, request_id: str, run: dict[str, Any]):
+    """Resolve a durable run's logical conversation ownership across replicas."""
+    if not hasattr(runtime, "_client"):
+        return None, None
+    store = ConversationExecutionStore(runtime)
+    conversation_id = str(run["conversation_id"])
+    fence = run.get("conversation_fence")
+    owner_id = f"run:{request_id}"
+    if type(fence) is int:
+        return store, await store.current_claim(tenant, conversation_id, owner_id, fence)
+    claim = await store.acquire_immediate(tenant, conversation_id, owner_id)
+    if claim:
+        run["conversation_fence"] = claim.fence
+    return store, claim
+
+
+def _conversation_tool_executor(request, store, claim, tenant: str, conversation_id: str):
+    executor = request.app.state.tool_executor
+    return (
+        ConversationFencedExecutor(executor, store, tenant, conversation_id, claim)
+        if executor and claim
+        else executor
+    )
+
+
+def _build_fenced_graph(
+    request,
+    model,
+    runtime,
+    settings,
+    principal,
+    request_id: str,
+    model_name: str,
+    store,
+    claim,
+    conversation_id: str,
+):
+    return build_agent_graph(
+        model,
+        request.app.state.scraper,
+        tool_executor=_conversation_tool_executor(
+            request, store, claim, principal.tenant_id, conversation_id
+        ),
+        autonomous_tool_planning=settings.autonomous_tool_planning,
+        checkpointer=request.app.state.checkpointer,
+        threat_detector=request.app.state.threat_detector,
+        safety_journal=graph_journal(
+            runtime,
+            settings,
+            principal.tenant_id,
+            request_id,
+            model=model_name,
+            subject=principal.subject,
+        ),
+    )
 
 
 @router.post("/v1/agent/stream")
@@ -91,28 +152,49 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         selected_model = request.app.state.model_router.get(model_name)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    graph = request.app.state.graph or build_agent_graph(
-        selected_model,
-        request.app.state.scraper,
-        tool_executor=request.app.state.tool_executor,
-        autonomous_tool_planning=settings.autonomous_tool_planning,
-        checkpointer=request.app.state.checkpointer,
-        threat_detector=request.app.state.threat_detector,
-        safety_journal=graph_journal(
-            request.app.state.redis,
-            settings,
-            principal.tenant_id,
-            request_id,
-            model=model_name,
-            subject=principal.subject,
-        ),
-    )
     redis_runtime = request.app.state.redis
     max_retries = (
         payload.max_retries if payload.max_retries is not None else settings.agent_max_retries
     )
     history: list[dict[str, str]] = []
     await claim_conversation(request, principal, conversation_id)
+    conversation_store = None
+    conversation_claim = None
+    if redis_runtime and hasattr(redis_runtime, "_client"):
+        conversation_store = ConversationExecutionStore(redis_runtime)
+        conversation_claim = await conversation_store.acquire_immediate(
+            principal.tenant_id,
+            conversation_id,
+            f"run:{request_id}",
+            payload.deadline_seconds or settings.agent_default_deadline_seconds,
+        )
+        if conversation_claim is None:
+            raise HTTPException(status_code=409, detail="Conversation already has active work")
+    try:
+        graph = request.app.state.graph or _build_fenced_graph(
+            request,
+            selected_model,
+            redis_runtime,
+            settings,
+            principal,
+            request_id,
+            model_name,
+            conversation_store,
+            conversation_claim,
+            conversation_id,
+        )
+    except Exception:
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                conversation_id,
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "failed",
+                release=True,
+            )
+        raise
     reserved_tokens = max(1, len(safe_query) // 3) + settings.llm_max_output_tokens
     if redis_runtime and hasattr(redis_runtime, "get_conversation"):
         if hasattr(redis_runtime, "get_conversation_context"):
@@ -138,6 +220,16 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                 settings.tenant_daily_token_budget,
             )
         except RuntimeError as exc:
+            if conversation_claim:
+                await conversation_store.transition(
+                    principal.tenant_id,
+                    conversation_id,
+                    conversation_claim.owner_id,
+                    conversation_claim.fence,
+                    conversation_claim.execution_fence,
+                    "failed",
+                    release=True,
+                )
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         if not await redis_runtime.acquire_run_slot(
             principal.tenant_id,
@@ -145,6 +237,16 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
             settings.tenant_max_concurrent_runs,
             ttl_seconds=max(60, int(settings.llm_timeout_seconds * 3)),
         ):
+            if conversation_claim:
+                await conversation_store.transition(
+                    principal.tenant_id,
+                    conversation_id,
+                    conversation_claim.owner_id,
+                    conversation_claim.fence,
+                    conversation_claim.execution_fence,
+                    "failed",
+                    release=True,
+                )
             raise HTTPException(status_code=429, detail="Tenant concurrent run limit exceeded")
     state = initial_state(
         request_id,
@@ -175,6 +277,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         "deadline_seconds": payload.deadline_seconds or settings.agent_default_deadline_seconds,
         "approved_tools": payload.approved_tools,
         "reserved_tokens": reserved_tokens,
+        "conversation_fence": conversation_claim.fence if conversation_claim else None,
     }
 
     async def publish(event: dict[str, Any]) -> None:
@@ -238,6 +341,18 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                     config={"configurable": {"thread_id": request_id}},
                     stream_mode="custom",
                 ):
+                    if (
+                        conversation_claim
+                        and event.get("type") not in {"token", "draft_token"}
+                        and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            conversation_id,
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        )
+                    ):
+                        raise RuntimeError("Conversation ownership was revoked")
                     observe_agent_event(event, model=model_name)
                     if event.get("type") in {"draft_token", "token"} and not first_token_seen:
                         first_token_seen = True
@@ -281,6 +396,16 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                             )
                     if event.get("type") == "approval_required":
                         waiting_for_approval = True
+                        if conversation_claim:
+                            if not await conversation_store.transition(
+                                principal.tenant_id,
+                                conversation_id,
+                                conversation_claim.owner_id,
+                                conversation_claim.fence,
+                                conversation_claim.execution_fence,
+                                "waiting_approval",
+                            ):
+                                raise RuntimeError("Conversation ownership was revoked")
                         if redis_runtime:
                             await redis_runtime.save_run_state(
                                 request_id,
@@ -298,6 +423,14 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
                         and hasattr(redis_runtime, "append_conversation_turn")
                     ):
                         waiting_for_approval = False
+                        if conversation_claim and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            conversation_id,
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        ):
+                            raise RuntimeError("Conversation ownership was revoked")
                         usage = event.get("usage", {})
                         if (
                             isinstance(usage, dict)
@@ -343,6 +476,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
             if waiting_for_approval and redis_runtime:
                 await redis_runtime.release_run_slot(principal.tenant_id, request_id)
         except TimeoutError:
+            waiting_for_approval = False
             await publish(
                 {
                     "type": "error",
@@ -369,6 +503,7 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            waiting_for_approval = False
             await publish(
                 {
                     "type": "error",
@@ -406,6 +541,16 @@ async def stream_agent(payload: AgentRequest, request: Request) -> StreamingResp
             metrics.gauge_add("ai_gateway_active_runs", -1, tenant=principal.tenant_id)
             if redis_runtime:
                 await redis_runtime.release_run_slot(principal.tenant_id, request_id)
+            if conversation_claim and not waiting_for_approval:
+                await conversation_store.transition(
+                    principal.tenant_id,
+                    conversation_id,
+                    conversation_claim.owner_id,
+                    conversation_claim.fence,
+                    conversation_claim.execution_fence,
+                    "terminal",
+                    release=True,
+                )
             if consumer_attached.is_set():
                 await queue.put(_DONE)
 
@@ -475,6 +620,11 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
         raise HTTPException(status_code=409, detail="Terminal runs cannot be resumed")
     if run.get("status") == "waiting_approval":
         raise HTTPException(status_code=409, detail="Use the approval endpoint for this run")
+    conversation_store, conversation_claim = await _run_conversation_claim(
+        runtime, principal.tenant_id, request_id, run
+    )
+    if conversation_store and conversation_claim is None:
+        raise HTTPException(status_code=409, detail="Conversation ownership was revoked")
     if request_id in request.app.state.active_run_ids:
         raise HTTPException(status_code=409, detail="Agent run is already active")
 
@@ -483,29 +633,60 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
         model = request.app.state.model_router.get(model_name)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    graph = build_agent_graph(
-        model,
-        request.app.state.scraper,
-        tool_executor=request.app.state.tool_executor,
-        autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
-        checkpointer=request.app.state.checkpointer,
-        threat_detector=request.app.state.threat_detector,
-        safety_journal=graph_journal(
-            runtime,
-            request.app.state.settings,
+    if conversation_claim:
+        resumed_claim = await conversation_store.claim_execution(
             principal.tenant_id,
-            request_id,
-            model=model_name,
-            subject=principal.subject,
-        ),
-    )
+            str(run["conversation_id"]),
+            conversation_claim.owner_id,
+            conversation_claim.fence,
+            float(run.get("deadline_seconds", 300)),
+            expected_phases={"paused", "failed"},
+        )
+        if resumed_claim is None:
+            raise HTTPException(status_code=409, detail="Agent run is already active")
+        conversation_claim = resumed_claim
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
         request_id,
         request.app.state.settings.tenant_max_concurrent_runs,
         ttl_seconds=max(60, int(float(run.get("deadline_seconds", 300)))),
     ):
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                str(run["conversation_id"]),
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "paused",
+            )
         raise HTTPException(status_code=429, detail="Tenant concurrent run limit exceeded")
+
+    try:
+        graph = _build_fenced_graph(
+            request,
+            model,
+            runtime,
+            request.app.state.settings,
+            principal,
+            request_id,
+            model_name,
+            conversation_store,
+            conversation_claim,
+            str(run["conversation_id"]),
+        )
+    except Exception:
+        await runtime.release_run_slot(principal.tenant_id, request_id)
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                str(run["conversation_id"]),
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "paused",
+            )
+        raise
 
     async def resume() -> None:
         waiting = False
@@ -527,6 +708,18 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                     config={"configurable": {"thread_id": request_id}},
                     stream_mode="custom",
                 ):
+                    if (
+                        conversation_claim
+                        and event.get("type") not in {"token", "draft_token"}
+                        and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        )
+                    ):
+                        raise RuntimeError("Conversation ownership was revoked")
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
                     if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
@@ -557,6 +750,15 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                         )
                     if event.get("type") == "approval_required":
                         waiting = True
+                        if conversation_claim and not await conversation_store.transition(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                            "waiting_approval",
+                        ):
+                            raise RuntimeError("Conversation ownership was revoked")
                         await runtime.save_run_state(
                             request_id,
                             {
@@ -569,6 +771,14 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                         )
                     if event.get("type") == "completed":
                         waiting = False
+                        if conversation_claim and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        ):
+                            raise RuntimeError("Conversation ownership was revoked")
                         usage = event.get("usage", {})
                         if isinstance(usage, dict) and usage.get("provider_reported"):
                             await runtime.reconcile_daily_tokens(
@@ -593,6 +803,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
                             principal.tenant_id,
                         )
         except TimeoutError:
+            waiting = False
             if latest_usage.get("provider_reported"):
                 await runtime.reconcile_daily_tokens(
                     principal.tenant_id,
@@ -613,6 +824,7 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            waiting = False
             if latest_usage.get("provider_reported"):
                 await runtime.reconcile_daily_tokens(
                     principal.tenant_id,
@@ -637,6 +849,16 @@ async def resume_agent_run(request_id: str, request: Request) -> dict[str, objec
             )
         finally:
             await runtime.release_run_slot(principal.tenant_id, request_id)
+            if conversation_claim and not waiting:
+                await conversation_store.transition(
+                    principal.tenant_id,
+                    str(run["conversation_id"]),
+                    conversation_claim.owner_id,
+                    conversation_claim.fence,
+                    conversation_claim.execution_fence,
+                    "terminal",
+                    release=True,
+                )
             if waiting:
                 metrics.inc("ai_gateway_approval_waits_total", tenant=principal.tenant_id)
 
@@ -673,6 +895,11 @@ async def decide_agent_approval(
         raise HTTPException(status_code=404, detail="Agent run not found")
     if run.get("status") != "waiting_approval":
         raise HTTPException(status_code=409, detail="Run is not waiting for approval")
+    conversation_store, conversation_claim = await _run_conversation_claim(
+        runtime, principal.tenant_id, request_id, run
+    )
+    if conversation_store and conversation_claim is None:
+        raise HTTPException(status_code=409, detail="Conversation ownership was revoked")
     if not payload.approved:
         usage = run.get("usage", {})
         if isinstance(usage, dict) and usage.get("provider_reported"):
@@ -699,6 +926,16 @@ async def decide_agent_approval(
                 "reason": payload.reason,
             },
         )
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                str(run["conversation_id"]),
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "rejected",
+                release=True,
+            )
         return {"request_id": request_id, "status": "rejected"}
     if request_id in request.app.state.active_run_ids:
         raise HTTPException(status_code=409, detail="Agent run is already active")
@@ -708,29 +945,60 @@ async def decide_agent_approval(
         model = request.app.state.model_router.get(model_name)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    graph = build_agent_graph(
-        model,
-        request.app.state.scraper,
-        tool_executor=request.app.state.tool_executor,
-        autonomous_tool_planning=request.app.state.settings.autonomous_tool_planning,
-        checkpointer=request.app.state.checkpointer,
-        threat_detector=request.app.state.threat_detector,
-        safety_journal=graph_journal(
-            runtime,
-            request.app.state.settings,
+    if conversation_claim:
+        resumed_claim = await conversation_store.claim_execution(
             principal.tenant_id,
-            request_id,
-            model=model_name,
-            subject=principal.subject,
-        ),
-    )
+            str(run["conversation_id"]),
+            conversation_claim.owner_id,
+            conversation_claim.fence,
+            float(run.get("deadline_seconds", 300)),
+            expected_phases={"waiting_approval"},
+        )
+        if resumed_claim is None:
+            raise HTTPException(status_code=409, detail="Agent run is already active")
+        conversation_claim = resumed_claim
     if not await runtime.acquire_run_slot(
         principal.tenant_id,
         request_id,
         request.app.state.settings.tenant_max_concurrent_runs,
         ttl_seconds=max(60, int(request.app.state.settings.agent_default_deadline_seconds)),
     ):
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                str(run["conversation_id"]),
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "waiting_approval",
+            )
         raise HTTPException(status_code=429, detail="Tenant concurrent run limit exceeded")
+
+    try:
+        graph = _build_fenced_graph(
+            request,
+            model,
+            runtime,
+            request.app.state.settings,
+            principal,
+            request_id,
+            model_name,
+            conversation_store,
+            conversation_claim,
+            str(run["conversation_id"]),
+        )
+    except Exception:
+        await runtime.release_run_slot(principal.tenant_id, request_id)
+        if conversation_claim:
+            await conversation_store.transition(
+                principal.tenant_id,
+                str(run["conversation_id"]),
+                conversation_claim.owner_id,
+                conversation_claim.fence,
+                conversation_claim.execution_fence,
+                "waiting_approval",
+            )
+        raise
 
     async def continue_after_approval() -> None:
         waiting = False
@@ -752,6 +1020,18 @@ async def decide_agent_approval(
                     config={"configurable": {"thread_id": request_id}},
                     stream_mode="custom",
                 ):
+                    if (
+                        conversation_claim
+                        and event.get("type") not in {"token", "draft_token"}
+                        and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        )
+                    ):
+                        raise RuntimeError("Conversation ownership was revoked")
                     observe_agent_event(event, model=model_name)
                     await runtime.append_event(request_id, event, principal.tenant_id)
                     if event.get("type") == "threat_detection" and not event.get("safety_event_id"):
@@ -782,6 +1062,15 @@ async def decide_agent_approval(
                         )
                     if event.get("type") == "approval_required":
                         waiting = True
+                        if conversation_claim and not await conversation_store.transition(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                            "waiting_approval",
+                        ):
+                            raise RuntimeError("Conversation ownership was revoked")
                         await runtime.save_run_state(
                             request_id,
                             {
@@ -794,6 +1083,14 @@ async def decide_agent_approval(
                         )
                     if event.get("type") == "completed":
                         waiting = False
+                        if conversation_claim and not await conversation_store.assert_owner(
+                            principal.tenant_id,
+                            str(run["conversation_id"]),
+                            conversation_claim.owner_id,
+                            conversation_claim.fence,
+                            conversation_claim.execution_fence,
+                        ):
+                            raise RuntimeError("Conversation ownership was revoked")
                         usage = event.get("usage", {})
                         if isinstance(usage, dict) and usage.get("provider_reported"):
                             await runtime.reconcile_daily_tokens(
@@ -822,6 +1119,7 @@ async def decide_agent_approval(
                             principal.tenant_id,
                         )
         except TimeoutError:
+            waiting = False
             if latest_usage.get("provider_reported"):
                 await runtime.reconcile_daily_tokens(
                     principal.tenant_id,
@@ -840,6 +1138,7 @@ async def decide_agent_approval(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            waiting = False
             if latest_usage.get("provider_reported"):
                 await runtime.reconcile_daily_tokens(
                     principal.tenant_id,
@@ -857,6 +1156,16 @@ async def decide_agent_approval(
             )
         finally:
             await runtime.release_run_slot(principal.tenant_id, request_id)
+            if conversation_claim and not waiting:
+                await conversation_store.transition(
+                    principal.tenant_id,
+                    str(run["conversation_id"]),
+                    conversation_claim.owner_id,
+                    conversation_claim.fence,
+                    conversation_claim.execution_fence,
+                    "terminal",
+                    release=True,
+                )
             if waiting:
                 metrics.inc("ai_gateway_approval_waits_total", tenant=principal.tenant_id)
 
@@ -889,6 +1198,11 @@ async def cancel_agent_run(request_id: str, request: Request) -> dict[str, objec
         raise HTTPException(status_code=404, detail="Agent run not found")
     if run.get("status") in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
         raise HTTPException(status_code=409, detail="Run is already terminal")
+    conversation_store, conversation_claim = await _run_conversation_claim(
+        runtime, principal.tenant_id, request_id, run
+    )
+    if conversation_store and conversation_claim is None:
+        raise HTTPException(status_code=409, detail="Conversation ownership was revoked")
     event = {"type": "cancelled", "request_id": request_id, "by": principal.subject}
     usage = run.get("usage", {})
     if (
@@ -916,6 +1230,16 @@ async def cancel_agent_run(request_id: str, request: Request) -> dict[str, objec
     task = request.app.state.active_run_tasks.get(request_id)
     if task is not None:
         task.cancel()
+    if conversation_claim:
+        await conversation_store.transition(
+            principal.tenant_id,
+            str(run["conversation_id"]),
+            conversation_claim.owner_id,
+            conversation_claim.fence,
+            conversation_claim.execution_fence,
+            "cancelled",
+            release=True,
+        )
     return {"request_id": request_id, "status": "cancelled"}
 
 
