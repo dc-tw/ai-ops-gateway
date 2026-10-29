@@ -88,6 +88,8 @@ event envelope、Agent identity、tamper-evident audit 與 per-conversation sing
 
 完整待辦與分階段交付見[實作追蹤](docs/implementation-roadmap.md)；
 本次安全行為變更見[M1 完整掃描／journal 紀錄](docs/releases/2026-10-27-m1-safety.md)。
+跨功能全量回歸、多副本故障、固定負載與 PostgreSQL PITR 證據見
+[M9 多副本 staging 與封版驗證](docs/releases/2026-10-29-m9-staging.md)。
 
 管理台登入、CSRF、presence／heartbeat 與通知維運見
 [繁中管理台、協作與通知](docs/console-collaboration.md)。
@@ -427,6 +429,14 @@ sh scripts/test_ollama_stack.sh
 ```bash
 sh scripts/test_proactive_stack.sh
 sh scripts/test_atr_tool_stack.sh
+```
+
+完整封版另提供私有多副本 staging、固定 1／4／16 併發、Gateway／Redis／PostgreSQL 故障與
+真正 WAL restore-point PITR。腳本只操作自己建立的可拋棄資源；本機結果不代表 production SLA：
+
+```bash
+sh scripts/test_m9_staging_stack.sh
+sh scripts/test_postgres_pitr.sh
 ```
 
 ## 已知邊界

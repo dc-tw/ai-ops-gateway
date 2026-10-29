@@ -1,0 +1,49 @@
+# Disposable, loopback-free multi-replica M9 staging overlay. The verifier runs
+# inside the private backend network; no service is published to the host.
+services:
+  gateway:
+    ports: !reset []
+    environment:
+      POSTGRES_HISTORY_MODE: shadow
+      API_KEYS_JSON: '{"m9-admin":{"subject":"m9-admin","tenant_id":"m9-e2e","role":"admin"}}'
+      # The production defaults remain unchanged. This isolated load fixture
+      # intentionally admits the fixed 16-concurrent workload.
+      TENANT_REQUESTS_PER_MINUTE: "10000"
+      TENANT_MAX_CONCURRENT_RUNS: "64"
+      TENANT_DAILY_TOKEN_BUDGET: "10000000"
+      # The default 5s fail-closed scan budget produced 1 timeout in 32
+      # synthetic requests at concurrency 16 on this small local host.
+      ATR_SCAN_TIMEOUT_SECONDS: "15"
+      # Four process slots can leave concurrent requests waiting for most of
+      # the total scan budget. Match this fixture's peak request concurrency.
+      ATR_SCAN_MAX_WORKERS: "16"
+
+  worker:
+    environment:
+      POSTGRES_HISTORY_MODE: shadow
+
+  scheduler:
+    environment:
+      POSTGRES_HISTORY_MODE: shadow
+
+  m9-runner:
+    image: ${POSTGRES_TEST_PROJECT:-ai-ops-m9-test}-gateway:local
+    pull_policy: never
+    command: ["sleep", "infinity"]
+    healthcheck: {disable: true}
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://gateway:local-postgres-only@postgres:5432/gateway
+      POSTGRES_SOURCE_ID: postgres-e2e
+    depends_on:
+      redis:
+        condition: service_healthy
+      pg-migrate:
+        condition: service_completed_successfully
+      mock-llm:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]

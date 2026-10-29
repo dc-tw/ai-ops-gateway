@@ -8,12 +8,12 @@
 | M1 | ATR 完整掃描、超限拒絕、可終止隔離、規則健全性、安全決策 journal | 已實作／本機與 Docker 驗證完成 |
 | M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：owner／分享 ACL 已實作；其餘待實作 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
-| M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 核心交付完成／本機及 Docker 故障驗證通過；跨階段封版仍屬 M9 |
-| M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心交付完成／本機及 Docker 驗證通過；真實模型校正屬 M9 |
-| M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 核心交付完成／真實 Redis＋PG 與完整 Docker 生命週期驗證通過；production 治理屬 M9 |
-| M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 核心交付完成／本機、真實 Redis 與 Docker image 驗證通過；正式 IdP／外部收件端屬 M9 |
-| M8 | ACP v1 stdio client adapter、session／串流／取消／逐次核准 | 核心交付完成／官方 reference client stdio E2E 通過；完整封版屬 M9 |
-| M9 | 全量回歸、隔離 staging／故障／PITR／壓測及封版證據 | 待實作 |
+| M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 已實作／本機、Docker 新舊版本及故障驗證完成 |
+| M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心已實作／synthetic 校正通過；真實模型校正需環境 |
+| M6 | Postgres 正文／provenance 搜尋、ACL 重查、retention 及 poison 重送 | 已實作／真實 Redis＋PG、故障、restore／PITR 驗證完成 |
+| M7 | 繁中管理台、OIDC、人類自願 presence、Agent heartbeat、規劃 SSE 及簽章 Webhook | 核心已實作／正式 IdP 與外部收件端需環境 |
+| M8 | ACP v1 stdio client adapter、session／串流／取消／逐次核准 | 核心已實作／官方 Python reference client stdio E2E 通過 |
+| M9 | 全量回歸、隔離 staging／故障／PITR／壓測及封版證據 | 已完成本機 production-like 驗證；正式環境項目明確保留 |
 
 ## 已確認邊界
 
@@ -75,6 +75,11 @@
   history、prompt/update、逐次 permission 與 cancel 已完成；真實 Redis＋官方 reference client
   subprocess stdio 納入全套 `849 passed`，PG 72 skips 會在 M9 的 Redis＋PG 封版重跑補齊。
   完整 staging／TCK 矩陣與 M9 封版、M2 剩餘治理仍待完成。
+- M9：[多副本 staging 與封版驗證](releases/2026-10-29-m9-staging.md)。2×Gateway／Worker／
+  Scheduler／projector、1／4／16 併發、Gateway `SIGKILL`、Redis／PostgreSQL 故障與 catch-up、
+  PostgreSQL 17 WAL restore-point PITR、四組 Docker E2E、混合版本 Workflow 與 ACP stdio 均通過；
+  真實 Redis＋PostgreSQL 全套為 `921 passed, 0 skipped`。正式 OIDC／外部 webhook、真實模型
+  校正、multi-AZ／正式 RPO／RTO 與其他 ACP client 矩陣仍需對應環境；M2 剩餘治理仍待完成。
 
 ## 後續階段的固定實作契約
 

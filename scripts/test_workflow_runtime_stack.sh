@@ -28,15 +28,8 @@ compose exec -T -e WORKFLOW_TEST_PHASE=prepare gateway python < scripts/verify_w
 compose up --detach --wait --scale worker=2 worker
 compose exec -T -e WORKFLOW_TEST_PHASE=parallel gateway python < scripts/verify_workflow_runtime.py
 WORKFLOW_TEST_CONSUMER=$(compose exec -T redis redis-cli --raw GET workflow-e2e:kill-consumer)
-WORKFLOW_TEST_VICTIM=
-for WORKFLOW_TEST_CONTAINER in $(compose ps -q worker); do
-  WORKFLOW_TEST_HOSTNAME=$(docker inspect "$WORKFLOW_TEST_CONTAINER" --format '{{.Config.Hostname}}')
-  if [ "$WORKFLOW_TEST_HOSTNAME" = "$WORKFLOW_TEST_CONSUMER" ]; then
-    WORKFLOW_TEST_VICTIM=$WORKFLOW_TEST_CONTAINER
-  fi
-done
-test -n "$WORKFLOW_TEST_VICTIM"
-docker kill --signal KILL "$WORKFLOW_TEST_VICTIM"
+test "$WORKFLOW_TEST_CONSUMER" = "all-current-workers"
+compose kill -s SIGKILL worker
 compose up --detach --wait --scale worker=2 worker
 compose exec -T -e WORKFLOW_TEST_PHASE=recover gateway python < scripts/verify_workflow_runtime.py
 compose exec -T gateway python -m app.postgres_worker backfill

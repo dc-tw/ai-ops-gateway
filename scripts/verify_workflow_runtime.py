@@ -251,21 +251,13 @@ async def main():
                 root = await call("GET", f"/v1/goals/{manifest['kill']['root_id']}")
                 child_id = root["workflow"]["states"]["n0"]["goal_id"]
                 manifest["kill"]["child_id"] = child_id
-                victim = None
-                pending = await runtime._client.xpending_range(
-                    WORKFLOW_QUEUE, "goal-workers", "-", "+", 100
-                )
-                for delivery in pending:
-                    row = await runtime._client.xrange(
-                        WORKFLOW_QUEUE, delivery["message_id"], delivery["message_id"]
-                    )
-                    if row and row[0][1].get("goal_id") == child_id:
-                        victim = delivery["consumer"].split("-")[0]
-                        break
-                assert victim and len(victim) == 12 and all(c in "0123456789abcdef" for c in victim)
-                await runtime._client.set("workflow-e2e:kill-consumer", victim)
+                # The mock provider is the authoritative signal that at least
+                # one current worker is mid-call. Killing this disposable
+                # stack's two current workers avoids a racy cross-system
+                # attempt to map the Redis pending list back to one container.
+                await runtime._client.set("workflow-e2e:kill-consumer", "all-current-workers")
                 await runtime._client.set(MANIFEST, json.dumps(manifest))
-                print("Parallel DAG/typed join passed; exact live consumer selected for SIGKILL")
+                print("Parallel DAG/typed join passed; active current workers selected for SIGKILL")
             elif phase == "recover":
                 case = manifest["kill"]
                 value = await wait_goal(case["root_id"])
