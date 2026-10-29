@@ -133,6 +133,7 @@ async def create_goal(payload: GoalCreateRequest, request: Request) -> dict[str,
         "updated_at": now,
         "tenant_id": principal.tenant_id,
         "created_by": principal.subject,
+        "created_by_type": principal.actor_type,
         "history_search_approved": True,
     }
     atomic_store = hasattr(runtime, "_client") or hasattr(runtime, "goal_execution_mutate")

@@ -395,13 +395,20 @@ async def apply_agent(
 
 
 async def build_agent_goal(
-    runtime: Any, tenant: str, agent_id: str, payload: GoalCreateRequest, *, created_by: str
+    runtime: Any,
+    tenant: str,
+    agent_id: str,
+    payload: GoalCreateRequest,
+    *,
+    created_by: str,
+    created_by_type: str = "human",
 ) -> dict[str, Any]:
     now = datetime.now(UTC).isoformat()
     goal = {
         "goal_id": str(uuid4()),
         "tenant_id": tenant,
         "created_by": created_by,
+        "created_by_type": created_by_type,
         "objective": payload.objective,
         "model": payload.model,
         "status": "queued",
@@ -520,7 +527,12 @@ async def create_agent_goal(
     _request_store(request)
     runtime, settings = request.app.state.redis, request.app.state.settings
     goal = await build_agent_goal(
-        runtime, principal.tenant_id, agent_id, payload, created_by=principal.subject
+        runtime,
+        principal.tenant_id,
+        agent_id,
+        payload,
+        created_by=principal.subject,
+        created_by_type=getattr(principal, "actor_type", "human"),
     )
     if settings.pii_redaction:
         goal["objective"] = redact_pii(goal["objective"])

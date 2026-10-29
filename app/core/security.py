@@ -23,6 +23,7 @@ class Principal:
     role: str
     auth_method: str
     actor_type: str = "human"
+    credential_id: str = ""
 
 
 def redact_pii(text: str) -> str:
@@ -63,6 +64,26 @@ def _validate_principal(
 async def authenticate(request: Request) -> Principal:
     settings: Settings = request.app.state.settings
     api_key = request.headers.get("x-api-key")
+    agent_key = request.headers.get("x-agent-key")
+    if agent_key:
+        if api_key or request.headers.get("authorization"):
+            raise HTTPException(status_code=400, detail="Ambiguous authentication credentials")
+        runtime = getattr(request.app.state, "redis", None)
+        if runtime is None or not hasattr(runtime, "_client"):
+            raise HTTPException(status_code=503, detail="Agent authentication requires Redis")
+        from app.core.agent_credentials import AgentCredentialStore
+
+        record = await AgentCredentialStore(runtime).resolve(agent_key)
+        if record is None:
+            raise HTTPException(status_code=401, detail="Invalid Agent credential")
+        return Principal(
+            subject=str(record["agent_id"]),
+            tenant_id=str(record["tenant_id"]),
+            role="operator",
+            auth_method="agent_credential",
+            actor_type="agent",
+            credential_id=str(record["credential_id"]),
+        )
     if api_key:
         if settings.api_keys_json.strip():
             configured = json.loads(settings.api_keys_json)
@@ -141,6 +162,24 @@ async def authorize(request: Request, minimum_role: str = "viewer") -> Principal
             raise HTTPException(status_code=403, detail="Valid CSRF token required")
     if ROLE_LEVEL[principal.role] < ROLE_LEVEL[minimum_role]:
         raise HTTPException(status_code=403, detail=f"{minimum_role} role required")
+    if principal.auth_method == "agent_credential":
+        own = f"/v1/agents/{principal.subject}"
+        goal_path = request.url.path.startswith("/v1/goals/")
+        goal_control = request.url.path.endswith(("/cancel", "/pause", "/resume"))
+        allowed = (
+            request.method == "GET" and request.url.path == own
+        ) or (
+            request.method == "POST" and request.url.path == own + "/goals"
+        ) or (
+            request.method == "GET" and request.url.path == "/auth/session"
+        ) or (
+            request.method == "GET"
+            and (request.url.path == "/v1/goals" or goal_path)
+        ) or (
+            request.method == "POST" and goal_path and goal_control
+        )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Agent credential route is not allowed")
     from app.core.resource_access import authorize_resource_route
 
     await authorize_resource_route(request, principal)

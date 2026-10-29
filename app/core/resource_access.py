@@ -297,6 +297,12 @@ def enforcement(request):
     return bool(getattr(request.app.state.settings, "resource_acl_enabled", False))
 
 
+def principal_enforcement(request, principal):
+    # A dynamically issued Agent credential must never regain tenant-wide
+    # visibility just because the optional human ACL rollout flag is off.
+    return enforcement(request) or principal.auth_method == "agent_credential"
+
+
 def access_store(request):
     runtime = request.app.state.redis
     if runtime is None or not hasattr(runtime, "_client"):
@@ -305,7 +311,7 @@ def access_store(request):
 
 
 async def require_access(request, principal, kind, resource_id, permission="read"):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return
     try:
         store = access_store(request)
@@ -321,7 +327,7 @@ async def require_access(request, principal, kind, resource_id, permission="read
 
 
 async def filter_resources(request, principal, kind, rows, id_field):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return rows
     store = access_store(request)
     try:
@@ -331,7 +337,7 @@ async def filter_resources(request, principal, kind, rows, id_field):
 
 
 async def filter_history(request, principal, rows):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return rows
     store = access_store(request)
     try:
@@ -342,7 +348,7 @@ async def filter_history(request, principal, rows):
 
 
 async def history_permissions(request, principal):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return {}
     try:
         store = access_store(request)
@@ -355,7 +361,7 @@ async def history_permissions(request, principal):
 
 
 async def claim_conversation(request, principal, conversation_id):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return
     store = access_store(request)
     client, tenant = store.client, principal.tenant_id
@@ -403,7 +409,7 @@ async def claim_conversation(request, principal, conversation_id):
 
 
 async def authorize_resource_route(request, principal):
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return
     # Run inside authorize(), after routing and role checks. Public signed hooks
     # intentionally use their separate server-owned capability, not this path.
@@ -424,6 +430,12 @@ async def authorize_resource_route(request, principal):
         mapping["session_id"] = "conversation"
     for field, kind in mapping.items():
         if field in request.path_params:
+            if (
+                principal.auth_method == "agent_credential"
+                and kind == "agent"
+                and request.path_params[field] == principal.subject
+            ):
+                continue
             await require_access(
                 request,
                 principal,
@@ -435,7 +447,7 @@ async def authorize_resource_route(request, principal):
 
 async def stream_access(request, principal, kind, resource_id):
     """Recheck current identity and ACL immediately before each streamed payload."""
-    if not enforcement(request):
+    if not principal_enforcement(request, principal):
         return True
     from app.core.security import authenticate
 

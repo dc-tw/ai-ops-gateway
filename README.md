@@ -93,6 +93,8 @@ event envelope、Agent identity、tamper-evident audit 與 per-conversation sing
 
 管理台登入、CSRF、presence／heartbeat 與通知維運見
 [繁中管理台、協作與通知](docs/console-collaboration.md)。
+Agent 一次顯示憑證、輪替／撤銷、強制 typed ACL 與使用方式見
+[Agent 專屬憑證](docs/agent-credentials.md)。
 
 支援 ACP v1 的編輯器可用 `ai-ops-gateway-acp` stdio adapter 連線至遠端 Gateway；session、
 串流、取消與逐次核准映射見 [ACP v1 遠端 Adapter](docs/acp-adapter.md)。
