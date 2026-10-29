@@ -21,7 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.api.routes import _sse
 from app.api.schemas import GoalCreateRequest
 from app.core.automation_scheduling import next_run, utc_datetime
-from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+from app.core.internal_events import (
+    INTERNAL_STREAM,
+    build_internal_event,
+    encode_internal_event,
+)
 from app.core.observability import observe_agent_event
 from app.core.resource_access import filter_resources, require_access, stream_access
 from app.core.security import TENANT_PATTERN, authorize, redact_pii
@@ -402,7 +406,7 @@ async def emit_internal_event(
             INTERNAL_STREAM,
             {
                 "tenant_id": tenant_id,
-                "payload": json.dumps(event, ensure_ascii=False),
+                "payload": encode_internal_event(event, tenant_id),
             },
         )
     )

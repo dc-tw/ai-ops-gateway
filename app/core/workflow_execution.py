@@ -15,6 +15,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from redis.exceptions import WatchError
 
+from app.core.event_envelope import encode_event
 from app.core.goal_execution import GoalExecutionStore, GoalMutation
 from app.core.goal_protocol import (
     WORKFLOW_PREFIX,
@@ -383,7 +384,20 @@ class WorkflowExecutionStore:
     def _event(pipe, root, event_type):
         tenant, root_id = root["tenant_id"], root["goal_id"]
         event = {"type": event_type, "goal_id": root_id, "status": root["status"], "time": now()}
-        pipe.xadd(f"tenant:{tenant}:agent:goal:events:{root_id}", {"payload": encoded(event)})
+        pipe.xadd(
+            f"tenant:{tenant}:agent:goal:events:{root_id}",
+            {
+                "payload": encode_event(
+                    event,
+                    tenant_id=tenant,
+                    category="goal",
+                    resource_id=root_id,
+                    actor_type=root.get("created_by_type", "unknown"),
+                    actor_id=str(root.get("created_by", "gateway")),
+                    conversation_id=root.get("conversation_id"),
+                )
+            },
+        )
         pipe.xadd(f"tenant:{tenant}:audit", {"payload": encoded(event | {"action": event_type})})
 
     @staticmethod
@@ -763,7 +777,11 @@ class WorkflowExecutionStore:
                         )
                     internal_failure = None
                     if root["status"] == "failed" and prior_status != "failed":
-                        from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+                        from app.core.internal_events import (
+                            INTERNAL_STREAM,
+                            build_internal_event,
+                            encode_internal_event,
+                        )
 
                         internal_failure = build_internal_event(
                             "goal.failed",
@@ -818,7 +836,10 @@ class WorkflowExecutionStore:
                     if internal_failure:
                         pipe.xadd(
                             INTERNAL_STREAM,
-                            {"tenant_id": tenant, "payload": encoded(internal_failure)},
+                            {
+                                "tenant_id": tenant,
+                                "payload": encode_internal_event(internal_failure, tenant),
+                            },
                         )
                     await pipe.execute()
                     execution = GoalExecutionStore(self.runtime)

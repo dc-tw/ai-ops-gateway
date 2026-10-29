@@ -21,6 +21,7 @@ from app.core.conversation_execution import (
     ConversationFencedExecutor,
 )
 from app.core.goal_execution import GoalExecutionStore
+from app.core.internal_events import decode_internal_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatScan
 from app.tools.registry import ToolSpec
@@ -644,12 +645,13 @@ async def test_failed_goal_and_safe_internal_event_commit_together_without_a_lat
     # there is deliberately no worker emit_internal_event call here.
     assert not await store.finish(active, "worker", {"type": "goal_failed"})
     rows = await runtime._client.xrange("automation:internal-events")
-    own = [
-        json.loads(fields["payload"])
-        for _, fields in rows
-        if fields["tenant_id"] == tenant
-        and json.loads(fields["payload"]).get("data", {}).get("goal_id") == goal["goal_id"]
-    ]
+    own = []
+    for cursor, fields in rows:
+        if fields["tenant_id"] != tenant:
+            continue
+        event = decode_internal_event(fields["payload"], tenant, cursor)
+        if event.get("data", {}).get("goal_id") == goal["goal_id"]:
+            own.append(event)
     assert len(own) == 1
     assert own[0]["type"] == "goal.failed"
     assert own[0]["data"]["error_type"] == "DeploymentFailure"

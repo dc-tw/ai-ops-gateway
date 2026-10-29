@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "legacy_mappings": {
+    "accepted": "run.accepted",
+    "agent_event": "agent.event",
+    "approval_decided": "approval.decided",
+    "approval_required": "approval.required",
+    "cancelled": "run.cancelled",
+    "completed": "run.completed",
+    "draft_token": "model.draft_token",
+    "error": "run.failed",
+    "goal_cancelled": "goal.cancelled",
+    "goal_completed": "goal.completed",
+    "goal_failed": "goal.failed",
+    "goal_planned": "goal.planned",
+    "goal_queued": "goal.queued",
+    "goal_recovered": "goal.recovered",
+    "goal_status": "goal.status",
+    "goal_step": "goal.step",
+    "goal_waiting_approval": "approval.waiting",
+    "model_usage": "model.usage",
+    "threat_detection": "threat.detected",
+    "token": "model.token"
+  },
+  "native_namespaces": [
+    "agent", "approval", "automation", "goal", "legacy", "model", "planning", "run",
+    "threat", "tool", "workflow"
+  ]
+}

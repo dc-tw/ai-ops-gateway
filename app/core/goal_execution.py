@@ -15,6 +15,7 @@ from typing import Any
 
 from redis.exceptions import WatchError
 
+from app.core.event_envelope import encode_event
 from app.core.goal_protocol import (
     goal_index,
     goal_key,
@@ -340,7 +341,22 @@ class GoalExecutionStore:
                     for event in mutation.events:
                         pipe.xadd(
                             f"tenant:{tenant}:agent:goal:events:{goal_id}",
-                            {"payload": json.dumps(event, ensure_ascii=False)},
+                            {
+                                "payload": encode_event(
+                                    event,
+                                    tenant_id=tenant,
+                                    category="goal",
+                                    resource_id=goal_id,
+                                    actor_type=mutation.goal.get(
+                                        "created_by_type", "unknown"
+                                    ),
+                                    actor_id=str(
+                                        mutation.goal.get("agent_id")
+                                        or mutation.goal.get("created_by", "gateway")
+                                    ),
+                                    conversation_id=mutation.goal.get("conversation_id"),
+                                )
+                            },
                         )
                         automation_id = mutation.goal.get("automation_id")
                         if automation_id and event.get("type") in {
@@ -375,7 +391,11 @@ class GoalExecutionStore:
                     if mutation.release_slot:
                         pipe.zrem(f"tenant:{tenant}:quota:active-runs", mutation.release_slot)
                     if mutation.goal.get("status") == "failed" and prior_status != "failed":
-                        from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+                        from app.core.internal_events import (
+                            INTERNAL_STREAM,
+                            build_internal_event,
+                            encode_internal_event,
+                        )
 
                         internal = build_internal_event(
                             "goal.failed",
@@ -394,7 +414,7 @@ class GoalExecutionStore:
                                 INTERNAL_STREAM,
                                 {
                                     "tenant_id": tenant,
-                                    "payload": json.dumps(internal, ensure_ascii=False),
+                                    "payload": encode_internal_event(internal, tenant),
                                 },
                             )
                     from app.core.outbound_notifications import (

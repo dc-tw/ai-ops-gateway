@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from redis.exceptions import WatchError
 
+from app.core.event_envelope import decode_event, encode_event
 from app.core.skill_selection import plan_skill_selections
 
 SCHEMA_VERSION = 1
@@ -141,7 +142,13 @@ class PlanningStore:
         result: list[tuple[str, dict[str, Any]]] = []
         for _, records in rows:
             for event_id, fields in records:
-                event = _decode(fields.get("payload"))
+                event = decode_event(
+                    fields.get("payload"),
+                    tenant_id=tenant,
+                    category="planning",
+                    resource_id=session_id,
+                    cursor=event_id,
+                )[1]
                 # These are the only fields allowed across the SSE boundary.
                 safe = {
                     name: event[name]
@@ -349,7 +356,19 @@ class PlanningStore:
             "time": session["updated_at"],
         }
         tenant = session["tenant_id"]
-        pipe.xadd(self.events_key(tenant, session["session_id"]), {"payload": _json(event)})
+        pipe.xadd(
+            self.events_key(tenant, session["session_id"]),
+            {
+                "payload": encode_event(
+                    event,
+                    tenant_id=tenant,
+                    category="planning",
+                    resource_id=session["session_id"],
+                    actor_type="human",
+                    actor_id=subject,
+                )
+            },
+        )
         pipe.xadd(
             self.runtime._tenant_key(tenant, "audit"),
             {"payload": _json({"action": action} | event)},

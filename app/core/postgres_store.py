@@ -149,6 +149,16 @@ def message_identity(message: dict[str, Any]) -> str:
     return f"{message['request_id']}:{message['role']}:{digest}"
 
 
+def _compatible_event_data(data: dict[str, Any]) -> dict[str, Any]:
+    if (
+        data.get("schema_version") == 1
+        and isinstance(data.get("event_type"), str)
+        and isinstance(data.get("payload"), dict)
+    ):
+        return data["payload"]
+    return data
+
+
 def _page_cursor(kind: str, resource_id: str) -> str:
     return base64.urlsafe_b64encode(json.dumps([kind, resource_id]).encode()).decode()
 
@@ -822,7 +832,7 @@ class PostgresStore:
                 "kind": row["kind"],
                 "resource_id": row["resource_id"],
                 "event_id": row["event_id"],
-                "data": row["data"],
+                "data": _compatible_event_data(row["data"]),
                 "source_cursor": _source_cursor(row),
                 "archived_at": row["archived_at"].isoformat(),
             }

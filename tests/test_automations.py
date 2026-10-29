@@ -26,6 +26,7 @@ from app.automations import (
 from app.core.automation_scheduling import coalesce_due, next_run
 from app.core.automation_store import AutomationStore
 from app.core.config import Settings
+from app.core.internal_events import decode_internal_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatScan
 from app.core.threat_feedback import record_threat_findings
@@ -413,7 +414,10 @@ async def test_internal_event_omits_content_and_suppresses_chain():
         },
     )
     assert "secret payload" not in json.dumps(events)
-    assert json.loads(events[0][1]["payload"])["data"]["findings"] == [
+    envelope = json.loads(events[0][1]["payload"])
+    assert envelope["schema_version"] == 1
+    assert envelope["event_type"] == "threat.detected"
+    assert envelope["payload"]["data"]["findings"] == [
         {"rule_id": "ATR-a", "severity": "high"}
     ]
     assert (
@@ -676,8 +680,8 @@ async def test_atr_source_and_internal_event_commit_before_post_save_crash(
         )
     assert await runtime.get_threat_finding(tenant, finding_id)
     queued = [
-        json.loads(fields["payload"])
-        for _, fields in await runtime._client.xrange("automation:internal-events")
+        decode_internal_event(fields["payload"], tenant, cursor)
+        for cursor, fields in await runtime._client.xrange("automation:internal-events")
         if fields.get("tenant_id") == tenant
     ]
     assert len(queued) == (0 if source_automation_id else 1)

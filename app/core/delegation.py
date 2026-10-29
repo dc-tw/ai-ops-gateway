@@ -11,7 +11,11 @@ from uuid import NAMESPACE_URL, uuid5
 
 from redis.exceptions import WatchError
 
-from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+from app.core.internal_events import (
+    INTERNAL_STREAM,
+    build_internal_event,
+    encode_internal_event,
+)
 from app.core.skill_store import skill_refs
 
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -412,7 +416,7 @@ class DelegationStore:
                                 INTERNAL_STREAM,
                                 {
                                     "tenant_id": tenant,
-                                    "payload": json.dumps(event),
+                                    "payload": encode_internal_event(event, tenant),
                                 },
                             )
                     await pipe.execute()

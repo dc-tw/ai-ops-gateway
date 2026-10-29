@@ -18,7 +18,11 @@ from uuid import NAMESPACE_URL, uuid5
 
 from redis.exceptions import WatchError
 
-from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+from app.core.internal_events import (
+    INTERNAL_STREAM,
+    build_internal_event,
+    encode_internal_event,
+)
 
 
 def journal_key(tenant: str, decision_id: str) -> str:
@@ -160,7 +164,10 @@ class SafetyJournal:
                         if internal:
                             pipe.xadd(
                                 INTERNAL_STREAM,
-                                {"tenant_id": self.tenant, "payload": encode(internal)},
+                                {
+                                    "tenant_id": self.tenant,
+                                    "payload": encode_internal_event(internal, self.tenant),
+                                },
                             )
                     if records:
                         pipe.expire(index_key, self.settings.atr_findings_ttl_seconds)

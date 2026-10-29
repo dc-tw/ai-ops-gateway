@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dc-tw.github.io/ai-ops-gateway/schemas/event-envelope-v1.schema.json",
+  "title": "AI Operations Gateway EventEnvelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "event_type", "tenant_id", "actor_type", "actor_id",
+    "conversation_id", "run_id", "parent_event_id", "correlation_id", "idempotency_key",
+    "created_at", "payload", "prev_hash", "hash"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "event_type": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$"},
+    "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
+    "actor_type": {"enum": ["human", "agent", "system", "service", "unknown"]},
+    "actor_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "conversation_id": {"type": ["string", "null"], "maxLength": 128},
+    "run_id": {"type": ["string", "null"], "maxLength": 128},
+    "parent_event_id": {"type": ["string", "null"], "maxLength": 200},
+    "correlation_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 300},
+    "created_at": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object"},
+    "prev_hash": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+    "hash": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"}
+  }
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.event_envelope import decode_event, encode_event
+
 INTERNAL_STREAM = "automation:internal-events"
 
 
@@ -41,3 +43,26 @@ def build_internal_event(
     else:
         raise ValueError("Unsupported internal automation event")
     return {"event_id": event_id, "type": event_type, "data": safe}
+
+
+def encode_internal_event(event: dict[str, Any], tenant_id: str) -> str:
+    return encode_event(
+        event,
+        tenant_id=tenant_id,
+        category="automation",
+        resource_id=str(event["event_id"]),
+        actor_type="system",
+        actor_id="gateway",
+        event_id=str(event["event_id"]),
+        idempotency_key=f"internal:{tenant_id}:{event['event_id']}",
+    )
+
+
+def decode_internal_event(raw: str, tenant_id: str, cursor: str) -> dict[str, Any]:
+    return decode_event(
+        raw,
+        tenant_id=tenant_id,
+        category="automation",
+        resource_id="internal-events",
+        cursor=cursor,
+    )[1]

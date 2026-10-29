@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -17,6 +16,7 @@ from app.automations import INTERNAL_STREAM, dispatch, event_matches
 from app.core.automation_scheduling import coalesce_due
 from app.core.automation_store import AutomationStore
 from app.core.config import get_settings
+from app.core.internal_events import decode_internal_event
 from app.core.redis_runtime import RedisRuntime
 from app.core.threat_detection import ThreatDetector
 from app.llm.client import ModelRouter
@@ -79,7 +79,7 @@ async def _internal_events(
     processed = 0
     for stream_id, fields in entries:
         tenant_id = fields["tenant_id"]
-        event = json.loads(fields["payload"])
+        event = decode_internal_event(fields["payload"], tenant_id, stream_id)
         # Only the server emits on this stream. External webhook fields never
         # influence tenant, service identity, or automation provenance.
         for job in await store.list(tenant_id):

@@ -194,6 +194,12 @@ def event_search_text(kind: str, data: Any) -> str:
     """Index safe event summaries without raw ATR input, prompts or tool payloads."""
     if kind not in EVENT_KINDS or not isinstance(data, dict):
         return ""
+    if (
+        data.get("schema_version") == 1
+        and isinstance(data.get("event_type"), str)
+        and isinstance(data.get("payload"), dict)
+    ):
+        data = data["payload"]
     values = _metadata_text(data)
     if kind == "goal":
         event_type = data.get("type")

@@ -8,6 +8,7 @@ from typing import Any
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
+from app.core.event_envelope import decode_event, encode_event
 from app.core.goal_protocol import (
     LEGACY_QUEUE,
     QUEUES,
@@ -17,7 +18,11 @@ from app.core.goal_protocol import (
     goal_queue,
     tenants_key,
 )
-from app.core.internal_events import INTERNAL_STREAM, build_internal_event
+from app.core.internal_events import (
+    INTERNAL_STREAM,
+    build_internal_event,
+    encode_internal_event,
+)
 
 
 class RedisRuntime:
@@ -54,7 +59,17 @@ class RedisRuntime:
         return str(
             await self._client.xadd(
                 self._tenant_key(tenant_id, f"agent:events:{request_id}"),
-                {"payload": json.dumps(event, ensure_ascii=False)},
+                {
+                    "payload": encode_event(
+                        event,
+                        tenant_id=tenant_id,
+                        category="run",
+                        resource_id=request_id,
+                        actor_type="agent",
+                        actor_id=str(event.get("agent_id", "gateway")),
+                        conversation_id=event.get("conversation_id"),
+                    )
+                },
                 maxlen=self._stream_maxlen,
                 approximate=True,
             )
@@ -75,7 +90,43 @@ class RedisRuntime:
         if not result:
             return []
         return [
-            (event_id, json.loads(fields["payload"]))
+            (
+                event_id,
+                decode_event(
+                    fields["payload"],
+                    tenant_id=tenant_id,
+                    category="run",
+                    resource_id=request_id,
+                    cursor=event_id,
+                )[1],
+            )
+            for _, events in result
+            for event_id, fields in events
+        ]
+
+    async def read_agent_event_envelopes(
+        self,
+        request_id: str,
+        last_id: str = "0-0",
+        block_ms: int = 15_000,
+        tenant_id: str = "default",
+    ) -> list[tuple[str, dict[str, Any]]]:
+        result = await self._client.xread(
+            {self._tenant_key(tenant_id, f"agent:events:{request_id}"): last_id},
+            count=100,
+            block=block_ms,
+        )
+        return [
+            (
+                event_id,
+                decode_event(
+                    fields["payload"],
+                    tenant_id=tenant_id,
+                    category="run",
+                    resource_id=request_id,
+                    cursor=event_id,
+                )[0].model_dump(mode="json"),
+            )
             for _, events in result
             for event_id, fields in events
         ]
@@ -257,7 +308,7 @@ class RedisRuntime:
                         INTERNAL_STREAM,
                         {
                             "tenant_id": tenant_id,
-                            "payload": json.dumps(internal, ensure_ascii=False),
+                            "payload": encode_internal_event(internal, tenant_id),
                         },
                     )
             pipe.expire(index_key, ttl_seconds)
@@ -614,7 +665,17 @@ class RedisRuntime:
         return str(
             await self._client.xadd(
                 self._tenant_key(tenant_id, f"agent:goal:events:{goal_id}"),
-                {"payload": json.dumps(event, ensure_ascii=False)},
+                {
+                    "payload": encode_event(
+                        event,
+                        tenant_id=tenant_id,
+                        category="goal",
+                        resource_id=goal_id,
+                        actor_type="agent",
+                        actor_id=str(event.get("agent_id", "gateway")),
+                        conversation_id=event.get("conversation_id"),
+                    )
+                },
             )
         )
 
@@ -633,7 +694,43 @@ class RedisRuntime:
         if not result:
             return []
         return [
-            (event_id, json.loads(fields["payload"]))
+            (
+                event_id,
+                decode_event(
+                    fields["payload"],
+                    tenant_id=tenant_id,
+                    category="goal",
+                    resource_id=goal_id,
+                    cursor=event_id,
+                )[1],
+            )
+            for _, events in result
+            for event_id, fields in events
+        ]
+
+    async def read_goal_event_envelopes(
+        self,
+        goal_id: str,
+        last_id: str = "0-0",
+        block_ms: int = 15_000,
+        tenant_id: str = "default",
+    ) -> list[tuple[str, dict[str, Any]]]:
+        result = await self._client.xread(
+            {self._tenant_key(tenant_id, f"agent:goal:events:{goal_id}"): last_id},
+            count=100,
+            block=block_ms,
+        )
+        return [
+            (
+                event_id,
+                decode_event(
+                    fields["payload"],
+                    tenant_id=tenant_id,
+                    category="goal",
+                    resource_id=goal_id,
+                    cursor=event_id,
+                )[0].model_dump(mode="json"),
+            )
             for _, events in result
             for event_id, fields in events
         ]
