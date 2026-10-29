@@ -21,6 +21,10 @@ from app.automations import AutomationPolicy, validate_goal_input
 from app.core.goal_execution import GoalExecutionStore
 from app.core.resource_access import filter_resources, guard_owner, queue_owner
 from app.core.security import authorize, redact_pii
+from app.core.security_policies import (
+    SecurityPolicyRef,
+    resolve_agent_security_policies,
+)
 from app.core.skill_selection import SkillSelectionRule, select_skills, selection_candidates
 from app.core.skill_store import SkillBinding, resolve_skill_bindings, skill_refs
 
@@ -54,6 +58,8 @@ class AgentCreate(BaseModel):
     skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
     planning_skills: list[SkillBinding] = Field(default_factory=list, max_length=8)
     skill_selection_rules: list[SkillSelectionRule] = Field(default_factory=list, max_length=8)
+    mcp_policy_ref: SecurityPolicyRef | None = None
+    atr_policy_ref: SecurityPolicyRef | None = None
 
     @model_validator(mode="after")
     def finite_delegation(self) -> AgentCreate:
@@ -220,6 +226,14 @@ class AgentStore:
                             watch=True,
                             mode="plan",
                         )
+                    security_policy_snapshots = await resolve_agent_security_policies(
+                        self.runtime,
+                        tenant,
+                        record,
+                        client=pipe,
+                        watch=True,
+                    )
+                    record["security_policy_snapshots"] = security_policy_snapshots
                     audit = {
                         "action": "agent.create" if expected_version is None else "agent.update",
                         "agent_id": agent_id,
@@ -228,6 +242,14 @@ class AgentStore:
                         "role": record["role"],
                         "skills": skill_refs(skill_snapshots),
                         "time": record["updated_at"],
+                        "security_policies": [
+                            {
+                                "policy_id": item["policy_id"],
+                                "revision": item["version"],
+                                "kind": item["kind"],
+                            }
+                            for item in security_policy_snapshots
+                        ],
                     }
                     if planning_snapshots:
                         audit["planning_skills"] = skill_refs(planning_snapshots)
@@ -360,6 +382,12 @@ async def apply_agent(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        security_policy_snapshots = await resolve_agent_security_policies(
+            runtime, tenant, agent
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     snapshot = {
         field: deepcopy(agent[field])
         for field in (
@@ -374,7 +402,15 @@ async def apply_agent(
             "policy",
         )
     }
-    snapshot.update(skills=bindings, skill_snapshots=skill_snapshots)
+    snapshot.update(
+        mcp_policy_ref=deepcopy(agent.get("mcp_policy_ref")),
+        atr_policy_ref=deepcopy(agent.get("atr_policy_ref")),
+    )
+    snapshot.update(
+        skills=bindings,
+        skill_snapshots=skill_snapshots,
+        security_policy_snapshots=security_policy_snapshots,
+    )
     if selection is not None:
         snapshot["skill_selection"] = selection
     trusted_goal = deepcopy(goal)

@@ -173,10 +173,18 @@ async def execute_goal(
                 raise PermissionError("Workflow model route differs from its accepted snapshot")
         if goal.get("agent_config"):
             from app.agents import AgentStore
+            from app.core.security_policies import guard_agent_security_policies
 
             configured = await AgentStore(runtime).get(tenant_id, goal["agent_id"])
             if not configured or not configured["enabled"]:
                 raise PermissionError("Agent is disabled")
+            await guard_agent_security_policies(
+                runtime,
+                tenant_id,
+                goal["agent_config"],
+                settings,
+                threat_detector,
+            )
         config = goal.get("agent_config") or {}
         if config.get("skills") or config.get("skill_snapshots"):
             await guard_goal_skills(runtime, goal)
