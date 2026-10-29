@@ -9,6 +9,7 @@ description = "Enterprise local-LLM operations and data processing gateway"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "agent-client-protocol>=0.12.1,<0.13",
   "beautifulsoup4>=4.12,<5",
   "croniter>=6,<7",
   "fastapi>=0.115,<1",
@@ -43,6 +44,9 @@ dev = [
   "PyYAML>=6,<7",
   "ruff>=0.9,<1",
 ]
+
+[project.scripts]
+ai-ops-gateway-acp = "app.acp_adapter:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

@@ -420,6 +420,8 @@ async def authorize_resource_route(request, principal):
         "automation_id": "automation",
         "conversation_id": "conversation",
     }
+    if template.startswith("/v1/acp/sessions/"):
+        mapping["session_id"] = "conversation"
     for field, kind in mapping.items():
         if field in request.path_params:
             await require_access(

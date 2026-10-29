@@ -92,8 +92,13 @@ event envelope、Agent identity、tamper-evident audit 與 per-conversation sing
 管理台登入、CSRF、presence／heartbeat 與通知維運見
 [繁中管理台、協作與通知](docs/console-collaboration.md)。
 
+支援 ACP v1 的編輯器可用 `ai-ops-gateway-acp` stdio adapter 連線至遠端 Gateway；session、
+串流、取消與逐次核准映射見 [ACP v1 遠端 Adapter](docs/acp-adapter.md)。
+
 Gateway 規劃 session、不可變計畫／設定快照與不自動執行的模式切換，見
-[規劃模式操作指南](docs/plan-mode.md)。時間／token 預測與接受計畫後的執行銜接仍未實作。
+[規劃模式操作指南](docs/plan-mode.md)。時間／token 情境預測與校正見
+[plan-forecast](docs/plan-forecast.md)；明確且冪等的執行 admission 見
+[Workflow Plan v2](docs/workflow-plan-v2.md)。
 
 這版已完成項目、尚未納入功能、完整測試與整合驗證結果，統一見
 [2026-10-26 Skill／plan mode 封版紀錄](docs/releases/2026-10-26-skills-plan-mode.md)。
@@ -272,7 +277,7 @@ rollback 與 `SKILL.md` 文字匯出。Skill 是可重用的指令流程，不�
 
 新增的 opt-in v2 模式／唯讀資源、獨立規劃綁定與確定性自動選擇，見
 [Skill v2 指南](docs/skills-v2.md)。另提供[唯讀套件匯入](docs/skill-package-import.md)；
-forecast estimator 尚未完成。
+Skill 選擇的 plan-only forecast estimator 見 [plan-forecast 指南](docs/plan-forecast.md)。
 
 ## PostgreSQL 歷史儲存
 

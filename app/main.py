@@ -11,6 +11,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.access import router as access_router
+from app.acp_sessions import router as acp_sessions_router
 from app.agents import router as agents_router
 from app.api.routes import router
 from app.api.security_routes import router as security_router
@@ -125,6 +126,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         lifespan=lifespan,
     )
     app.include_router(router)
+    app.include_router(acp_sessions_router)
     app.include_router(auth_router)
     app.include_router(collaboration_router)
     app.include_router(security_router)
