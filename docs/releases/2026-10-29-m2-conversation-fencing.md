@@ -18,8 +18,12 @@
 - 新增競爭案例涵蓋背景 FIFO、approval 保留 logical owner、終止交棒、即時／背景互斥、遞增 fence、
   stale release／stale tool attempt 拒絕，以及兩個 replica 同時 resume 只有一個取得 execution lease。
 - Ruff 與 `git diff --check` 通過。
+- M2 收尾重新執行三種真實雙 replica `SIGKILL` phase：有效 execution lease 期間 resume 固定
+  回 409，lease 到期才由另一 replica 取得新 execution fence；ATR blocked output 不會洩漏或重播。
 
-## 尚待接續
+## 後續完成
 
-- EventEnvelope v1 compatibility adapter。
-- tenant tamper-evident audit chain 與 checkpoint export／verify。
+- EventEnvelope v1 compatibility adapter 見
+  [M2 EventEnvelope 紀錄](2026-10-29-m2-event-envelope.md)。
+- tenant tamper-evident audit chain 與 checkpoint export／verify 見
+  [M2 audit chain 紀錄](2026-10-29-m2-audit-chain.md)。

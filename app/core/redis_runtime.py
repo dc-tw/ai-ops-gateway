@@ -239,14 +239,18 @@ class RedisRuntime:
         await self._client.zrem(self._tenant_key(tenant_id, "quota:active-runs"), request_id)
 
     async def append_audit(self, tenant_id: str, event: dict[str, Any]) -> str:
-        return str(
+        # Audit is intentionally not MAXLEN-trimmed. Retention is allowed only after
+        # a signed checkpoint has been exported to the operator's external archive.
+        cursor = str(
             await self._client.xadd(
                 self._tenant_key(tenant_id, "audit"),
                 {"payload": json.dumps(event, ensure_ascii=False)},
-                maxlen=self._stream_maxlen,
-                approximate=True,
             )
         )
+        from app.core.audit_chain import AuditChainStore
+
+        await AuditChainStore(self).sync(tenant_id, through_cursor=cursor)
+        return cursor
 
     async def save_threat_findings(
         self,

@@ -101,6 +101,8 @@ Agent 綁定 server-approved MCP／ATR exact revision 的方式見
 [Conversation fencing](docs/conversation-fencing.md)。
 統一事件欄位、型別目錄、新舊 stream 相容與 SSE 保留方式見
 [EventEnvelope v1](docs/event-envelope-v1.md)。
+tenant audit 的 SHA-256 chain、human-admin 驗鏈、signed checkpoint 與外部 WORM 保存程序見
+[Audit chain 維運指南](docs/audit-chain.md)。
 
 支援 ACP v1 的編輯器可用 `ai-ops-gateway-acp` stdio adapter 連線至遠端 Gateway；session、
 串流、取消與逐次核准映射見 [ACP v1 遠端 Adapter](docs/acp-adapter.md)。

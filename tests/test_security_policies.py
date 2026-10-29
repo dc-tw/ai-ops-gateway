@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.agents import apply_agent
 from app.agents import router as agent_router
+from app.core.audit_chain import AuditChainStore
 from app.core.config import Settings
 from app.core.durable_outbox import maintenance_key, outbox_key
 from app.core.redis_runtime import RedisRuntime
@@ -325,6 +326,13 @@ async def test_policy_revocation_does_not_depend_on_history_maintenance(policy_e
         )
         assert disabled["enabled"] is False
         assert not await durable._client.exists(outbox_key(source))
+        tenant_audits = await durable._client.xrange(
+            durable._tenant_key(policy_env.tenant, "audit")
+        )
+        assert "security_policy.disable" in {
+            json.loads(fields["payload"])["action"] for _, fields in tenant_audits
+        }
+        assert (await AuditChainStore(durable).verify(policy_env.tenant))["valid"]
     finally:
         await durable._client.delete(maintenance_key(source), outbox_key(source))
         await durable.close()

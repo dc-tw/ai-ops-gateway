@@ -59,7 +59,8 @@ curl -X POST "$GATEWAY/v1/agents/$AGENT_ID/goals" \
    重新啟用 Agent 會恢復尚未撤銷且未到期的 credential，因此外洩事件仍必須明確 revoke／rotate。
 4. Redis-only `security:credential-audit` 只記 action、Agent／credential ID、操作者、到期時間與
    輪替／清理數量，不記 token 或 hash。它刻意不進 PostgreSQL history outbox，確保 history
-   maintenance fence 期間仍能發出／撤銷 credential；後續 audit-chain 階段須納入此 stream。
+   maintenance fence 期間仍能發出／撤銷 credential；同一 transaction 也寫 tenant audit，供後續
+   audit-chain projector 納入可驗證順序。
 
 目前 policy reference 尚在下一個 M2 子段落；本功能只保證 credential 綁定現有 server-owned
 Agent record，不能宣稱 MCP／ATR policy registry 已完成。credential audit 目前仍是一般 Redis

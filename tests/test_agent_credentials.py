@@ -16,6 +16,7 @@ from app.agent_credentials import router as credential_router
 from app.agents import router as agent_router
 from app.auth import router as auth_router
 from app.core.agent_credentials import AgentCredentialStore
+from app.core.audit_chain import AuditChainStore
 from app.core.config import Settings
 from app.core.durable_outbox import maintenance_key, outbox_key
 from app.core.redis_runtime import RedisRuntime
@@ -362,6 +363,12 @@ async def test_revocation_authority_does_not_depend_on_postgres_history_fence(
         assert revoked["status"] == "revoked"
         assert await store.resolve(token) is None
         assert not await durable._client.exists(outbox_key(source))
+        tenant_audits = await durable._client.xrange(
+            durable._tenant_key(credential_env.tenant, "audit")
+        )
+        actions = {json.loads(fields["payload"])["action"] for _, fields in tenant_audits}
+        assert {"agent.credential.issue", "agent.credential.revoke"} <= actions
+        assert (await AuditChainStore(durable).verify(credential_env.tenant))["valid"]
     finally:
         await durable._client.delete(maintenance_key(source), outbox_key(source))
         await durable.close()

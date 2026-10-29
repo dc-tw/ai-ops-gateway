@@ -208,23 +208,23 @@ class SecurityPolicyStore:
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
                     pipe.set(revision_key, json.dumps(record, ensure_ascii=False), nx=True)
                     pipe.sadd(self.index_key(tenant), policy_id)
-                    pipe.xadd(
-                        self.audit_key(tenant),
+                    audit_payload = _canonical(
                         {
-                            "payload": _canonical(
-                                {
-                                    "action": (
-                                        "security_policy.create"
-                                        if expected_version is None
-                                        else "security_policy.update"
-                                    ),
-                                    "policy_id": policy_id,
-                                    "kind": config["kind"],
-                                    "revision": version,
-                                    "subject": subject,
-                                }
-                            )
-                        },
+                            "action": (
+                                "security_policy.create"
+                                if expected_version is None
+                                else "security_policy.update"
+                            ),
+                            "policy_id": policy_id,
+                            "kind": config["kind"],
+                            "revision": version,
+                            "subject": subject,
+                        }
+                    )
+                    pipe.xadd(self.audit_key(tenant), {"payload": audit_payload})
+                    pipe.xadd(
+                        self.runtime._tenant_key(tenant, "audit"),
+                        {"payload": audit_payload},
                     )
                     await pipe.execute()
                     return record
@@ -250,21 +250,21 @@ class SecurityPolicyStore:
                     record["updated_by"] = subject
                     pipe.multi()
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
-                    pipe.xadd(
-                        self.audit_key(tenant),
+                    audit_payload = _canonical(
                         {
-                            "payload": _canonical(
-                                {
-                                    "action": (
-                                        "security_policy.enable"
-                                        if enabled
-                                        else "security_policy.disable"
-                                    ),
-                                    "policy_id": policy_id,
-                                    "subject": subject,
-                                }
-                            )
-                        },
+                            "action": (
+                                "security_policy.enable"
+                                if enabled
+                                else "security_policy.disable"
+                            ),
+                            "policy_id": policy_id,
+                            "subject": subject,
+                        }
+                    )
+                    pipe.xadd(self.audit_key(tenant), {"payload": audit_payload})
+                    pipe.xadd(
+                        self.runtime._tenant_key(tenant, "audit"),
+                        {"payload": audit_payload},
                     )
                     await pipe.execute()
                     return record

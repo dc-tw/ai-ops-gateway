@@ -163,26 +163,26 @@ class AgentCredentialStore:
                         json.dumps(record, ensure_ascii=False),
                     )
                     pipe.sadd(index_key, credential_id)
-                    pipe.xadd(
-                        self.audit_key(tenant),
+                    audit_payload = json.dumps(
                         {
-                            "payload": json.dumps(
-                                {
-                                    "action": (
-                                        "agent.credential.rotate"
-                                        if rotate
-                                        else "agent.credential.issue"
-                                    ),
-                                    "agent_id": agent_id,
-                                    "credential_id": credential_id,
-                                    "subject": issued_by,
-                                    "expires_at": record["expires_at"],
-                                    "revoked_credentials": len(active) if rotate else 0,
-                                    "pruned_metadata": len(pruned) + len(dangling_ids),
-                                },
-                                ensure_ascii=False,
-                            )
+                            "action": (
+                                "agent.credential.rotate"
+                                if rotate
+                                else "agent.credential.issue"
+                            ),
+                            "agent_id": agent_id,
+                            "credential_id": credential_id,
+                            "subject": issued_by,
+                            "expires_at": record["expires_at"],
+                            "revoked_credentials": len(active) if rotate else 0,
+                            "pruned_metadata": len(pruned) + len(dangling_ids),
                         },
+                        ensure_ascii=False,
+                    )
+                    pipe.xadd(self.audit_key(tenant), {"payload": audit_payload})
+                    pipe.xadd(
+                        self.runtime._tenant_key(tenant, "audit"),
+                        {"payload": audit_payload},
                     )
                     await pipe.execute()
                     return public_credential(record), token
@@ -216,19 +216,19 @@ class AgentCredentialStore:
                     record["revoked_by"] = revoked_by
                     pipe.multi()
                     pipe.set(key, json.dumps(record, ensure_ascii=False))
-                    pipe.xadd(
-                        self.audit_key(tenant),
+                    audit_payload = json.dumps(
                         {
-                            "payload": json.dumps(
-                                {
-                                    "action": "agent.credential.revoke",
-                                    "agent_id": agent_id,
-                                    "credential_id": credential_id,
-                                    "subject": revoked_by,
-                                },
-                                ensure_ascii=False,
-                            )
+                            "action": "agent.credential.revoke",
+                            "agent_id": agent_id,
+                            "credential_id": credential_id,
+                            "subject": revoked_by,
                         },
+                        ensure_ascii=False,
+                    )
+                    pipe.xadd(self.audit_key(tenant), {"payload": audit_payload})
+                    pipe.xadd(
+                        self.runtime._tenant_key(tenant, "audit"),
+                        {"payload": audit_payload},
                     )
                     await pipe.execute()
                     return public_credential(record)

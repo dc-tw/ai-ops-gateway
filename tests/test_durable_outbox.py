@@ -159,6 +159,27 @@ async def test_preflight_failure_fences_record_and_index_before_any_write(durabl
     assert not await env.raw.exists(record, index)
 
 
+async def test_security_audit_archive_bypass_requires_matching_atomic_dedicated_pair(durable):
+    env = durable
+    await env.raw.set(env.fence, "archive-maintenance")
+    main = env.key("audit")
+    dedicated = env.key("security:credential-audit")
+    payload = json.dumps({"action": "agent.credential.revoke", "credential_id": "one"})
+    async with env.client.pipeline(transaction=True) as pipe:
+        pipe.xadd(main, {"payload": payload})
+        with pytest.raises(ResponseError, match="DURABLE_MAINTENANCE"):
+            await pipe.execute()
+    assert not await env.raw.exists(main, dedicated, env.outbox)
+
+    async with env.client.pipeline(transaction=True) as pipe:
+        pipe.xadd(dedicated, {"payload": payload})
+        pipe.xadd(main, {"payload": payload})
+        results = await pipe.execute()
+    assert len(results) == 2
+    assert await env.raw.xlen(main) == await env.raw.xlen(dedicated) == 1
+    assert not await env.raw.exists(env.outbox)
+
+
 @pytest.mark.parametrize(
     ("suffix", "command"),
     [

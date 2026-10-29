@@ -16,9 +16,11 @@ from app.agent_credentials import router as agent_credentials_router
 from app.agents import router as agents_router
 from app.api.routes import router
 from app.api.security_routes import router as security_router
+from app.audit_chain import router as audit_chain_router
 from app.auth import router as auth_router
 from app.automations import router as automations_router
 from app.collaboration import router as collaboration_router
+from app.core.audit_chain import run_audit_chain_projector
 from app.core.checkpoint_bootstrap import open_checkpointer
 from app.core.config import Settings, get_settings
 from app.core.observability import install_observability
@@ -99,9 +101,16 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
                 ) from None
             app.state.postgres = store
         app.state.checkpointer = None
+        app.state.audit_chain_projector = None
         if app_settings.langgraph_checkpointing and isinstance(app.state.redis, RedisRuntime):
             checkpointer = await open_checkpointer(app.state.redis, app_settings)
             app.state.checkpointer = checkpointer
+        if isinstance(app.state.redis, RedisRuntime):
+            app.state.audit_chain_projector = asyncio.create_task(
+                run_audit_chain_projector(
+                    app.state.redis, app_settings.audit_chain_projector_poll_seconds
+                )
+            )
         yield
         for task in list(app.state.active_runs):
             task.cancel()
@@ -110,6 +119,10 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
         if app.state.checkpointer:
             with contextlib.suppress(Exception):
                 await app.state.checkpointer.__aexit__(None, None, None)
+        if app.state.audit_chain_projector:
+            app.state.audit_chain_projector.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await app.state.audit_chain_projector
         if app.state.redis:
             with contextlib.suppress(Exception):
                 await app.state.redis.close()
@@ -130,6 +143,7 @@ def create_app(*, graph=None, settings: Settings | None = None, redis_runtime=No
     app.include_router(router)
     app.include_router(acp_sessions_router)
     app.include_router(auth_router)
+    app.include_router(audit_chain_router)
     app.include_router(collaboration_router)
     app.include_router(security_router)
     app.include_router(goals_router)

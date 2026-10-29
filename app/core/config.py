@@ -60,6 +60,11 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     redis_stream_maxlen: int = 10_000
+    audit_checkpoint_signing_key: str = Field(default="", repr=False)
+    audit_checkpoint_key_id: str = Field(
+        default="primary", pattern=r"^[A-Za-z0-9._-]{1,64}$"
+    )
+    audit_chain_projector_poll_seconds: float = Field(default=2.0, ge=0.1, le=60)
     postgres_dsn: str = Field(default="", repr=False)
     postgres_source_id: str = Field(default="gateway", pattern=r"^[A-Za-z0-9._-]{1,64}$")
     postgres_history_mode: str = Field(default="shadow", pattern=r"^(shadow|postgres)$")

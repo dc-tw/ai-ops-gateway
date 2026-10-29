@@ -6,7 +6,7 @@
 | 階段 | 交付內容 | 狀態 |
 | --- | --- | --- |
 | M1 | ATR 完整掃描、超限拒絕、可終止隔離、規則健全性、安全決策 journal | 已實作／本機與 Docker 驗證完成 |
-| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 進行中：Agent 憑證、policy reference、owner／分享 ACL、conversation fencing、EventEnvelope 已實作；audit chain 待實作 |
+| M2 | Agent 憑證／policy reference、owner／分享 ACL、conversation fencing、統一事件及 audit chain | 已實作／真實 Redis 專項與相容回歸完成 |
 | M3 | Skill v2、plan-only 綁定、確定性自動選擇、唯讀外部套件匯入 | 已實作／本機與 Docker 驗證完成 |
 | M4 | Plan v2、條件／平行 DAG、Workflow YAML、明確且冪等的計畫執行 admission | 已實作／本機、Docker 新舊版本及故障驗證完成 |
 | M5 | plan-forecast、模型版本／逐呼叫 telemetry／校正及情境估算 | 核心已實作／synthetic 校正通過；真實模型校正需環境 |
@@ -51,7 +51,11 @@
   已完成；EventEnvelope 與 audit chain 仍待實作。
 - M2 第五段：[EventEnvelope v1 compatibility adapter](releases/2026-10-29-m2-event-envelope.md)。
   JSON Schema、catalog、ID／cursor／idempotency 分離、新舊 mixed replay 與既有 SSE／history 相容已完成；
-  tenant audit chain 仍待實作。
+  tenant audit chain 的接續結果見下一段。
+- M2 收尾：[tenant audit chain 與 signed checkpoint](releases/2026-10-29-m2-audit-chain.md)。
+  legacy producer 相容投影、併發原子排序、missing／mutation／tenant 驗證、human-admin API 與
+  離線 HMAC checkpoint 驗證已完成；外部 WORM storage 仍是部署環境責任，不冒稱 hash chain
+  自身即為不可變保存。
 - M3 第一段：[v2／planning_skills／確定性選擇實作與驗證](releases/2026-10-27-m3-skill-v2-selection.md)。
   775 tests、真實 HTTP／worker／model-context Docker E2E；套件隔離匯入仍待接續。
 - M3 完整段落：[唯讀 package 匯入與驗證](releases/2026-10-27-m3-package-import.md)。
@@ -92,7 +96,8 @@
   Scheduler／projector、1／4／16 併發、Gateway `SIGKILL`、Redis／PostgreSQL 故障與 catch-up、
   PostgreSQL 17 WAL restore-point PITR、四組 Docker E2E、混合版本 Workflow 與 ACP stdio 均通過；
   真實 Redis＋PostgreSQL 全套為 `921 passed, 0 skipped`。正式 OIDC／外部 webhook、真實模型
-  校正、multi-AZ／正式 RPO／RTO 與其他 ACP client 矩陣仍需對應環境；M2 剩餘治理仍待完成。
+  校正、multi-AZ／正式 RPO／RTO 與其他 ACP client 矩陣仍需對應環境；M2 後續已完成，總結見
+  [M2–M9 完成稽核](releases/2026-10-30-m2-m9-completion-audit.md)。
 
 ## 後續階段的固定實作契約
 

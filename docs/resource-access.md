@@ -2,7 +2,8 @@
 
 `RESOURCE_ACL_ENABLED=false` 為預設。啟用後，tenant／RBAC 之外還須通過資源 ACL；
 同租戶不代表可以讀取彼此資料。這不是完整 M2：Agent 憑證、執行 policy reference、
-對話 single-flight／FIFO／fencing、統一事件及 SHA-256 audit chain 仍待實作。
+對話 single-flight／FIFO／fencing、統一事件及 SHA-256 audit chain 已在後續 M2 段落實作；
+audit chain 操作與限制見 [維運指南](audit-chain.md)。
 
 ## 權限規則
 

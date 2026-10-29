@@ -161,6 +161,40 @@ def _text(value: Any) -> Any:
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
+def _xadd_payload(args: tuple) -> str | None:
+    if len(args) < 5 or str(_text(args[0])).upper() != "XADD":
+        return None
+    values = [_text(value) for value in args[2:]]
+    try:
+        return str(values[values.index("payload") + 1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _redis_only_security_audit(args: tuple, stack: list[tuple[tuple, dict]]) -> bool:
+    """Recognize only an atomic main-audit + dedicated-security-audit pair."""
+    key = str(_text(args[1])) if len(args) >= 2 else ""
+    if classify_key(key) != ("audit", "audit", "events"):
+        return False
+    payload = _xadd_payload(args)
+    try:
+        event = json.loads(payload or "")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    action = event.get("action") if isinstance(event, dict) else None
+    if isinstance(action, str) and action.startswith("agent.credential."):
+        dedicated = key.removesuffix(":audit") + ":security:credential-audit"
+    elif isinstance(action, str) and action.startswith("security_policy."):
+        dedicated = key.removesuffix(":audit") + ":security:policy-audit"
+    else:
+        return False
+    return any(
+        str(_text(other[1])) == dedicated and _xadd_payload(other) == payload
+        for other, _options in stack
+        if len(other) >= 2
+    )
+
+
 def _captured(args: tuple) -> bool:
     command = str(_text(args[0])).upper()
     if command in {"EVAL", "EVALSHA"}:
@@ -206,7 +240,8 @@ class DurablePipeline(Pipeline):
 
     async def execute(self, raise_on_error: bool = True):
         stack = list(self.command_stack)
-        if not stack or not any(_captured(args) for args, _ in stack):
+        captured = [args for args, _ in stack if _captured(args)]
+        if not captured or all(_redis_only_security_audit(args, stack) for args in captured):
             return await super().execute(raise_on_error=raise_on_error)
         if any(str(_text(args[0])).upper() in {"EVAL", "EVALSHA"} for args, _ in stack):
             await self.reset()

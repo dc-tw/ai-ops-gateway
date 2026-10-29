@@ -90,7 +90,9 @@ def _serve(listener, redis_url, tenant, prefix, phase):
         atr_blocking=True,
         langgraph_checkpointing=True,
         tenant_requests_per_minute=1000,
-        agent_default_deadline_seconds=60,
+        # Keep the crash-recovery lease short enough for this destructive test;
+        # another replica must not take over until the old execution lease expires.
+        agent_default_deadline_seconds=2,
         sse_heartbeat_seconds=1,
     )
     app = create_app(settings=settings, redis_runtime=runtime)
@@ -190,10 +192,24 @@ async def test_two_replicas_sigkill_during_output_release_never_persist_or_repla
             await asyncio.to_thread(processes[0].join, 5)
             assert not processes[0].is_alive()
             await asyncio.wait_for(stream_task, 5)
-            resumed = await client.post(
-                f"http://127.0.0.1:{ports[1]}/v1/agent/runs/{run_id}/resume"
-            )
-            assert resumed.status_code == 200, resumed.text
+            resume_url = f"http://127.0.0.1:{ports[1]}/v1/agent/runs/{run_id}/resume"
+            first_resume = await client.post(resume_url)
+            assert first_resume.status_code == 409
+            assert first_resume.json()["detail"] == "Agent run is already active"
+            resumed = None
+
+            async def lease_expired():
+                nonlocal resumed
+                candidate = await client.post(resume_url)
+                if candidate.status_code == 200:
+                    resumed = candidate
+                    return True
+                assert candidate.status_code == 409, candidate.text
+                assert candidate.json()["detail"] == "Agent run is already active"
+                return False
+
+            await _until(lease_expired)
+            assert resumed is not None
             # Replay via the other process, including any safe event persisted
             # before the first process died but not delivered to its live client.
             replay = await client.get(f"http://127.0.0.1:{ports[1]}/v1/agent/runs/{run_id}/events")
